@@ -9,9 +9,11 @@ Windows, Linux, and probably Mac (not tested on Mac).
 ## Requirements
 
 * Python 3 (such as Python 3.7)
-* Cherrypy (Python library - may be installed by using pip.
+* Cherrypy (Python library - may be installed by using pip).
     * On Raspberry Pi, the pip executable for Python 3 is named "pip3"
     * Example command: pip3 install cherrypy
+* Python m3u8 parser (Python library - may be installed by using pip).
+    * Example command: pip3 install m3u8
 * ffmpeg
 
 ## Setting Up
