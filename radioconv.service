@@ -1,0 +1,13 @@
+[Unit]
+Description = Python M3u8 radio converter
+After = mediacenter.service
+
+[Service]
+Restart=always
+TimeoutStopSec=5
+User=osmc
+Type = simple
+ExecStart = /usr/bin/python3 /home/rpi/radioconv/radioconv.py
+
+[Install]
+WantedBy = multi-user.target
