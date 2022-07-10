@@ -5,8 +5,8 @@
     File name: radioconv.py
     Author: Clifford Farrugia
     Date created: 27/08/2021
-    Date last modified: 27/08/2021
-    Python Version: 3.7
+    Date last modified: 10/07/2022
+    Python Version: 3.7 (may work with more recent versions)
 '''
 
 ffmpeg_location = "ffmpeg" #replace with full exe path if using Windows such as "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe"
@@ -22,6 +22,7 @@ import m3u8
 import time
 import urllib.request
 import urllib.parse
+import os
 
 running_processes = {}
 
@@ -32,6 +33,7 @@ def download_thread(m3u8_url, ffmpeg_proc, reading_token):
     playlist_duration = 0
     first_playlist = True
     last_sequence = 0
+    base_url = os.path.split(m3u8_url)[0]
     while True:
         if reading_token.reading is not True:
             if current_reading:
@@ -53,7 +55,15 @@ def download_thread(m3u8_url, ffmpeg_proc, reading_token):
             time.sleep(1)
             continue
         last_download = time.time()
-        playlist = m3u8.load(m3u8_url)
+        try:
+            playlist = m3u8.load(m3u8_url)
+        except:
+            print ("closing failed thread")
+            try:
+                ffmpeg_proc.stdin.close()
+            except:
+                pass
+            return
         playlist_duration = playlist.target_duration
         if first_playlist:
             first_playlist = False
@@ -64,11 +74,14 @@ def download_thread(m3u8_url, ffmpeg_proc, reading_token):
             elif playlist.media_sequence - last_sequence == 0:
                 time.sleep(1)
                 continue
-            else:                           
+            else:
                 read_files = playlist.media_sequence - last_sequence
         last_sequence = playlist.media_sequence
         for curr_file in range(read_files):
-            orig_bytes = urllib.request.urlopen(playlist.files[curr_file - read_files]).read()
+            curr_url = playlist.files[curr_file - read_files]
+            if curr_url[:4] != "http":
+                curr_url = os.path.join(base_url, curr_url).replace("\\", "/")
+            orig_bytes = urllib.request.urlopen(curr_url).read()
             current_loc = 0
             while current_loc < len(orig_bytes):
                 if reading_token.reading is not True:
@@ -103,7 +116,7 @@ def cleanup_thread():
                 kill_process.kill()
             except:
                 pass
-    
+
 
 class ReadingToken():
     reading = False
@@ -120,15 +133,19 @@ class ServerRoot:
             ffmpeg_proc = subprocess.Popen([ffmpeg_location, "-i", "pipe:", "-acodec", "mp3", "-b:a", str(bitrate), "-f", "mp3", "-"], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=buffer_size)
             running_processes[ffmpeg_proc] = time.time()
             read_thread = threading.Thread(target=download_thread, args=[urllib.parse.unquote(args[0]), ffmpeg_proc, reading_token])
-            read_thread.start()               
+            read_thread.start()
             while True:
                 reading_token.reading = True
                 running_processes[ffmpeg_proc] = time.time()
                 read_data = ffmpeg_proc.stdout.read(buffer_size)
                 if len(read_data) == 0:
+                    print("data length is 0 - breaking")
                     break
                 reading_token.reading = False
                 yield (read_data)
+            time.sleep(10)
+            print ("setting status to 500")
+            cherrypy.response.status = 500
         return streamer()
 
     default._cp_config = {'response.stream': True,

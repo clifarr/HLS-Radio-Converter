@@ -19,7 +19,7 @@ Windows, Linux, and probably Mac (not tested on Mac).
 ## Setting Up
 
 1. Edit the file to set the ffmpeg location (if using Windows) and IP address.
-1. If running on Linux, it's best to set this up as a service. Example service file attached.
+1. If running on Linux, it's best to set this up as a service. Example service file included (radioconv.service).
 1. If running on Windows, you may need to allow port 8123 (or the port number you set) as it is blocked by Windows Firewall by default.
 
 ## Using
