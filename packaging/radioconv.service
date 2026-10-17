@@ -1,0 +1,74 @@
+[Unit]
+Description=HLS Radio Converter (m3u8 to MP3/AAC for Internet radios)
+Documentation=https://github.com/clifarr/HLS-Radio-Converter
+# Sockets, not just interfaces: a Pi with Wi-Fi can be "up" before it is useful.
+After=network-online.target
+Wants=network-online.target
+
+# If it cannot stay up, stop trying instead of burning CPU and SD-card writes.
+StartLimitIntervalSec=180
+StartLimitBurst=6
+
+[Service]
+Type=exec
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@STATE_DIR@
+ExecStart=@EXEC_START@
+Environment=RADIOCONV_CONFIG_DIR=@CONFIG_DIR@
+# Keep the journal bounded - an unbounded log is a classic way for a hobby
+# service to fill an SD card and take the whole machine down.
+LogExtraFields=RADIOCONV=1
+
+# ---------------------------------------------------------------- stability
+# restart v2's entire reason for existing: the process is now expected to die
+# *cleanly* on purpose (watchdog, OOM) rather than wedge for days.
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+# Mixed: SIGTERM to us, then SIGKILL the whole group so ffmpeg children cannot
+# outlive the service and keep a transcode burning CPU forever.
+KillMode=mixed
+KillSignal=SIGTERM
+
+# A hard ceiling with a soft warning: the kernel reclaims this service, not
+# the Pi. Also set --memory-limit in radioconv so it can exit *gracefully* first.
+MemoryHigh=192M
+MemoryMax=256M
+# Audio work is not worth starving ssh/sshd of the CPU.
+Nice=5
+CPUWeight=50
+IOWeight=50
+# Each pipeline needs a handful of sockets, not thousands.
+LimitNOFILE=4096
+
+# ---------------------------------------------------------------- hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+SystemCallArchitectures=native
+# Caveat: leave MemoryDenyWriteExecute off. It can break dynamically-generated
+# code paths on some arm64/Python combinations, and it buys us little here.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# The only writable places (ProtectSystem=strict makes everything else read-only).
+ReadWritePaths=@STATE_DIR@
+ReadOnlyPaths=@CONFIG_DIR@
+
+[Install]
+WantedBy=multi-user.target

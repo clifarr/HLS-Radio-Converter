@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}HLS Radio Converter{% endblock %}
+
+{% block main %}
+<p>Turn an HLS (<code>.m3u8</code>) stream into a plain audio stream your radio
+can play.</p>
+
+<section class="card">
+  <form action="/" method="get">
+    <label for="url">Source <code>.m3u8</code> URL</label>
+    <input id="url" name="url" value="{{ target }}" placeholder="{{ example }}" required>
+    <button type="submit">Get radio URL</button>
+  </form>
+</section>
+
+{% if target and usable %}
+<section class="card result">
+  <p><strong>Radio URL</strong> - paste this into the radio:</p>
+  <code class="block">{{ radio_url }}</code>
+  <p class="muted">
+    Or <a href="{{ listen_url }}">play it in this browser</a> (an endless stream,
+    so the tab will not stop on its own).
+  </p>
+</section>
+{% elif target %}
+<section class="card">
+  <p><strong>That does not look like a stream URL.</strong></p>
+  <p class="muted">It must start with <code>http://</code> or
+  <code>https://</code> and point at either a <code>.m3u8</code> playlist or a
+  page that redirects to one.</p>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>Right now</h2>
+  <div class="tiles">
+    <div class="tile" tabindex="0"
+         data-tooltip="Stations being converted right now - one per distinct stream URL. Radios listening to the same station share a single pipeline.">
+      <span class="value" data-metric="gauges.sessions" data-format="count">&ndash;</span>
+      <span class="label">stations</span>
+    </div>
+    <div class="tile" tabindex="0"
+         data-tooltip="Radio connections currently receiving audio from this service.">
+      <span class="value" data-metric="gauges.listeners" data-format="count">&ndash;</span>
+      <span class="label">radios listening</span>
+    </div>
+    <div class="tile" tabindex="0"
+         data-tooltip="Bytes downloaded from the stations during the last 60 minutes (playlists and audio segments). This is network traffic IN.">
+      <span class="value" data-metric="gauges.bytes_in_last_hour" data-format="bytes">&ndash;</span>
+      <span class="label">received, last hour</span>
+    </div>
+    <div class="tile" tabindex="0"
+         data-tooltip="Audio bytes handed to radios during the last 60 minutes. Audio produced while no radio was listening is deliberately not counted.">
+      <span class="value" data-metric="gauges.bytes_out_last_hour" data-format="bytes">&ndash;</span>
+      <span class="label">audio sent, last hour</span>
+    </div>
+    <div class="tile" tabindex="0"
+         data-tooltip="Time since the service process started. It also restarts itself on a memory limit or on a stalled event loop.">
+      <span class="value" data-metric="uptime" data-format="duration">&ndash;</span>
+      <span class="label">running for</span>
+    </div>
+  </div>
+  <noscript>
+  <p class="muted small">These figures need JavaScript.</p>
+  </noscript>
+</section>
+
+<h2>How to use it</h2>
+<p>Give each radio the percent-encoded form of a stream URL. For example:</p>
+<p><code class="block">{{ example_radio_url }}</code></p>
+<p>...or, more readably, <code>{{ base }}/stream?url=&lt;url&gt;</code></p>
+<p class="muted">
+  There is no station list to configure: the radio is the configuration, and the
+  URL above is all it needs. Optional <code>&amp;name=</code> sets the station
+  name shown on the radio's display, and <code>&amp;br=</code> /
+  <code>&amp;codec=</code> override the output.
+</p>
+{% endblock %}

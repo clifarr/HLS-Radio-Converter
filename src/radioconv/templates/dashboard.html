@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - HLS Radio Converter{% endblock %}
+{% block bodyclass %}wide{% endblock %}
+
+{% block main %}
+<p class="muted">
+  One pipeline per station, shared by every radio listening to it, so the cost is
+  the number of <em>stations</em> - not the number of radios. Hover any figure or
+  column heading - or tap it on a phone - to see what it counts.
+</p>
+
+<div class="tiles wide">
+  <div class="tile" tabindex="0"
+       data-tooltip="Stations being converted right now - one per distinct stream URL. Radios listening to the same station share a single pipeline.">
+    <span class="value" data-metric="gauges.sessions" data-format="count">&ndash;</span>
+    <span class="label">stations of <span data-metric="gauges.max_sessions"
+      data-format="count">&ndash;</span></span>
+  </div>
+  <div class="tile" tabindex="0"
+       data-tooltip="Radio connections currently receiving audio from this service.">
+    <span class="value" data-metric="gauges.listeners" data-format="count">&ndash;</span>
+    <span class="label">radios listening</span>
+  </div>
+  <div class="tile" tabindex="0"
+       data-tooltip="Stations with a radio attached whose listeners have had nothing to play for longer than {{ config['Restart a silent station after'] }}. Measured from the radio's side - an empty buffer - and not from the station's, because a station is silent between segments by design without anyone hearing it. A radio hears this as nothing at all, so any station in this state makes the service report itself as degraded.">
+    <span class="value" data-metric="gauges.silent_sessions" data-format="count">&ndash;</span>
+    <span class="label">silent stations</span>
+  </div>
+  <div class="tile" tabindex="0"
+       data-tooltip="CPU used by this service AND the FFmpeg processes it starts, as a percentage of ONE CPU core. 100% means one core is completely busy - it is not a percentage of the machine, so on a 4-core Raspberry Pi the total available is 400%. It does not include anything else running on the machine.">
+    <span class="value" data-metric="gauges.cpu_percent" data-format="percent">&ndash;</span>
+    <span class="label">CPU of one core</span>
+  </div>
+  <div class="tile" tabindex="0"
+       data-tooltip="Resident memory (RAM actually in use, not disk) held by this service AND its FFmpeg children together. It excludes the rest of the operating system, other programs, and disk cache. On a Pi with no swap, this is the figure that matters.">
+    <span class="value" data-metric="gauges.rss_bytes" data-format="bytes">&ndash;</span>
+    <span class="label">memory</span>
+  </div>
+  <div class="tile" tabindex="0"
+       data-tooltip="How late the event loop was last able to run its scheduled work. Normally a few milliseconds. Sustained values above 5000 ms mean the process can no longer keep up, and it will restart itself rather than sit there serving nothing.">
+    <span class="value" data-metric="gauges.loop_lag_seconds" data-format="millis">&ndash;</span>
+    <span class="label">event loop lag</span>
+  </div>
+  <div class="tile" tabindex="0"
+       data-tooltip="Time since the service process started. It also restarts itself on a memory limit or on a stalled event loop.">
+    <span class="value" data-metric="uptime" data-format="duration">&ndash;</span>
+    <span class="label">running for</span>
+  </div>
+  <div class="tile" tabindex="0"
+       data-tooltip="Bytes downloaded from the stations during the last 60 minutes (playlists and audio segments). This is network traffic IN. It keeps rising on a warm station that has no radios listening, which is normal.">
+    <span class="value" data-metric="gauges.bytes_in_last_hour" data-format="bytes">&ndash;</span>
+    <span class="label">received, last hour</span>
+  </div>
+  <div class="tile" tabindex="0"
+       data-tooltip="Audio bytes handed to radios during the last 60 minutes. This is what actually left the machine towards a radio - audio produced while no radio was listening is deliberately not counted here.">
+    <span class="value" data-metric="gauges.bytes_out_last_hour" data-format="bytes">&ndash;</span>
+    <span class="label">audio sent, last hour</span>
+  </div>
+  <div class="tile" tabindex="0"
+       data-tooltip="Chunks of audio thrown away because a radio was not reading fast enough. A few is harmless; a number that keeps climbing means a slow or congested radio, or one with a tiny buffer.">
+    <span class="value" data-metric="counters.dropped_chunks_total" data-format="count">&ndash;</span>
+    <span class="label">chunks dropped</span>
+  </div>
+  <div class="tile" tabindex="0"
+       data-tooltip="Times a fetch from a station failed - a segment that would not download, a playlist that would not parse, a 404 or a timeout. Retried automatically; only a sustained run of them ends a station.">
+    <span class="value" data-metric="counters.pipeline_failures_total" data-format="count">&ndash;</span>
+    <span class="label">upstream failures</span>
+  </div>
+  <div class="tile" tabindex="0"
+       data-tooltip="Times a station's pipeline was torn down and built again, across all stations, since the service started. A restart happens when fetching fails repeatedly, or when a station goes quiet for too long; the station then reconnects by itself. Zero is the normal, healthy value - a rising count means an upstream is unreliable.">
+    <span class="value" data-metric="counters.pipeline_restarts_total" data-format="count">&ndash;</span>
+    <span class="label">restarts</span>
+  </div>
+  <div class="tile" tabindex="0"
+       data-tooltip="Requests refused because the service was already at its station limit. The radio is told to retry shortly; raise 'Max stations' if you see this often.">
+    <span class="value" data-metric="counters.capacity_rejections_total"
+      data-format="count">&ndash;</span>
+    <span class="label">refused as full</span>
+  </div>
+</div>
+
+<h2>Stations</h2>
+<div class="scroll">
+<table>
+  <thead>
+    <tr>
+      <th tabindex="0" data-tooltip="The name the radio gave with its &amp;name= parameter, or the source URL when it gave none. Radios asking for the same URL share one row.">Station</th>
+      <th class="num" tabindex="0" data-tooltip="Radio connections attached to this station right now.">Radios</th>
+      <th class="num" tabindex="0" data-tooltip="Chunks of audio discarded for a listener on this station that fell too far behind. Anything other than 0 means a radio is not keeping up.">Dropped</th>
+      <th tabindex="0" data-tooltip="How the audio is produced: 'passthrough' means it is forwarded without FFmpeg running at all, 'transcode' means FFmpeg is re-encoding it to the configured bitrate, 'starting' means the first segment has not arrived yet.">Engine</th>
+      <th class="num" tabindex="0" data-tooltip="Seconds of audio currently held for this station's listeners - the least-buffered listener, since a station is only as safe as its worst-served radio. This is the jitter buffer that covers the gap between one HLS segment arriving and the next. A new listener is given recent audio immediately, so this does not start at 0.">Buffered</th>
+      <th class="num" tabindex="0" data-tooltip="Audio bytes handed to radios for this station since it started. Excludes audio that was produced while nobody was listening.">Sent</th>
+      <th class="num" tabindex="0" data-tooltip="Times this station's pipeline was torn down and rebuilt, because fetching kept failing or because it went quiet for too long.">Restarts</th>
+      <th class="num" tabindex="0" data-tooltip="Upstream fetches that failed for this station since it started. They are retried automatically.">Failures</th>
+      <th class="num" tabindex="0" data-tooltip="How long the least-buffered listener has had nothing to play. This is what silence means to a radio: if its own buffer is empty it has run dry. It stays at 0 while audio is flowing, so a figure that climbs means listeners really are hearing nothing - the row turns amber past the stall timeout.">Starved</th>
+      <th class="num" tabindex="0" data-tooltip="How long since this station last received any audio from its upstream. A few seconds is NORMAL and not a fault: a segment is downloaded and decoded in one burst, so the gap between segments is dead time by design. This is a diagnostic for the pipeline, not a measure of what a listener hears - see the Starved column for that.">Upstream idle</th>
+      <th class="num" tabindex="0" data-tooltip="How long ago this station's session was created.">Up</th>
+    </tr>
+  </thead>
+  <tbody id="streams">
+    <tr><td colspan="11" class="empty">Loading&hellip;</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="muted small">
+  A station's name comes from its <code>&amp;name=</code> parameter, so without
+  one the column shows the stream URL.
+  <strong>Starved</strong> is how long the least-buffered listener has had
+  nothing to play, which is what silence means to a radio. It stays at 0 while
+  audio is flowing; past
+  <code>{{ config["Restart a silent station after"] }}</code> the station is
+  counted as silent, the row turns amber, and the service reports
+  <code>degraded</code>.
+  <strong>Upstream idle</strong> is different and much less alarming: it counts
+  from the pipeline's side, and a segment is downloaded and decoded in one
+  burst, so it climbs to about one segment and resets - on a station that is
+  playing perfectly.
+</p>
+
+<h2>Configuration</h2>
+<div class="scroll">
+<table class="kv">
+  <tbody>
+  {% for name, value in config.items() %}
+    <tr><th>{{ name }}</th><td>{{ value }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="muted small">
+  These come from the config file or <code>RADIOCONV_*</code> environment
+  variables and are fixed for the life of the process.
+</p>
+
+<noscript>
+<p class="card">
+  This page draws its figures with JavaScript, so with scripting off it has
+  nothing to show. See <a href="/docs">the API reference</a> for the same numbers
+  as JSON.
+</p>
+</noscript>
+{% endblock %}

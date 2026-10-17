@@ -1,0 +1,118 @@
+# HLS Radio Converter - annotated configuration example.
+#
+# Copy to /etc/radioconv/config.toml (or ~/.config/radioconv/config.toml) and
+# edit. Every value can also be supplied as an environment variable with the
+# RADIOCONV_ prefix, e.g. RADIOCONV_BITRATE=128000.
+#
+# Precedence: built-in defaults < this file < RADIOCONV_* environment < command
+# line flags.
+
+# ---------------------------------------------------------------- networking
+host = "0.0.0.0"          # 0.0.0.0 = every interface (what you want for a radio)
+port = 8123
+# Shown on the index page; set this if the machine has several addresses.
+# public_host = "192.168.1.50:8123"
+# cors_origins = "http://localhost:3000"   # only needed for a browser client
+
+# ------------------------------------------------------------------ encoding
+bitrate = 192000          # 8000..320000 bit/s. The default, and the value the
+                          # original project used: 192 kbit/s MP3 is the
+                          # quality bar radios were set up against.
+                          # Lower it only if the machine struggles (128000
+                          # cuts the CPU noticeably, at a real cost in quality).
+# sample_rate = 44100     # omit to keep the source rate (saves a resample step)
+channels = 2
+
+# mp3   - always hand the radio MP3. Widest compatibility; the safe default.
+# adts  - leave AAC as raw ADTS. *No re-encoding at all*: best quality and the
+#         cheapest option for a Raspberry Pi, but your radio must play AAC.
+# auto  - forward the source untouched whenever possible (AAC stays AAC).
+output_codec = "mp3"
+
+# When the source is already something the radio can play, forward it verbatim:
+# no FFmpeg process, no decode, no encode. This is what makes modern HLS radio
+# cheap on a Pi.
+prefer_passthrough = true
+
+# --------------------------------------------------------------------- ffmpeg
+# Leave unset to use the binary bundled with the pip package, then $PATH.
+# ffmpeg_path = "/usr/bin/ffmpeg"
+# One thread is the right answer on a single-board computer: audio transcoding
+# is not worth saturating the cores.
+ffmpeg_threads = 1
+# Escape hatches for exotic sources (inserted into the ffmpeg command line).
+# ffmpeg_input_args = ""
+# ffmpeg_output_args = ""
+
+# ----------------------------------------------------------------- HLS client
+user_agent = "radioconv/2.0 (+https://github.com/clifarr/HLS-Radio-Converter)"
+# Some CDNs require a Referer or they return 403.
+# referer = "https://www.example.com/"
+connect_timeout = 5.0
+read_timeout = 10.0
+playlist_timeout = 12.0
+segment_retries = 3
+# Consecutive failures before switching to the next URL in `fallbacks`.
+failover_after = 3
+# AES-128 encrypted HLS (very common) is decrypted transparently.
+decrypt_segments = true
+# Skip TLS verification for a broken CDN.
+insecure = false
+# highest = best audio quality source (video renditions are ignored),
+# lowest  = least bandwidth, first = as listed in the master playlist.
+variant_selection = "highest"
+
+# ------------------------------------------------------------------ streaming
+chunk_size = 8192         # bytes per read/write, and the unit `queue_chunks` counts
+# Per-listener jitter buffer: 128 * 8 KiB = 1 MiB, which is ~43 seconds of audio
+# at the default 192 kbit/s. It exists to cover the gap between one HLS segment
+# arriving and the next, which is 8-16 seconds on a typical station - so this is
+# the setting that decides whether a radio plays continuously or stutters.
+# Chunks are normalised to `chunk_size` regardless of how ffmpeg's pipe is
+# actually chunked, which is what makes the arithmetic above true.
+queue_chunks = 128
+# Hand each radio its audio at the stream's realtime rate instead of as fast as
+# it can be read. A segment is transcoded far quicker than realtime, so without
+# this a listener gets a ten-second burst followed by silence, and a radio with a
+# small input buffer underruns in every gap. Only disable it to diagnose pacing.
+pace_output = true
+# Seconds of audio released immediately at the start of a connection, so a radio
+# can fill its own buffer before the steady drip begins. Also the ceiling on how
+# far ahead of realtime a listener is ever put.
+initial_burst_seconds = 1.5
+# Concurrent pipelines. Each one is either an ffmpeg process or a very cheap
+# pure-python demuxer. 2-4 is sane on a Pi, more on a desktop.
+max_sessions = 4
+max_listeners_per_session = 8
+# Share one upstream pipeline between radios listening to the same station.
+share_sessions = true
+# Keep a pipeline warm this long after the last radio disconnects, so a radio
+# that reconnects (they all do) does not pay a cold start.
+linger_seconds = 25.0
+# Recent audio handed to a listener the moment it connects, in seconds. Audio is
+# produced in bursts - a whole segment every ~10s at roughly 6x realtime - so
+# without this a radio that tunes in during a gap hears nothing until the next
+# burst, which was measured at a median of 8 seconds. 0 disables it.
+preroll_seconds = 10.0
+# No audio for this long => the pipeline is killed and restarted. Also the point
+# at which a session whose listeners have nothing buffered is counted as a
+# *silent* session and the service reports `degraded` on /health, /metrics and
+# /dashboard, because a radio hears silence as nothing at all.
+stall_timeout = 30.0
+restart_backoff = 2.0
+
+# --------------------------------------------------------------- housekeeping
+# Ask systemd for a clean restart above this RSS. 0 = disabled. Pair with
+# MemoryMax= in the unit file (which is a hard kernel-level ceiling).
+memory_limit_mb = 0
+# How often CPU and memory are read, for /health, /metrics and the dashboard.
+# Deliberately much faster than memory_check_interval below: that one is how
+# long a bad reading takes to become a *restart decision*, but sampling at the
+# same slow rate is what made the CPU figure on the dashboard look frozen.
+resource_sample_interval = 1.0
+memory_check_interval = 30.0
+log_level = "INFO"        # DEBUG, INFO, WARNING, ERROR
+log_json = false          # one JSON object per line (good for journald/Loki)
+access_log = false        # uvicorn per-request logging (noisy)
+# Force the Content-Type sent to radios if your firmware is picky:
+# mime_override = "audio/mpeg3"

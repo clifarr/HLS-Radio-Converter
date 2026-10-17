@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint (ruff + ty)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Install
+        # --locked fails if uv.lock is out of date with pyproject.toml, which
+        # catches a contributor who changed dependencies but forgot to commit
+        # the regenerated lockfile.
+        run: uv sync --locked
+      - name: Format
+        run: uv run ruff format --check .
+      - name: Lint
+        run: uv run ruff check .
+      - name: Types
+        run: uv run ty check
+
+  test:
+    name: test (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor: Raspberry Pi OS Bullseye ships it, and it is the
+        # version that catches PEP 604 annotation mistakes at runtime.
+        python: ["3.9", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: uv sync --locked
+      - name: Test
+        run: uv run pytest -q
+      - name: Self-test (generates and streams real HLS)
+        run: uv run radioconv check --end-to-end --skip-port
+
+  shell:
+    name: shell (installer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n packaging/install.sh
+      - name: Helper unit tests
+        # The IP/port/station-detection helpers are the parts that quietly
+        # produce a wrong URL, so they get their own tests rather than being
+        # exercised only by a full install.
+        run: bash scripts/test-installer-helpers.sh
+
+  package:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      # Nothing is published anywhere. This job exists because `pip install .` is
+      # how the Raspberry Pi installer works, so a tree that cannot build is a
+      # broken install - and because a missing templates/ or static/ in the wheel
+      # produces a service that starts, streams audio, and 500s on its own pages.
+      - name: Build the wheel
+        run: uv build
+      - name: Check the packaged assets made it in
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          for needed in ("templates/base.html", "templates/dashboard.html",
+                         "templates/index.html", "static/dashboard.css",
+                         "static/dashboard.js"):
+              assert any(n.endswith(needed) for n in names), f"{needed} is not in the wheel"
+          print(f"{wheel}: assets present")
+          PY

@@ -1,0 +1,162 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hls-radio-converter"
+version = "2.0.0"
+description = "Convert HLS (m3u8) internet radio streams into plain MP3/AAC HTTP streams for Frontier Silicon and similar radios."
+readme = "README.md"
+requires-python = ">=3.9"
+# PEP 639: an SPDX expression plus the file it refers to, so the LICENSE text
+# actually ships in the built wheel instead of only being asserted here.
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Clifford Farrugia" }]
+dependencies = [
+    # Web layer
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    # The two browser pages. Kept as templates rather than HTML-in-Python (see
+    # src/radioconv/web.py); jinja2 is pure Python and markupsafe ships armv7l
+    # wheels, so this costs the Raspberry Pi nothing to install.
+    "jinja2>=3.1",
+    # Env/TOML backed configuration
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    # HTTP client with strict, per-operation timeouts (kills the "hangs for days" bug)
+    "httpx>=0.27",
+    # Pure-python HLS parser (we only ever use m3u8.loads on text we fetched ourselves)
+    "m3u8>=4.0",
+    # Bundled ffmpeg binary shipped as a normal pip wheel -> no apt, no manual download
+    "imageio-ffmpeg>=0.4.9",
+    # AES-128 HLS segment decryption (pure/wheel-based, works on ARM)
+    "cryptography>=41",
+    # Resource watchdog
+    "psutil>=5.9",
+    # TOML parsing on Python < 3.11
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.scripts]
+radioconv = "radioconv.cli:main"
+
+[project.urls]
+# Must match the real remote (verified against `git remote -v`); the tests in
+# tests/test_metadata.py fail if this and the README ever disagree.
+Homepage = "https://github.com/clifarr/HLS-Radio-Converter"
+Repository = "https://github.com/clifarr/HLS-Radio-Converter"
+Issues = "https://github.com/clifarr/HLS-Radio-Converter/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/radioconv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+# --------------------------------------------------------- dev dependencies
+# A PEP 735 dependency group rather than an optional-dependencies extra, so that
+# plain `uv sync` and `uv run` pick it up with no flags to remember. There is
+# deliberately no Makefile: uv already provides sync, run and build, and a
+# second layer of task aliases would only be another thing to keep in step.
+#   uv sync          -> venv + runtime deps + this group, exactly as locked
+#   uv run pytest    -> runs inside that environment
+[dependency-groups]
+dev = [
+    "pytest>=7",
+    "pytest-asyncio>=0.23",
+    "anyio>=4",
+    "ruff>=0.17",
+    "ty>=0.0.88",
+]
+
+# ---------------------------------------------------------------- ruff (lint)
+[tool.ruff]
+# Keep the linter honest about our declared floor. `requires-python` is 3.9
+# (Raspberry Pi OS Bullseye still ships 3.9), and ruff's `UP` rules would
+# otherwise rewrite every `Optional[X]` to `X | None`. That is *not* merely
+# cosmetic: PEP 604 unions are evaluated at runtime by pydantic and FastAPI, and
+# on 3.9 `int | None` raises
+#   TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'
+# unless the `eval_type_backport` package is installed. Pinning the target here
+# means a future contributor writing `x: int | None` in an endpoint gets told
+# by the linter instead of finding out on the Pi.
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # import sorting
+    "UP",       # pyupgrade (bounded by target-version above)
+    "B", "C4",  # bugbear, comprehensions
+    "SIM",      # simplify
+    "RUF",      # ruff-specific
+    "S",        # bandit: security
+    "PL",       # pylint
+    "TRY",      # exception hygiene
+    "BLE",      # blind except
+    "ASYNC",    # async correctness
+    "RET",      # return statements
+    "LOG", "G", # logging correctness and idioms
+]
+ignore = [
+    "E501",      # line length is `ruff format`'s job, not a lint failure
+    "S101",      # asserts are how this project tests
+    "S104",      # binding 0.0.0.0 is the entire point of this program
+    "S311",      # random is not used for anything security related
+    "TRY003",    # long inline exception messages are clearer than custom classes here
+    "TRY301",    # abstracting raises into helpers adds indirection for no gain
+    # Complexity of a few stream loops is inherent; they are heavily commented.
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004",
+    "PLW2901",   # reassigning a loop variable (`data = await fetch(...)`) is intentional
+    "SIM108",    # ternary-not-if is a readability call, not a correctness one
+    # Unicode punctuation (em dashes, arrows, ellipses) is deliberate in prose.
+    "RUF001", "RUF002", "RUF003",
+    # Imports inside functions are a deliberate cold-start optimisation: keeping
+    # google-cloud/uvicorn/ffmpeg-probing imports off the module-load path is the
+    # single biggest win for startup latency. Each site is individually commented.
+    "PLC0415",
+    # --- the three rules below need their own paragraph -----------------------
+    # UP006 (`List` -> `list`), UP035 (deprecated `typing` imports) and UP045
+    # (`Optional[X]` -> `X | None`) are *disabled on purpose*, not overlooked.
+    #
+    # Ruff offers them because every module has `from __future__ import
+    # annotations`, which makes the newer syntax legal to *parse* on 3.9. But
+    # annotations are not inert here: pydantic and FastAPI evaluate them at
+    # runtime, and on Python 3.9 the evaluation of `int | None` fails with
+    # `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'`
+    # (verified; the fix would be adding the `eval_type_backport` dependency).
+    #
+    # We keep `requires-python = ">=3.9"` because Raspberry Pi OS Bullseye ships
+    # 3.9, and this linter is the guard that stops a contributor writing
+    # `x: int | None` in an endpoint and only discovering it on the Pi.
+    # If the floor is ever raised to 3.10+, delete these three lines and run
+    # `ruff check --fix --unsafe-fixes` to modernise every annotation at once.
+    "UP006", "UP035", "UP045",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests intentionally use duck-typed stubs, magic numbers, broad excepts in
+# fakes, and `subprocess.run` without `check` so failures can be asserted.
+# ASYNC110 is disabled because tests legitimately poll-wait for a background
+# task to settle, which is clearer than plumbing an Event through each fixture.
+"tests/**" = ["S", "PLR2004", "BLE001", "ARG001", "SIM117", "C408", "PLW1510", "RET504", "ASYNC110"]
+# The self-test runs subprocesses and builds dicts for reporting by design.
+# ffmpeg.py runs the ffmpeg binary: the path comes from configuration, PATH or
+# our own wheel, is passed as an argv list with no shell, and every call has an
+# explicit timeout. S603 would otherwise fire on every invocation.
+"src/radioconv/check.py" = ["S", "C408", "PLW1510"]
+"src/radioconv/ffmpeg.py" = ["S603"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["radioconv"]
+
+# ------------------------------------------------------------------ ty (types)
+[tool.ty.environment]
+# Ties type checking to the same floor as ruff, so `tomllib` (3.11+) is
+# correctly reported as unavailable and the fallback import is exercised.
+python-version = "3.9"

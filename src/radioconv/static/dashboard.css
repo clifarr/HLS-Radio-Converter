@@ -1,0 +1,188 @@
+/* Styling for the two browser pages (/ and /dashboard).
+ *
+ * One small stylesheet, no framework: the pages are served from the same
+ * Raspberry Pi that is doing the audio work, so nothing here may pull in a CDN
+ * or a build step. Deliberately dark-on-light and readable on a phone, because
+ * "is my radio working?" is often asked from a phone.
+ */
+
+:root {
+  --fg: #222;
+  --muted: #666;
+  --line: #e3e3e3;
+  --card: #f6f6f6;
+  --accent: #0b5cad;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --bad: #b3261e;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--fg);
+  max-width: 62rem;
+  margin: 0 auto;
+  padding: 0 1rem 3rem;
+}
+
+/* The dashboard carries an eleven-column table, which is wider than a column of
+   prose should ever be. At the reading width it needed horizontal scrolling on
+   every desktop, so the summary table - the thing the page exists to show - was
+   the one thing you could not see at a glance. The landing page keeps the narrow
+   measure, where a form and a paragraph are what is on screen. */
+body.wide { max-width: 84rem; }
+
+h1 { font-size: 1.35rem; margin: 1.25rem 0 .25rem; }
+h1 a { color: inherit; text-decoration: none; }
+h2 { font-size: 1.05rem; margin: 2rem 0 .5rem; }
+p { margin: .6rem 0; }
+
+a { color: var(--accent); }
+code, input, table { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+code { font-size: .88em; background: #fff; border: 1px solid var(--line); border-radius: .2rem; padding: 0 .25rem; }
+.muted { color: var(--muted); }
+.small { font-size: .85rem; }
+.num { text-align: right; white-space: nowrap; }
+
+/* ------------------------------------------------------------------- header */
+.head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .25rem 1rem;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: .5rem;
+}
+.head nav { display: flex; gap: 1rem; }
+.head nav a { text-decoration: none; }
+.head nav a:hover { text-decoration: underline; }
+
+/* Status pill, filled in by dashboard.js once a poll has succeeded. */
+.pill {
+  font-size: .8rem;
+  font-variant: small-caps;
+  letter-spacing: .04em;
+  padding: .15rem .6rem;
+  border-radius: 1rem;
+  background: var(--card);
+  color: var(--muted);
+  margin-left: auto;
+}
+.pill[data-state="ok"] { background: #e6f4ea; color: var(--ok); }
+.pill[data-state="degraded"] { background: #fdf3d5; color: var(--warn); }
+.pill[data-state="down"] { background: #fbeae9; color: var(--bad); }
+
+/* -------------------------------------------------------------------- cards */
+.card {
+  background: var(--card);
+  border-radius: .5rem;
+  padding: .9rem 1rem;
+  margin: 1rem 0;
+}
+.card label { display: block; margin-bottom: .35rem; }
+.card input {
+  width: 100%;
+  padding: .5rem;
+  border: 1px solid var(--line);
+  border-radius: .25rem;
+  font-size: .9rem;
+}
+.card button {
+  margin-top: .5rem;
+  padding: .5rem 1rem;
+  font: inherit;
+  cursor: pointer;
+}
+.card.result code.block { background: #fff; }
+
+code.block {
+  display: block;
+  padding: .5rem .6rem;
+  border-radius: .25rem;
+  word-break: break-all;
+  background: var(--card);
+  border: 1px solid var(--line);
+}
+
+/* -------------------------------------------------------------------- tiles */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: .6rem;
+  margin: .8rem 0;
+}
+.tile {
+  background: var(--card);
+  border-radius: .5rem;
+  padding: .6rem .75rem;
+}
+.tile .value { display: block; font-size: 1.4rem; line-height: 1.2; }
+.tile .label { display: block; color: var(--muted); font-size: .8rem; }
+/* Tiles inside a card would otherwise be the same colour as it and stop reading
+   as tiles at all - which is what the landing page does. */
+.card .tile { background: #fff; border: 1px solid var(--line); }
+
+/* Hover help. Every figure on the dashboard carries a plain-language description,
+   because "CPU of one core" and "restarts" are only obvious once somebody has
+   told you what they count.
+ *
+ * The dotted underline is the whole affordance, deliberately. An earlier version
+ * also set `cursor: help`, which browsers render as a literal question mark - so
+ * the page looked like it was offering a "?" and nothing else, which is exactly
+ * how it was reported.
+ *
+ * The bubble itself is a single fixed-position element created by dashboard.js.
+ * It cannot be a `::after` here: the stations table scrolls horizontally, and an
+ * absolutely-positioned child of a scrolling box is clipped by it.
+ */
+[data-tooltip] { cursor: default; }
+.tile[data-tooltip] .label { border-bottom: 1px dotted currentColor; }
+th[data-tooltip] { border-bottom: 1px dotted var(--muted); }
+
+/* Focusable so a keyboard (and a phone, which has no hover at all) can reach the
+   description. Styled rather than suppressed: a focus ring nobody can see is how
+   tab stops become mysteriously invisible. */
+[data-tooltip]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: .2rem;
+}
+
+#tooltip {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 50;
+  max-width: min(26rem, calc(100vw - 1.5rem));
+  padding: .5rem .65rem;
+  border-radius: .35rem;
+  background: #1f2328;
+  color: #fff;
+  font: 400 .8rem/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  text-align: left;
+  white-space: normal;
+  box-shadow: 0 6px 20px rgb(0 0 0 / .28);
+  /* Laid out always, shown by opacity: `display: none` would make its size
+     unmeasurable, and the size is what decides whether it flips below. */
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity .1s ease-out;
+  pointer-events: none;
+}
+#tooltip[data-open="true"] { opacity: 1; visibility: visible; }
+
+/* -------------------------------------------------------------------- table */
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: .88rem; }
+th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid var(--line); }
+thead th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+tbody tr:hover { background: var(--card); }
+td.empty, .empty { color: var(--muted); text-align: center; padding: 1.2rem; }
+.station { max-width: 26rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-dead td { color: var(--bad); }
+/* Connected but producing no audio: the state that used to look healthy. */
+.row-stalled td { background: #fdf3d5; }
+.row-stalled td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+table.kv th { font-weight: 400; color: var(--muted); white-space: nowrap; width: 1%; }

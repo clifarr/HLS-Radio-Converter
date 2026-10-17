@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}HLS Radio Converter{% endblock %}</title>
+{# An empty favicon, so a browser does not ask for /favicon.ico: the legacy
+   catch-all route would answer that with "expected a percent-encoded URL". #}
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="{{ static_url }}/dashboard.css">
+</head>
+{# `data-refresh-ms` and `data-metrics-url` are how the server tells the static
+   JavaScript what to poll and how often, so that file stays a constant with no
+   template markup in it at all. `bodyclass` lets a page opt into a wider measure
+   than the readable default - only the dashboard does, for its wide table. #}
+<body class="{% block bodyclass %}{% endblock %}"
+      data-metrics-url="{{ metrics_url }}" data-refresh-ms="{{ refresh_ms }}">
+
+<header class="head">
+  <h1>
+    <a href="/">HLS Radio Converter</a>
+    <span class="muted small">v{{ version }}</span>
+  </h1>
+  <nav>
+    <a href="/">Converter</a>
+    <a href="{{ dashboard_url }}">Dashboard</a>
+    <a href="/docs">API reference</a>
+  </nav>
+  {# Hidden until the first poll succeeds, so a browser that cannot reach
+     /metrics.json shows nothing rather than a confident "live". #}
+  <span id="live-state" class="pill" role="status" aria-live="polite" hidden></span>
+</header>
+
+<main>
+{% block main %}{% endblock %}
+</main>
+
+<script src="{{ static_url }}/dashboard.js" defer></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>
