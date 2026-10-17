@@ -138,11 +138,37 @@ def test_bare_command_name_from_imageio_is_resolved_to_a_path(monkeypatch):
     assert os.path.isabs(resolved), "a bare command name must never be reported"
 
 
-def test_absolute_path_from_imageio_is_kept(monkeypatch):
-    """A genuine bundled wheel build gives an absolute path; do not touch it."""
+def test_a_system_ffmpeg_wins_over_the_bundled_wheel(monkeypatch):
+    """An installed ffmpeg is the administrator's choice; the wheel is a fallback.
+
+    This used to be the other way round, and the consequence was severe: imageio's
+    x86_64 release build segfaults on any MPEG-TS input, so on a machine that had
+    both, every transcoded station played silence - while `/health` reported the
+    bundled path as if that were normal.
+    """
+    _stub_imageio(monkeypatch, "/opt/bundled/ffmpeg-linux-x86_64-v7.0.2")
+    monkeypatch.setattr(ff, "_sidecar_ffmpeg", lambda: None)
+    monkeypatch.setattr(ff, "_runs", lambda _path: True)
+    monkeypatch.setattr(ff.shutil, "which", lambda _name: "/usr/bin/ffmpeg")
+
+    assert ff.locate_ffmpeg() == "/usr/bin/ffmpeg"
+
+
+def test_the_bundled_wheel_is_used_when_there_is_no_system_ffmpeg(monkeypatch):
+    """Which is the case the wheel exists for: `pip install` and nothing else."""
     _stub_imageio(monkeypatch, "/opt/bundled/ffmpeg-linux-aarch64-v7.0.2")
     monkeypatch.setattr(ff, "_sidecar_ffmpeg", lambda: None)
     monkeypatch.setattr(ff, "_runs", lambda _path: True)
+    monkeypatch.setattr(ff.shutil, "which", lambda _name: None)
+
+    assert ff.locate_ffmpeg() == "/opt/bundled/ffmpeg-linux-aarch64-v7.0.2"
+
+
+def test_a_system_ffmpeg_that_does_not_run_is_skipped(monkeypatch):
+    """A broken binary on PATH must not shadow a working bundled one."""
+    _stub_imageio(monkeypatch, "/opt/bundled/ffmpeg-linux-aarch64-v7.0.2")
+    monkeypatch.setattr(ff, "_sidecar_ffmpeg", lambda: None)
+    monkeypatch.setattr(ff, "_runs", lambda path: path.startswith("/opt/bundled"))
     monkeypatch.setattr(ff.shutil, "which", lambda _name: "/usr/bin/ffmpeg")
 
     assert ff.locate_ffmpeg() == "/opt/bundled/ffmpeg-linux-aarch64-v7.0.2"

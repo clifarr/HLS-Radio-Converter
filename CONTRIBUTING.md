@@ -320,9 +320,16 @@ There is no `linux-armv7` build in `imageio-ffmpeg` at all, so on those Pis the
 wheel installs and then quietly provides nothing. `packaging/install.sh` handles
 this by asking `radioconv` where its FFmpeg is and installing the system package
 when the answer is "nowhere". Resolution order at runtime: `--ffmpeg`,
-`IMAGEIO_FFMPEG_EXE`, a bundled/sidecar binary, the wheel, then `$PATH`.
+`IMAGEIO_FFMPEG_EXE`, a bundled/sidecar binary, `$PATH`, and only then the wheel.
 `radioconv check` reports exactly which one is in use - useful, because on a Pi
 the answer should be `/usr/bin/ffmpeg`.
+
+The wheel is deliberately last. It exists so that installing the package is
+enough on a machine with no FFmpeg, not so that it can displace one the
+administrator installed. That ordering was the other way round until it caused a
+release-blocking bug: imageio-ffmpeg's x86_64 build of FFmpeg 7.0.2 segfaults on
+any MPEG-TS input, so on a machine that had both, every transcoded station played
+silence while `/health` pointed cheerfully at the bundled binary.
 
 ## Why there is no Docker image
 

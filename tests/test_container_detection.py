@@ -102,7 +102,15 @@ def _describe(audio: bytes) -> str:
         path = Path(handle.name)
     try:
         return subprocess.run(
-            [ffmpeg_mod.locate_ffmpeg(), "-hide_banner", "-i", str(path), "-f", "null", "-"],
+            [
+                ffmpeg_mod.locate_ffmpeg(Settings().ffmpeg_path or None),
+                "-hide_banner",
+                "-i",
+                str(path),
+                "-f",
+                "null",
+                "-",
+            ],
             capture_output=True,
             text=True,
             timeout=60,

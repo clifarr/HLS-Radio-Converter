@@ -117,8 +117,8 @@ def _sidecar_ffmpeg() -> Optional[str]:
 def locate_ffmpeg(configured: Optional[str] = None) -> str:
     """Return the path of a usable ffmpeg binary.
 
-    Search order: explicit configuration, a sidecar/bundled copy, the
-    ``imageio-ffmpeg`` wheel, then ``$PATH``.
+    Search order: explicit configuration, a sidecar/bundled copy, an ffmpeg
+    already on ``PATH``, and only then the ``imageio-ffmpeg`` wheel.
     """
     if configured:
         path = shutil.which(configured) or (configured if _runs(configured) else None)
@@ -129,6 +129,20 @@ def locate_ffmpeg(configured: Optional[str] = None) -> str:
     sidecar = _sidecar_ffmpeg()
     if sidecar:
         return sidecar
+
+    # A system ffmpeg, before the wheel.
+    #
+    # The wheel exists so that installing this package is enough on a machine with
+    # no ffmpeg at all - not so that it can override one the administrator already
+    # installed and the installer deliberately provides. That distinction turned
+    # out to matter: imageio-ffmpeg's x86_64 release build segfaults on *any*
+    # MPEG-TS input, so preferring it made every transcoded station silent on
+    # exactly the machines that had a working distro ffmpeg sitting beside it -
+    # and `/health` blamed the bundled path, which pointed at the wheel rather
+    # than at the cause.
+    system = shutil.which("ffmpeg")
+    if system and _runs(system):
+        return system
 
     try:  # pragma: no cover - depends on the installed wheel
         import imageio_ffmpeg
@@ -147,10 +161,6 @@ def locate_ffmpeg(configured: Optional[str] = None) -> str:
                 return candidate
     except Exception as exc:  # noqa: BLE001 - any import/probe failure means "no bundled ffmpeg"
         log.debug("bundled ffmpeg unavailable: %s", exc)
-
-    system = shutil.which("ffmpeg")
-    if system:
-        return system
 
     raise FFmpegNotFound(f"no ffmpeg binary found: {install_hint()}")
 

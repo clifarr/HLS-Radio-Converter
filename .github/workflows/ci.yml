@@ -15,7 +15,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # The floor version, deliberately. `_toml` picks tomllib or the tomli
+          # fallback by `sys.version_info`, and the `ty: ignore` comments exist
+          # for a ty mis-resolution seen on 3.9 - so type-checking anywhere else
+          # reports imports and suppressions that are not valid there.
+          python-version: "3.9"
       - name: Install
         # --locked fails if uv.lock is out of date with pyproject.toml, which
         # catches a contributor who changed dependencies but forgot to commit
@@ -37,11 +43,26 @@ jobs:
         # 3.9 is the floor: Raspberry Pi OS Bullseye ships it, and it is the
         # version that catches PEP 604 annotation mistakes at runtime.
         python: ["3.9", "3.11", "3.12", "3.13"]
+    env:
+      # Use the distro's ffmpeg, the same way the installer does on a Pi.
+      #
+      # Without this the code falls back to imageio-ffmpeg's bundled wheel, and
+      # that build must not be what CI trusts: its x86_64 release (7.0.2) crashes
+      # with SIGSEGV on *any* MPEG-TS input, so every transcoding test fails with
+      # "ffmpeg closed its input" and no diagnostic at all. Pointing the tests at
+      # a real binary also means they exercise the path a user actually gets.
+      RADIOCONV_FFMPEG_PATH: /usr/bin/ffmpeg
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@v6
         with:
+          # `python-version` is what selects the interpreter. It is not accepted
+          # by setup-uv@v3, and the input being silently ignored there made all
+          # four matrix entries run on the runner's default Python - the matrix
+          # looked like it covered four versions and covered one.
           python-version: ${{ matrix.python }}
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Install
         run: uv sync --locked
       - name: Test
@@ -67,7 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: astral-sh/setup-uv@v6
       # Nothing is published anywhere. This job exists because `pip install .` is
       # how the Raspberry Pi installer works, so a tree that cannot build is a
       # broken install - and because a missing templates/ or static/ in the wheel

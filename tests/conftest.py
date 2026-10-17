@@ -43,9 +43,22 @@ class _Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+def ffmpeg_binary() -> str:
+    """The ffmpeg the service itself would use, configuration included.
+
+    Not a bare ``locate_ffmpeg()``: that ignores ``ffmpeg_path``, so a test suite
+    could build its fixtures with one binary and have the code under test use
+    another. That is not hypothetical - the bundled x86_64 wheel build segfaults
+    on any MPEG-TS input, so CI runs against the system ffmpeg through
+    ``RADIOCONV_FFMPEG_PATH`` (see .github/workflows/ci.yml) and the fixtures must
+    follow it there.
+    """
+    return ffmpeg_mod.locate_ffmpeg(Settings().ffmpeg_path or None)
+
+
 def has_ffmpeg() -> bool:
     try:
-        ffmpeg_mod.locate_ffmpeg()
+        ffmpeg_binary()
     except Exception:
         return False
     return True
@@ -61,7 +74,7 @@ def build_hls(directory: Path, codec: str, seconds: int = 8) -> Path:
     playlist = directory / "index.m3u8"
     subprocess.run(
         [
-            ffmpeg_mod.locate_ffmpeg(),
+            ffmpeg_binary(),
             "-hide_banner",
             "-loglevel",
             "error",
@@ -153,7 +166,7 @@ def build_id3_adts_hls(directory: Path, segments: int = 6, seconds: int = 2) -> 
         name = f"media_{index}.aac"
         subprocess.run(
             [
-                ffmpeg_mod.locate_ffmpeg(),
+                ffmpeg_binary(),
                 "-hide_banner",
                 "-loglevel",
                 "error",

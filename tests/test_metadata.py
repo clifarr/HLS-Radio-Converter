@@ -386,10 +386,13 @@ def test_every_ruff_exclusion_is_documented_in_pyproject():
     rather than trusting it: every ignored rule code and every per-file-ignores
     block should be accompanied by a comment.
     """
-    import tomli
+    # Through the project's own shim: `tomli` is only installed below Python
+    # 3.11, so importing it directly makes this test fail on newer interpreters -
+    # which is exactly what happened the first time it ran in CI.
+    from radioconv import _toml
 
     text = _read("pyproject.toml")
-    config = tomli.loads(text)["tool"]["ruff"]["lint"]
+    config = _toml.loads(text)["tool"]["ruff"]["lint"]
 
     commented_lines = set()
     for number, line in enumerate(text.splitlines(), start=1):
