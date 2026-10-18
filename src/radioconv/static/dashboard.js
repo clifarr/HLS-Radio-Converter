@@ -16,7 +16,6 @@
   const intervalMs = Number(body.dataset.refreshMs) || 1000;
 
   let snapshot = null;
-  let lastOk = 0;
   let failures = 0;
   let inFlight = false;
 
@@ -84,29 +83,58 @@
     });
   }
 
+  /* What the pill says, as one pure function so the suite can drive every
+   * state without a browser (tests/test_web_ui.py runs this file's copy of it
+   * under Node).
+   *
+   * `status` alone cannot answer "is this live?". The snapshot reports "ok"
+   * for an idle service too - correctly, because idle is healthy and not
+   * degraded - so the old `status === "ok" -> "live"` claimed "live" on any
+   * install with no radio attached, and "nothing streaming" could never
+   * appear: it lived only on the `degraded` branch, which needs a session to
+   * be wrong. The session count is what tells idle from live; `status` then
+   * separates "streaming" from "streaming, but somebody is hearing silence".
+   *
+   * `failures` outranks any snapshot: stale numbers are worse than none, so a
+   * failed poll must not say "live" while nothing is arriving. That state is
+   * reachable even though the page is served by the same process - it appears
+   * the moment the service is stopped or dies (watchdog, restart, network)
+   * while the page is already open.
+   */
+  function statusFor(snap, failures) {
+    if (failures) return { state: "down", text: "no contact" };
+    if (!snap) return { state: "unknown", text: "connecting\u2026" };
+    const sessions = Number((snap.gauges || {}).sessions) || 0;
+    if (sessions === 0) return { state: "idle", text: "nothing streaming" };
+    if (snap.status === "ok") return { state: "ok", text: "live" };
+    return { state: "degraded", text: "nothing streaming" };
+  }
+
   function paintStatus() {
     const pill = document.getElementById("live-state");
     if (!pill) return;
 
-    // Stale numbers are worse than none, so a failed poll wins over the last
-    // good snapshot: the pill must not say "live" while nothing is arriving.
-    let state = "unknown";
-    let text = "connecting\u2026";
-    if (failures) {
-      state = "down";
-      text = "no contact";
-    } else if (snapshot) {
-      state = snapshot.status === "ok" ? "ok" : "degraded";
-      text = state === "ok" ? "live" : "nothing streaming";
-    }
+    const shown = statusFor(snapshot, failures);
+    const hint = "Reading " + endpoint + " every " + intervalMs / 1000 + "s.";
+
+    // `data-tooltip`, never `title` - the same rule as every other description
+    // on this page: the native tooltip is delayed about a second and drawn by
+    // the browser, and the `cursor: help` that hints at it renders as a literal
+    // question mark. The bubble says why the pill reads what it reads.
+    const TIP = {
+      unknown: "Waiting for the first reading from " + endpoint + ".",
+      down: "Could not read " + endpoint + " - is the service running?",
+      ok: hint,
+      idle: "The service is up, but no station is streaming right now. " + hint,
+      degraded:
+        "Sessions exist but their listeners have nothing to play - see the " +
+        "table below. " + hint,
+    };
 
     pill.hidden = false;
-    pill.dataset.state = state;
-    pill.textContent = text;
-    pill.title =
-      state === "down"
-        ? "Could not read " + endpoint + " - is the service running?"
-        : "Reading " + endpoint + " every " + intervalMs / 1000 + "s";
+    pill.dataset.state = shown.state;
+    pill.textContent = shown.text;
+    pill.dataset.tooltip = TIP[shown.state] || hint;
   }
 
   function element(tag, className, text) {
@@ -317,7 +345,6 @@
       const response = await fetch(endpoint, { cache: "no-store" });
       if (!response.ok) throw new Error("HTTP " + response.status);
       snapshot = await response.json();
-      lastOk = Date.now();
       failures = 0;
       paintAll();
     } catch (error) {

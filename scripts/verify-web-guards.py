@@ -143,6 +143,28 @@ CASES: List[Case] = [
         '      node.innerHTML = "<b>x</b>";',
         "test_the_javascript_writes_no_html",
     ),
+    Case(
+        # The status pill described itself with a native `title` once - the same
+        # failure the template/css cases above block, in the last place left to
+        # make it. The assertion reads code (comments stripped), so the prose in
+        # this file cannot blunt it either.
+        "the pill's description goes back to a native title",
+        PKG / "static" / "dashboard.js",
+        "    pill.dataset.tooltip = TIP[shown.state] || hint;",
+        "    pill.title = TIP[shown.state] || hint;",
+        "test_descriptions_are_not_native_title_tooltips",
+    ),
+    Case(
+        # The reported bug: the pill read `status === "ok"` as "live", which is
+        # true of an idle service too - so it claimed "live" while nothing
+        # streamed. Dropping the idle branch is exactly the old behaviour, and
+        # the test must fail for it.
+        "the pill calls an idle service live",
+        PKG / "static" / "dashboard.js",
+        '    if (sessions === 0) return { state: "idle", text: "nothing streaming" };\n',
+        "",
+        "test_the_status_pill_tells_idle_from_live",
+    ),
 ]
 
 

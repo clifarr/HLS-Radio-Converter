@@ -152,6 +152,104 @@ def test_the_javascript_writes_no_html():
         assert forbidden not in script, f"dashboard.js uses {forbidden}"
 
 
+def test_the_status_pill_tells_idle_from_live(tmp_path):
+    """Reported: the pill says "live" even when nothing is streaming.
+
+    ``status`` is ``ok`` for an idle service *on purpose* - idle is healthy,
+    not degraded (see ``test_the_snapshot_is_json_serialisable``) - so reading
+    ``status === "ok"`` as "live" claimed a live stream on any install with
+    no radio attached, and "nothing streaming" was unreachable: it lived only
+    on the ``degraded`` branch, which needs a session to be wrong.
+
+    The decision is one pure function in the script, so this runs that exact
+    source under Node through every state the pill can show. Asserting on the
+    source text instead would pass for a comment; rendering the page would
+    need a browser the suite does not have.
+    """
+    node = shutil.which("node")
+    if node is None:
+        # ty mis-resolves pytest.skip (see tests/conftest.py).
+        pytest.skip("node is not installed")  # ty: ignore[too-many-positional-arguments]
+    script = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.js").read_text(encoding="utf-8"),
+        language="javascript",
+    )
+    match = re.search(r"function statusFor\(snap, failures\) \{.*?\n  \}", script, re.S)
+    assert match, (
+        "statusFor has moved or changed shape - the pill's decision must stay "
+        "a pure function this test can drive"
+    )
+    # And the pill must actually be driven by it, not merely ship it unused.
+    assert "statusFor(snapshot, failures)" in script, "paintStatus ignores statusFor"
+
+    # What the pill shows, the snapshot it was shown, the poll failures counted,
+    # and the state/text that must come back - the spec, in one table.
+    expectations = [
+        ("no reading yet", "null", 0, "unknown", "connecting\u2026"),
+        (
+            "polls failing",
+            "{ status: 'ok', gauges: { sessions: 2 } }",
+            3,
+            "down",
+            "no contact",
+        ),
+        (
+            "idle service, no radio attached",
+            "{ status: 'ok', gauges: { sessions: 0 } }",
+            0,
+            "idle",
+            "nothing streaming",
+        ),
+        (
+            "a station streaming",
+            "{ status: 'ok', gauges: { sessions: 1 } }",
+            0,
+            "ok",
+            "live",
+        ),
+        (
+            "station silent to its listeners",
+            "{ status: 'degraded', gauges: { sessions: 1 } }",
+            0,
+            "degraded",
+            "nothing streaming",
+        ),
+        (
+            "every session dead",
+            "{ status: 'degraded', gauges: { sessions: 2 } }",
+            0,
+            "degraded",
+            "nothing streaming",
+        ),
+    ]
+    checks = "\n".join(
+        f"check({label!r}, statusFor({snap}, {failures}), {state!r}, {text!r});"
+        for label, snap, failures, state, text in expectations
+    )
+    harness = (
+        match.group(0)
+        + "\n\nfunction check(label, actual, state, text) {\n"
+        + "  if (!actual || actual.state !== state || actual.text !== text) {\n"
+        + '    console.error(label + ": got " + JSON.stringify(actual) + ", want "'
+        + ' + state + "/" + JSON.stringify(text));\n'
+        + "    process.exit(1);\n"
+        + "  }\n"
+        + "}\n"
+        + checks
+        + '\nconsole.log("statusFor: every state is what the pill should say");\n'
+    )
+    script_file = tmp_path / "status_for.js"
+    script_file.write_text(harness, encoding="utf-8")
+    result = subprocess.run(
+        [node, str(script_file)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_the_page_does_not_recompute_what_the_server_already_measured():
     """Buffered and Starved must be two readings of one number, not two sums.
 
@@ -294,6 +392,13 @@ def test_descriptions_are_not_native_title_tooltips(live_server):
     assert 'node.id = "tooltip"' in script, "the tooltip element is not the one the CSS styles"
     for needed in ("data-tooltip", "showTip", "hideTip", "pointerover", "focusin"):
         assert needed in script, f"dashboard.js does not implement {needed}"
+    # And the script itself must not describe anything with a native `title`
+    # either: the status pill used one, where it is delayed about a second,
+    # drawn by the browser, and paired with the cursor this page rejects.
+    assert ".title =" not in code_only(script, language="javascript"), (
+        "dashboard.js went back to a native title tooltip; use data-tooltip, "
+        "like every other description on the page"
+    )
 
 
 def test_every_description_is_reachable_without_a_mouse(live_server):

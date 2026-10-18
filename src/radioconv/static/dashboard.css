@@ -71,6 +71,9 @@ code { font-size: .88em; background: #fff; border: 1px solid var(--line); border
   margin-left: auto;
 }
 .pill[data-state="ok"] { background: #e6f4ea; color: var(--ok); }
+/* Idle: nothing wrong, nothing happening - the neutral pill, deliberately
+   not amber, because an idle service with no radio attached is healthy. */
+.pill[data-state="idle"] { background: var(--card); color: var(--muted); }
 .pill[data-state="degraded"] { background: #fdf3d5; color: var(--warn); }
 .pill[data-state="down"] { background: #fbeae9; color: var(--bad); }
 

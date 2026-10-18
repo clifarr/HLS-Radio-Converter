@@ -3,6 +3,46 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.0.2] - 2026-10-18
+
+Status-pill fix: the dashboard header claimed "live" even when nothing was
+streaming, and "nothing streaming" could never appear at all.
+
+### Fixed
+
+- **The status pill now tells idle from live.** It read the snapshot's
+  `status === "ok"` as "live", but `ok` deliberately covers an idle service
+  too (idle is healthy, not degraded), so with no radio attached the pill
+  said "live" while nothing streamed - and "nothing streaming" was
+  unreachable, living only on the `degraded` branch, which needs a session to
+  be wrong. The pill now reads the session count: no sessions shows "nothing
+  streaming" in neutral grey, a healthy snapshot with sessions shows "live",
+  a `degraded` snapshot shows "nothing streaming" in amber, and failed polls
+  still show "no contact" in red. "No contact" is reachable even though the
+  page is served by the same process: it appears the moment the service stops
+  or dies while the page is already open. Verified in a real browser against
+  a live server: idle, a real station streaming, and the server killed
+  underneath the open page.
+- **The pill's description is a real tooltip again.** It used a native `title`
+  attribute - delayed about a second, drawn by the browser, and the
+  `cursor: help` convention this page rejects renders as a literal question
+  mark - so it was effectively unreadable. It now uses the same
+  `data-tooltip` bubble as every other description, is focusable with the
+  keyboard, and says why the pill reads what it reads.
+- **`/health` documents `status` as the field behaves**: `ok` also covers an
+  idle service, and `degraded` also covers station listeners that have
+  nothing to play - not only "every session has died".
+
+### Testing
+
+- The pill's decision is now one pure function, `statusFor`, and a new test
+  runs that exact source under Node through all six states it can report
+  (connecting, no contact, idle, live, silent listeners, every session dead).
+- Two new cases in `scripts/verify-web-guards.py` prove the new guards bite:
+  the idle branch deleted (the reported bug) and the pill describing itself
+  with a native `title` again. All 15 web guards and the other three guard
+  scripts (7 + 20 + 7 mutations) go red as expected - 312 tests in total.
+
 ## [2.0.1] - 2026-10-18
 
 Playback-continuity release: fixes the two audible defects reported on
@@ -60,5 +100,6 @@ for the FFmpeg-free pass-through path, per-listener pacing with drop
 isolation, a dashboard with health metrics, and a systemd installer for the
 Raspberry Pi.
 
+[2.0.2]: https://github.com/clifarr/HLS-Radio-Converter/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/clifarr/HLS-Radio-Converter/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.0.0

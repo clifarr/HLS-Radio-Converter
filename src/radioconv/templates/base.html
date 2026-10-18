@@ -26,9 +26,13 @@
     <a href="{{ dashboard_url }}">Dashboard</a>
     <a href="/docs">API reference</a>
   </nav>
-  {# Hidden until the first poll succeeds, so a browser that cannot reach
-     /metrics.json shows nothing rather than a confident "live". #}
-  <span id="live-state" class="pill" role="status" aria-live="polite" hidden></span>
+  {# Hidden until the script runs, so a browser with scripting off shows
+     nothing rather than a confident "live". It then paints "connecting…"
+     until the first reading lands, and "no contact" if the readings never
+     do. tabindex, like every description on the page: the pill explains
+     itself through the same tooltip bubble, which a keyboard must reach. #}
+  <span id="live-state" class="pill" role="status" aria-live="polite"
+        tabindex="0" hidden></span>
 </header>
 
 <main>
