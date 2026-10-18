@@ -242,9 +242,15 @@ def build_command(settings: Settings, input_format: str, *, copy_audio: bool = F
         "-nostats",
         "-threads",
         str(max(1, settings.ffmpeg_threads)),
-        # Live sources: do not let ffmpeg build a several-second input buffer.
+        # ``genpts`` fills in missing timestamps. ``+nobuffer`` is deliberately
+        # NOT set: it makes ffmpeg discard the audio used during input probing,
+        # which silently drops seconds of real audio at startup. Measured with
+        # ffmpeg 7.1 on a 60s AAC/MPEG-TS source fed through stdin, exactly as
+        # the pipeline feeds it: ``+genpts`` alone decoded 60.02s, adding
+        # ``+nobuffer`` decoded 54.80s - 5.2s of the stream simply gone, heard
+        # as a jump forward when a listener tunes in.
         "-fflags",
-        "+nobuffer+genpts",
+        "+genpts",
     ]
     if fmt:
         cmd += ["-f", fmt]

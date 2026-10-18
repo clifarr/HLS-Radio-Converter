@@ -46,6 +46,12 @@ log = logging.getLogger(__name__)
 #: response begins reading within milliseconds - see `_drop_never_started`.
 NEVER_STARTED_GRACE = 5.0
 
+#: How many (client, user_agent) join-floors a session remembers. A stale floor
+#: is harmless - it only ever suppresses reserve pieces that key was already
+#: sent, and the reserve has moved on - but the map must not grow without limit
+#: on a service that runs for months.
+MAX_JOIN_FLOORS = 64
+
 
 class CapacityError(RuntimeError):
     """Too many concurrent pipelines; the caller should retry later."""
@@ -63,6 +69,10 @@ class Subscriber:
     chunks: int = 0
     bytes_sent: int = 0
     dropped: int = 0
+    #: ``produced_at`` of the newest audio the transport actually accepted for
+    #: this connection - the floor a rejoining client is primed from, so it is
+    #: never re-sent audio it already received (see ``StreamSession._join_floor``).
+    last_delivered: Optional[float] = None
     disconnected_at: Optional[float] = None
     #: Set by the response generator the moment it starts reading. A subscriber
     #: whose client vanished between the request and the body running never gets
@@ -139,6 +149,13 @@ class StreamSession:
         #: When the least-buffered listener last had something to play. ``None``
         #: means nothing is starved. See `starved_for`.
         self._starved_since: Optional[float] = None
+        #: ``(client, user_agent) -> produced_at`` of the newest audio that key
+        #: was actually *sent*. A LAN radio re-GETs this warm session every
+        #: 20-60 s (journal evidence: Kitchen-Roberts-Radio reattaching with
+        #: 15-72 chunks prerolled on every attach), and priming the full
+        #: reserve each time replayed up to 10 s of already-played audio - the
+        #: reported "~2 s repeated every now and then". See `_join_floor`.
+        self._floors: Dict[Tuple[str, str], float] = {}
 
     # ------------------------------------------------------------------ public
     @property
@@ -184,6 +201,7 @@ class StreamSession:
         return self.pipeline.stats.bytes_out > 0
 
     def add_subscriber(self, client: str = "", user_agent: str = "") -> Subscriber:
+        floor = self._join_floor(client, user_agent)
         subscriber = Subscriber(
             client=client,
             user_agent=user_agent,
@@ -193,8 +211,10 @@ class StreamSession:
         self.stats.listeners_total += 1
         self.stats.last_subscriber_left = None
         # Hand over the recent audio *before* the caller starts reading, so a
-        # radio that tuned in mid-gap has something to play immediately.
-        self._prime(subscriber)
+        # radio that tuned in mid-gap has something to play immediately - but
+        # only the audio this key has *not* already been sent; see
+        # `_join_floor` for why the distinction is audible.
+        self._prime(subscriber, floor)
         log.info(
             "listener attached (%d now listening, %d chunks prerolled)",
             len(self.subscribers),
@@ -211,6 +231,7 @@ class StreamSession:
                 len(self.subscribers),
                 extra={"session": self.id},
             )
+            self._note_floor(subscriber)
         if not self.subscribers:
             self.stats.last_subscriber_left = time.time()
 
@@ -287,10 +308,16 @@ class StreamSession:
 
     def _enqueue(self, piece: bytes) -> None:
         self.stats.chunks += 1
-        self._reserve_piece(piece)
+        # One stamp per piece, shared by the reserve *and* every queue, so a
+        # delivered piece can be compared against reserve entries later - that
+        # comparison is the join-floor. Queue items are therefore
+        # ``(produced_at, piece)`` tuples; the end-of-stream sentinel stays
+        # ``None``.
+        stamp = time.time()
+        self._reserve_piece(piece, stamp)
         for subscriber in self.subscribers:
             try:
-                subscriber.queue.put_nowait(piece)
+                subscriber.queue.put_nowait((stamp, piece))
             except asyncio.QueueFull:
                 # This listener is behind. Drop the *oldest* audio for it and
                 # carry on: one slow radio must never stall the station.
@@ -298,9 +325,9 @@ class StreamSession:
                 with contextlib.suppress(asyncio.QueueEmpty):
                     subscriber.queue.get_nowait()
                 with contextlib.suppress(asyncio.QueueFull):
-                    subscriber.queue.put_nowait(piece)
+                    subscriber.queue.put_nowait((stamp, piece))
 
-    def _reserve_piece(self, piece: bytes) -> None:
+    def _reserve_piece(self, piece: bytes, stamp: float) -> None:
         """Hold this piece for a moment, so a radio that arrives late is served.
 
         This is the whole reason a listener can start instantly. Audio is produced
@@ -312,12 +339,11 @@ class StreamSession:
         """
         if self.settings.preroll_seconds <= 0:
             return
-        now = time.time()
-        self._reserve.append((now, piece))
+        self._reserve.append((stamp, piece))
         # Bounded by time, not by a piece count: the correct count depends on the
         # stream's bitrate, which is not known when the reserve is created (a
         # pass-through station runs at its own rate, not the configured one).
-        cutoff = now - self.settings.preroll_seconds
+        cutoff = stamp - self.settings.preroll_seconds
         while self._reserve and self._reserve[0][0] < cutoff:
             self._reserve.popleft()
         # A hard cap as well, because a pathological bitrate should not be able to
@@ -325,17 +351,74 @@ class StreamSession:
         while len(self._reserve) > self.settings.queue_chunks:
             self._reserve.popleft()
 
-    def _prime(self, subscriber: Subscriber) -> None:
+    def _join_floor(self, client: str, user_agent: str) -> Optional[float]:
+        """Newest ``produced_at`` that *(client, user_agent)* was already sent.
+
+        Why a floor exists at all: the reserve stops a *new* listener from
+        starting in silence, but a client reconnecting to this warm session -
+        which a Frontier-Silicon radio does every 20-60 s, measured in the
+        journal - has already played the very audio the reserve holds. Priming
+        it again replayed up to ten seconds on every attach: a reconnect's
+        first 9.2 s was measured *bit-identical* to its predecessor's first
+        9.2 s, and that is the reported "~2 s repeated every now and then".
+        The floor makes a rejoin resume where the old connection stopped
+        instead of rewinding.
+
+        Two sources, because radios do both:
+
+        * the key's last *departed* connection (it recorded how far it got);
+        * a same-key connection that is *still open* - the observed overlap
+          pattern is "attach the new socket, then detach the old one", so the
+          predecessor's floor is the freshest truth at prime time.
+
+        Keyed on IP *and* User-Agent: two devices share an IP only behind NAT
+        and then differ by User-Agent, while one device reconnecting shares
+        both - exactly the case to floor. A second tab of the same browser
+        also shares the key and therefore joins nearer the live edge with less
+        pre-roll: a deliberate trade, since the replay is a measured defect
+        and a same-UA second listener is rare for this service.
+        """
+        key = (client, user_agent)
+        floor = self._floors.get(key)
+        for other in self.subscribers:
+            if (
+                (other.client, other.user_agent) == key
+                and other.last_delivered is not None
+                and (floor is None or other.last_delivered > floor)
+            ):
+                floor = other.last_delivered
+        return floor
+
+    def _note_floor(self, subscriber: Subscriber) -> None:
+        """Remember how far a departing connection got, for its next attach."""
+        if subscriber.last_delivered is None:
+            # Nothing reached the transport (abandoned or probe connection), so
+            # a later attach must not be floored by it - it heard nothing.
+            return
+        key = (subscriber.client, subscriber.user_agent)
+        # Re-insert rather than assign, so eviction sees the freshest keys.
+        self._floors.pop(key, None)
+        self._floors[key] = subscriber.last_delivered
+        while len(self._floors) > MAX_JOIN_FLOORS:
+            self._floors.pop(next(iter(self._floors)))
+
+    def _prime(self, subscriber: Subscriber, floor: Optional[float] = None) -> None:
         """Give a newly connected listener the reserve, oldest piece first.
 
         Without this a joining radio waits for the next production burst, which is
         up to eight seconds of silence - measured, not estimated. Its own buffer
         also starts at zero, so the first segment that arrives has no cushion
         behind it.
+
+        ``floor`` (from ``_join_floor``) skips the pieces this particular client
+        was already sent - what turns "attach" from a replay into a resume. A
+        new client has no floor and gets the full reserve, as before.
         """
-        for _, piece in list(self._reserve):
+        for produced_at, piece in list(self._reserve):
+            if floor is not None and produced_at <= floor:
+                continue
             try:
-                subscriber.queue.put_nowait(piece)
+                subscriber.queue.put_nowait((produced_at, piece))
             except asyncio.QueueFull:
                 break
 

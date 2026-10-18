@@ -226,6 +226,21 @@ def test_build_command_omits_the_demuxer_for_an_unknown_container():
         assert command[-3:] == ["-f", "mp3", "-"]
 
 
+def test_build_command_never_asks_ffmpeg_to_discard_startup_audio():
+    """``+nobuffer`` throws away real audio, at tuning-in time of all times.
+
+    Measured with ffmpeg 7.1 on a 60 s AAC/MPEG-TS source piped through stdin
+    exactly as the pipeline pipes it: ``+genpts`` alone decoded 60.02 s, adding
+    ``+nobuffer`` decoded 54.80 s - 5.2 s of the stream silently gone, heard as
+    the jump forward when a listener tunes in.
+    """
+    command = " ".join(ffmpeg_mod.build_command(Settings(), "ts"))
+    assert "+nobuffer" not in command, (
+        "+nobuffer makes ffmpeg discard the audio it used while probing the input"
+    )
+    assert "+genpts" in command, "genpts is still needed for missing timestamps"
+
+
 def test_the_default_container_is_honest_when_the_playlist_does_not_say():
     """The false dichotomy that caused all of this.
 

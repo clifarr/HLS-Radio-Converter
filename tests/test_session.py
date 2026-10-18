@@ -88,7 +88,11 @@ async def drain(subscriber, count, timeout=5.0):
             continue
         if item is None:
             break
-        chunks.append(item)
+        # Fan-out queues carry ``(produced_at, piece)``; unpack so assertions
+        # work on the audio itself. Deliberately strict: unpacking raw bytes
+        # raises instead of letting a wrong item type pass silently.
+        _, piece = item
+        chunks.append(piece)
     return chunks
 
 
@@ -331,9 +335,10 @@ def test_an_idle_pipeline_does_not_make_a_listener_look_starved():
     subscriber = session.add_subscriber(client="radio")
     subscriber.started = True
 
-    # Give this listener a buffer, as a warm session would have.
+    # Give this listener a buffer, as a warm session would have. Queue items
+    # are ``(produced_at, piece)`` tuples, as `_enqueue` puts them.
     for _ in range(10):
-        subscriber.queue.put_nowait(b"x" * settings.chunk_size)
+        subscriber.queue.put_nowait((time.time(), b"x" * settings.chunk_size))
 
     assert session.silent_for > 7.0, "the pipeline really has been quiet for a while"
     assert session.starved_for == 0.0, "but the listener is not short of anything"
@@ -362,7 +367,7 @@ async def test_an_abandoned_connection_is_not_counted_as_a_listener():
     live = session.add_subscriber(client="real radio")
     live.started = True
     for _ in range(10):
-        live.queue.put_nowait(b"x" * settings.chunk_size)
+        live.queue.put_nowait((time.time(), b"x" * settings.chunk_size))
     expected = session.buffered_seconds()
     assert expected > 0.0, "a listener with ten chunks queued has a buffer"
 
@@ -405,7 +410,7 @@ async def test_the_buffer_and_the_starvation_clock_are_the_same_measurement():
     # Queue audio for the second listener only. The buffer must not budge, because
     # the station is judged by the listener that has least, not the average.
     for _ in range(20):
-        other.queue.put_nowait(b"x" * settings.chunk_size)
+        other.queue.put_nowait((time.time(), b"x" * settings.chunk_size))
     assert session.buffered_seconds() == 0.0, "a well-fed listener must not mask a starving one"
 
 
@@ -551,3 +556,149 @@ async def test_close_signals_every_listener_and_stops_the_pipeline():
     assert saw_end, "the listener was never told the stream had ended"
     assert session.pipeline.closed
     await manager.aclose()
+
+
+# ---------------------------------------------------------- rejoining a stream
+# A LAN radio re-GETs the same warm session every 20-60 s (the journal evidence
+# is on `StreamSession._floors`). Priming the full reserve on every attach
+# replays audio the client already played - measured server-side: a reconnect's
+# first 9.2 s was *bit-identical* to its predecessor's first 9.2 s (cross-
+# correlation 1.000). The floor must turn "attach" into a resume for that
+# client while a genuinely new client still gets the full reserve.
+
+
+async def _delivered(subscriber, count: int, timeout: float = 5.0):
+    """Drain ``count`` chunks the way the response generator does, recording
+    the floor the transport would record for this connection."""
+    got = []
+    deadline = time.time() + timeout
+    while len(got) < count and time.time() < deadline:
+        try:
+            item = await asyncio.wait_for(subscriber.queue.get(), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
+        if item is None:
+            break
+        stamp, piece = item
+        subscriber.last_delivered = stamp
+        got.append((stamp, piece))
+    return got
+
+
+def _queued(subscriber):
+    """Everything currently primed for *subscriber*, without consuming it."""
+    items = []
+    while not subscriber.queue.empty():
+        items.append(subscriber.queue.get_nowait())
+    return items
+
+
+async def test_a_rejoining_client_resumes_instead_of_replaying():
+    """Same IP + User-Agent reconnecting: never re-send what it already got."""
+    manager = SessionManager(fast_settings(queue_chunks=128))
+    await manager.start()
+    try:
+        session, first = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="Frontier/1",
+        )
+        heard = await _delivered(first, 3)
+        assert len(heard) == 3, "the test needs audio that was actually delivered"
+        floor = max(stamp for stamp, _ in heard)
+        await manager.unsubscribe(session, first)
+
+        # Production continues while the client is away; whatever is primed on
+        # the rejoin must be newer than the floor.
+        await asyncio.sleep(0.05)
+
+        rejoined, second = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="Frontier/1",
+        )
+        assert rejoined is session, "the session is warm; only the connection is new"
+        primed = _queued(second)
+        assert primed, "the rejoining client got no audio at all"
+        stamps = [stamp for stamp, _ in primed]
+        assert all(stamp > floor for stamp in stamps), (
+            "the rejoin was primed with audio this client already received: "
+            f"floor={floor}, primed={stamps}"
+        )
+    finally:
+        await manager.aclose()
+
+
+async def test_a_different_client_still_gets_the_full_reserve():
+    """The floor is keyed: one client's history must not blind a new one."""
+    manager = SessionManager(fast_settings(queue_chunks=128))
+    await manager.start()
+    try:
+        session, first = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="Frontier/1",
+        )
+        heard = await _delivered(first, 3)
+        floor = max(stamp for stamp, _ in heard)
+        await manager.unsubscribe(session, first)
+        await asyncio.sleep(0.05)
+
+        _, other = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.74",
+            user_agent="Browser/1",
+        )
+        stamps = [stamp for stamp, _ in _queued(other)]
+        assert stamps, "a brand-new client got no pre-roll at all"
+        assert any(stamp <= floor for stamp in stamps), (
+            "a brand-new client was primed with another client's floor "
+            f"(floor={floor}, primed={stamps})"
+        )
+    finally:
+        await manager.aclose()
+
+
+async def test_an_overlapping_connection_resumes_from_the_still_open_one():
+    """The radio's other order: attach the new socket, *then* detach the old.
+
+    The journal shows both orders - "detach then attach" and "attach (2 now
+    listening) then detach (1 remaining)". Recording floors only at departure
+    would leave the second case replaying everything the first connection
+    delivered while both were open, so a live same-key connection must
+    contribute its floor too.
+    """
+    manager = SessionManager(fast_settings(queue_chunks=128))
+    await manager.start()
+    try:
+        _session, old = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="Frontier/1",
+        )
+        heard = await _delivered(old, 3)
+        floor = max(stamp for stamp, _ in heard)
+
+        # Let production run past the floor, otherwise there is genuinely
+        # nothing newer to prime and the test would pass for the wrong reason.
+        await asyncio.sleep(0.05)
+
+        _, new = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="Frontier/1",
+        )
+        stamps = [stamp for stamp, _ in _queued(new)]
+        assert stamps, "the overlapping connection got no audio at all"
+        assert all(stamp > floor for stamp in stamps), (
+            "the overlapping connection was primed with audio already sent on "
+            f"the live one: floor={floor}, primed={stamps}"
+        )
+    finally:
+        await manager.aclose()

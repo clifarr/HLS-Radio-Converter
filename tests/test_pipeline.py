@@ -23,6 +23,10 @@ import signal
 import pytest
 
 from radioconv import pipeline
+from radioconv.config import Settings
+from radioconv.hls import Segment
+from radioconv.pipeline import WorkItem
+from radioconv.tsdemux import build_test_ts
 
 
 class _FakeProcess:
@@ -116,3 +120,83 @@ async def test_really_kills_a_running_child():
         if proc.returncode is None:  # pragma: no cover - defensive cleanup
             proc.kill()
             await proc.wait()
+
+
+# ------------------------------------------------- pass-through startup backlog
+class _RecordingClient:
+    """Stands in for ``HLSClient``: canned bytes in, fetches recorded."""
+
+    def __init__(self, data: dict) -> None:
+        self.data = data
+        self.fetched: list = []
+
+    async def fetch_segment(self, segment: Segment) -> bytes:
+        self.fetched.append(segment.sequence)
+        return self.data[segment.sequence]
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _EndOfPlaylistTracker:
+    """``poll()`` finds nothing new and the playlist has ended, so the feeder
+    finishes instead of looping - the startup backlog is the whole test."""
+
+    endlist = True
+
+    async def poll(self) -> list:
+        return []
+
+    def seconds_until_reload(self) -> float:
+        return 0.0
+
+
+async def test_passthrough_startup_feeds_every_pending_segment():
+    """Readiness on the FIRST segment must not delete the rest of the backlog.
+
+    ``take_buffered()`` has already advanced the tracker past the startup
+    batch, so the old ``pending[index + 1:] = []`` made those segments
+    unrecoverable: with two missing five-second segments a listener jumped
+    forward ~10 s at tuning time. Every pending segment must be fetched exactly
+    once, fed in order, and reach the output - even though the demuxer reports
+    ready after the first.
+    """
+    settings = Settings(prefer_passthrough=True, output_codec="mp3")
+    payloads = [b"SEG%d." % index + bytes([0x41 + index]) * 595 for index in range(3)]
+    data = {100 + index: build_test_ts(payload) for index, payload in enumerate(payloads)}
+
+    stream = pipeline.StreamPipeline(settings, ["http://x/one.m3u8"], label="startup")
+    # The real client is never used; drop its pool rather than leak it.
+    await stream._client.aclose()
+    client = _RecordingClient(data)
+    # A duck-typed stand-in for HLSClient, as `_Racy` is for a process below.
+    stream._client = client  # ty: ignore[invalid-assignment]
+    segments = [
+        Segment(url=f"http://x/{sequence}.ts", sequence=sequence, duration=1.0)
+        for sequence in (100, 101, 102)
+    ]
+    # Mirrors ``_stream_once``: the first segment is prefetched for detection,
+    # the rest are still ``None`` and must be fetched by the feeder.
+    pending: list[WorkItem] = [(segments[0], data[100]), (segments[1], None), (segments[2], None)]
+
+    received = bytearray()
+    try:
+        # The tracker is a duck-typed double: a playlist that has already ended.
+        async for chunk in stream._run_passthrough(
+            _EndOfPlaylistTracker(),  # ty: ignore[invalid-argument-type]
+            pending,
+        ):
+            received += chunk
+    finally:
+        await stream.aclose()
+
+    output = bytes(received)
+    assert client.fetched == [101, 102], (
+        f"each unfetched pending segment exactly once, got {client.fetched}"
+    )
+    offsets = [output.find(payload) for payload in payloads]
+    assert all(offset >= 0 for offset in offsets), (
+        f"startup segments lost (offsets {offsets}) - readiness on the first "
+        "segment discarded the rest of the backlog"
+    )
+    assert offsets == sorted(offsets), f"segments emitted out of order: {offsets}"

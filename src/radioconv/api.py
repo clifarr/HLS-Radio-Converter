@@ -649,11 +649,17 @@ class _Pacer:
             self._started = now - self._emitted / rate
             target = now
 
-        delay = target - now
-        if delay <= 0:
-            return
-        self.waited += 1
-        await asyncio.sleep(min(delay, self.MAX_SLEEP))
+        # Sleep until the deadline, in capped slices so cancellation and the
+        # queue keep being serviced. Sleeping once with ``min(delay,
+        # MAX_SLEEP)`` and returning would send early whenever a single delay
+        # exceeds the cap - the docstring above promises "waking early and
+        # sleeping again lands in exactly the same place", so do that.
+        while True:
+            delay = target - time.monotonic()
+            if delay <= 0:
+                return
+            self.waited += 1
+            await asyncio.sleep(min(delay, self.MAX_SLEEP))
 
 
 def _pace_rate(settings: Settings, session: StreamSession) -> float:
@@ -754,7 +760,7 @@ async def _stream(
         try:
             while True:
                 try:
-                    chunk = await asyncio.wait_for(subscriber.queue.get(), timeout=idle_limit)
+                    item = await asyncio.wait_for(subscriber.queue.get(), timeout=idle_limit)
                 except asyncio.TimeoutError:
                     log.warning(
                         "listener %s starved for %.0fs; closing the connection",
@@ -763,8 +769,9 @@ async def _stream(
                         extra={"session": session.id},
                     )
                     return
-                if chunk is None:
+                if item is None:
                     return
+                produced_at, chunk = item
                 await pacer.wait(len(chunk))
                 subscriber.chunks += 1
                 subscriber.bytes_sent += len(chunk)
@@ -776,6 +783,11 @@ async def _stream(
                 session.stats.bytes_sent += len(chunk)
                 manager.throughput.add_out(len(chunk))
                 yield chunk
+                # Only what the transport accepted counts as delivered: this is
+                # the floor a rejoining connection is primed from (see
+                # `StreamSession._join_floor`), and claiming audio the client
+                # may never have received would turn a replay into a gap.
+                subscriber.last_delivered = produced_at
         finally:
             elapsed = time.time() - subscriber.connected_at
             log.info(

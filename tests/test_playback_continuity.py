@@ -71,7 +71,7 @@ async def test_small_pipe_reads_are_accumulated_into_full_chunks():
         for _ in range(40):
             session._fan_out(b"a" * MEASURED_PIPE_READ)
 
-        chunk = await asyncio.wait_for(subscriber.queue.get(), timeout=5)
+        _, chunk = await asyncio.wait_for(subscriber.queue.get(), timeout=5)
         assert len(chunk) == 8192, (
             f"expected an accumulated 8192-byte chunk, got {len(chunk)} - the queue "
             "bound is only meaningful if items have a known size"
@@ -98,7 +98,7 @@ async def test_large_blobs_are_split_into_full_chunks():
             item = subscriber.queue.get_nowait()
             if item is None:
                 break
-            sizes.append(len(item))
+            sizes.append(len(item[1]))
 
         assert sizes and all(size == 8192 for size in sizes), f"chunk sizes: {set(sizes)}"
 
@@ -107,7 +107,7 @@ async def test_large_blobs_are_split_into_full_chunks():
         held = len(session._pending)
         assert sum(sizes) + held == 240_000, "re-chunking must not lose or duplicate bytes"
         session._flush_pending()
-        assert held > 0 and subscriber.queue.get_nowait() == b"\x00" * held
+        assert held > 0 and subscriber.queue.get_nowait()[1] == b"\x00" * held
         assert session._pending == b""
     finally:
         await session.close("test")
@@ -161,7 +161,7 @@ async def test_the_buffer_absorbs_a_whole_segment_without_dropping():
             item = subscriber.queue.get_nowait()
             if item is None:
                 break
-            queued.append(item)
+            queued.append(item[1])
         assert sum(len(item) for item in queued) == len(segment), "audio was lost"
         assert len(queued) == 9, "8 full chunks plus the flushed remainder"
     finally:
@@ -245,6 +245,26 @@ async def test_pacing_can_be_turned_off():
     assert time.monotonic() - started < 1.0
 
 
+async def test_a_delay_beyond_the_sleep_cap_still_waits_for_its_deadline():
+    """Waking early must sleep again - the cap is a slice, not a deadline.
+
+    ``wait`` used to sleep once with ``min(delay, MAX_SLEEP)`` and return, so
+    any single delay over the cap handed the chunk to the socket before its
+    time. The comment beside it promises "waking early and sleeping again
+    lands in exactly the same place"; the loop is what makes that true.
+    """
+    pacer = _Pacer(lambda: 8192 / 0.3, initial_burst=0.0)  # 0.3 s per chunk
+    pacer.MAX_SLEEP = 0.05  # instance cap, so the test runs in 0.3 s, not 5 s
+
+    started = time.monotonic()
+    await pacer.wait(8192)
+    elapsed = time.monotonic() - started
+    assert elapsed >= 0.25, (
+        f"wait returned after {elapsed:.3f}s of a 0.3s delay: the capped sleep "
+        "was not repeated, so the chunk was sent early"
+    )
+
+
 async def test_no_gap_appears_while_a_segment_plays_out():
     """The end-to-end property, measured the way a radio experiences it.
 
@@ -267,7 +287,7 @@ async def test_no_gap_appears_while_a_segment_plays_out():
         target = int(FAST_RATE * 1.2)
         while time.monotonic() < deadline and received < target:
             try:
-                chunk = await asyncio.wait_for(subscriber.queue.get(), timeout=1.0)
+                _, chunk = await asyncio.wait_for(subscriber.queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 gaps.append(time.monotonic() - last_at)
                 break

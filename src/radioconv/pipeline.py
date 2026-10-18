@@ -439,15 +439,18 @@ class StreamPipeline:
                     await queue.put(plain)
 
             # The first couple of segments may not carry PAT/PMT, so the
-            # demuxer is not "ready" until it has seen the tables.
-            for index, (segment, data) in enumerate(pending):
+            # demuxer is not "ready" until it has seen the tables. Readiness is
+            # a validation condition, NOT permission to drop the rest: the
+            # tracker already advanced past these segments, so deleting them
+            # here (as this code used to, ``pending[index + 1:] = []``) made
+            # them unrecoverable - with two missing 5s segments a listener
+            # jumped forward ~10s at startup. Feed every pending segment in
+            # order and only then check that a usable stream was found.
+            for segment, data in pending:
                 if data is None:
                     data = await self._client.fetch_segment(segment)
                     self._note_input(segment, data)
                 await emit(segment, data)
-                if demux.ready:
-                    pending[index + 1 :] = []
-                    break
             if not demux.ready:
                 raise PipelineError("no usable MPEG-TS audio stream found; use ffmpeg instead")
 

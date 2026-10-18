@@ -58,8 +58,10 @@ CASES: List[Case] = [
     Case(
         "the pacer stops pacing entirely",
         PKG / "api.py",
-        "        delay = target - now\n        if delay <= 0:\n            return",
-        "        delay = target - now\n        if True:\n            return",
+        "        while True:\n            delay = target - time.monotonic()\n"
+        "            if delay <= 0:\n                return",
+        "        while True:\n            delay = target - time.monotonic()\n"
+        "            if True:\n                return",
         f"{CONTINUITY}::test_the_pacer_releases_at_the_stream_rate",
     ),
     Case(
