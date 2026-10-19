@@ -3,6 +3,48 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.2] - 2026-10-19
+
+The dashboard fits a phone.
+
+### Changed
+
+- **The stations table becomes a card per station below 64rem** (1024px),
+  which is where its eleven columns stop fitting. An eleven-column table cannot
+  be squeezed into 390px, and the alternative - sideways scrolling on the one
+  page whose whole job is to be glanced at - is worse than re-laying it out.
+  The card is a small two-column grid of figures with the name above each value
+  (`RADIOS` / `1`), not eleven `label ..... value` lines: the first version did
+  that and on a phone it was eleven rows of mostly `0` and `-`, set in the
+  table's monospace, which read as a spreadsheet turned sideways. The figures
+  are paired by what a person compares (radios and audio held, sent and engine,
+  starved and upstream idle) rather than by the desktop's column order, use the
+  page's own font with tabular digits, and carry their column's description on
+  the cell because the headings that hold it are hidden on a phone. A stalled
+  station colours the whole card. The station name wraps instead of being
+  truncated, because a URL cut to a dozen characters identifies nothing. Column
+  names are read from the headings at runtime rather than copied into the
+  script, so a renamed column cannot leave a header and a card label
+  disagreeing.
+- **The configuration list is narrower and compacts on a phone.** Two columns of
+  short strings stretched across a wide page read as a gap with an underline, so
+  it is capped at 34rem; below 64rem it drops a size and gives the label column
+  60% of the width, which stops values wrapping while labels take the room.
+- **The desktop table is trimmed** (station column 26rem -> 20rem, tighter cell
+  padding), which brings its natural width from about 1260px to 1150px - it now
+  fits a 1280px window instead of needing the horizontal scroller.
+
+### Testing
+
+- Two guards pin the card layout. The first: the table's shape (11 headings),
+  the labels being derived from the headings rather than hard-coded, every cell
+  being built by index, the explicit ARIA roles that `display: block` would
+  otherwise remove, and the narrow-screen CSS block. The second pins the things
+  that made it readable after the first attempt was rejected as unreadable: a
+  two-column grid with the label above its value, the page font rather than the
+  table's monospace, a chosen reading order, and descriptions on the cells.
+  329 tests in total.
+
 ## [2.1.1] - 2026-10-19
 
 A deploy that changes the dashboard now actually reaches the browser.
@@ -212,6 +254,7 @@ for the FFmpeg-free pass-through path, per-listener pacing with drop
 isolation, a dashboard with health metrics, and a systemd installer for the
 Raspberry Pi.
 
+[2.1.2]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.1.2
 [2.1.1]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.1.1
 [2.1.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.1.0
 [2.0.3]: https://github.com/clifarr/HLS-Radio-Converter/compare/v2.0.2...v2.0.3

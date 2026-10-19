@@ -15,12 +15,15 @@
   --ok: #1a7f37;
   --warn: #9a6700;
   --bad: #b3261e;
+  /* Named because the table opts out of it (see below) and the mobile cards
+     opt back in, and the two must not drift apart. */
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
 * { box-sizing: border-box; }
 
 body {
-  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font: 16px/1.55 var(--sans);
   color: var(--fg);
   max-width: 62rem;
   margin: 0 auto;
@@ -211,13 +214,161 @@ th[data-tooltip] { border-bottom: 1px dotted var(--muted); }
 /* -------------------------------------------------------------------- table */
 .scroll { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: .88rem; }
-th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid var(--line); }
+th, td { text-align: left; padding: .4rem .45rem; border-bottom: 1px solid var(--line); }
 thead th { color: var(--muted); font-weight: 600; white-space: nowrap; }
 tbody tr:hover { background: var(--card); }
 td.empty, .empty { color: var(--muted); text-align: center; padding: 1.2rem; }
-.station { max-width: 26rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 20rem, not 26: the eleven columns then fit a 1280px window, which is the
+   narrowest desktop this is likely to be read on. A longer URL is cut with an
+   ellipsis, as it always was - it is the station's `&name=` that identifies it. */
+.station { max-width: 20rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-dead td { color: var(--bad); }
 /* Connected but producing no audio: the state that used to look healthy. */
 .row-stalled td { background: #fdf3d5; }
 .row-stalled td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
 table.kv th { font-weight: 400; color: var(--muted); white-space: nowrap; width: 1%; }
+/* Two columns of short strings stretched across a wide page read as a gap with
+   an underline. The settings are a list, not a grid. */
+table.kv { max-width: 34rem; }
+
+/* ------------------------------------------------------------ narrow screens */
+/* "Is my radio working?" is usually asked from a phone, so the whole page has
+ * to fit one without sideways scrolling. Two of the three blocks do not fit as
+ * they are on a desktop: an eleven-column table cannot shrink to 390px, and the
+ * settings list does not need to. They are re-laid out rather than squeezed.
+ *
+ * 64rem is where the table stops fitting and starts scrolling sideways; below
+ * that, one card per station is the honest presentation of the same numbers.
+ *
+ * The station table becomes one card per station: the header row is hidden and
+ * each cell prints its own name from `data-label`, which dashboard.js sets from
+ * the same words as the header. `display: block` would otherwise drop the table
+ * from the accessibility tree, which is why the template and the script also
+ * spell out the roles the table would get for free.
+ */
+@media (max-width: 64rem) {
+  table.stations,
+  table.stations tbody,
+  table.stations tr,
+  table.stations td { display: block; }
+  table.stations thead { display: none; }
+
+  /* The card is a small grid of figures, not eleven label/value rows.
+   *
+   * The first attempt stacked one `label ......... value` line per cell, which
+   * on a phone became eleven lines of mostly `0` and `-` - a spreadsheet turned
+   * sideways. A figure and its name belong together in a block, two blocks to a
+   * row, so the eye picks out what matters (radios, buffer, bytes) without
+   * reading every line. */
+  table.stations tbody tr {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: .5rem .9rem;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: .55rem;
+    padding: .6rem .75rem .7rem;
+    margin: 0 0 .6rem;
+  }
+  table.stations tbody tr:hover { background: var(--card); }
+
+  /* Body font, not the monospace the table sets: the monospace was right for
+     eleven aligned columns of digits and is wrong for a block of prose-length
+     labels. Figures keep tabular digits so they do not jitter as they update. */
+  table.stations td {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: .1rem;
+    padding: 0;
+    border-bottom: 0;
+    font-family: var(--sans);
+    font-size: .95rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  table.stations td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: .66rem;
+    font-weight: 400;
+    line-height: 1.1;
+    letter-spacing: .05em;
+    text-transform: uppercase;
+  }
+
+  /* Which figure sits beside which. The grid fills row by row, so this pairing
+     is the column order - and the reading order of a phone card should group
+     what a person compares (is it buffered, is it sending, is anything starved)
+     rather than repeat the desktop's left-to-right importance. Keyed on the
+     label the script copies from the heading; if a column is renamed these
+     rules simply stop applying and the cell falls back to DOM order. */
+  table.stations td[data-label="Radios"] { order: 1; }
+  table.stations td[data-label="Buffered"] { order: 2; }
+  table.stations td[data-label="Sent"] { order: 3; }
+  table.stations td[data-label="Engine"] { order: 4; }
+  table.stations td[data-label="Starved"] { order: 5; }
+  table.stations td[data-label="Upstream idle"] { order: 6; }
+  table.stations td[data-label="Dropped"] { order: 7; }
+  table.stations td[data-label="Failures"] { order: 8; }
+  table.stations td[data-label="Restarts"] { order: 9; }
+  table.stations td[data-label="Up"] { order: 10; }
+
+  /* The same dotted underline the headings carry on a desktop, but only under
+     the label's own words - across the full cell width it read as a rule
+     between every line, which is exactly the look this replaces. */
+  table.stations td[data-tooltip]::before { border-bottom: 1px dotted currentColor; }
+  table.stations td[data-tooltip]::before { padding-bottom: 1px; }
+
+  /* The name is the card's title: full width, wrap, and not bold like a figure.
+     A URL cut to a dozen characters identifies nothing, so it wraps - and the
+     `#id · source` line below it is the small print. */
+  table.stations td.station-cell {
+    grid-column: 1 / -1;
+    display: block;
+    font-weight: 400;
+    padding: 0 0 .1rem;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: .2rem;
+  }
+  table.stations td.station-cell::before { content: none; }
+  table.stations .station {
+    max-width: none;
+    white-space: normal;
+    overflow: visible;
+    overflow-wrap: anywhere;
+    font-size: .84rem;
+    line-height: 1.35;
+  }
+
+  /* "Nothing is playing right now." is one sentence, not a grid. */
+  table.stations td.empty {
+    grid-column: 1 / -1;
+    display: block;
+    align-items: center;
+    font-weight: 400;
+    padding: .6rem 0;
+  }
+
+  /* A card is one object, so a problem colours the whole card instead of one
+     cell inside it. The bar down the side becomes the card's left edge. */
+  table.stations tr.row-stalled {
+    background: #fdf3d5;
+    border-color: #ecdca6;
+    border-left: 3px solid var(--warn);
+  }
+  table.stations tr.row-stalled td,
+  table.stations tr.row-stalled td:first-child {
+    background: transparent;
+    box-shadow: none;
+  }
+
+  /* Two columns of short strings fit - they just need less room per row. The
+     label column is given most of the width instead of sizing itself to its
+     longest line ("Keep warm after the last radio leaves"), which left the
+     values 69px and wrapped "192 kbit/s" onto two lines. */
+  table.kv { font-size: .78rem; }
+  table.kv th, table.kv td { padding: .28rem .35rem; }
+  table.kv th { width: 60%; white-space: normal; }
+}
+

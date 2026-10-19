@@ -523,6 +523,118 @@ def test_the_header_marks_which_page_you_are_on(live_server):
     )
 
 
+def test_the_station_table_becomes_cards_on_a_phone(live_server):
+    """Requested: make the dashboard fit a phone, and station rows become cards.
+
+    An eleven-column table cannot be squeezed into 390px: the alternative to a
+    card layout is either sideways scrolling (on the one page whose whole job is
+    to be glanced at) or type too small to read. The same markup serves both
+    layouts - the header row is hidden on a narrow screen and every cell prints
+    its own name from `data-label`.
+
+    Names are read from the headings at runtime instead of being written into
+    the script, so a renamed column cannot end up with a header saying one thing
+    and a card label saying another. This test pins that: the script must derive
+    the label, and must not hard-code the words.
+    """
+    body = httpx.get(live_server + web.DASHBOARD_URL, timeout=10).text
+    assert '<table class="stations" role="table">' in body, (
+        "the station table is not marked for the card layout"
+    )
+    # Station + ten figures. The script indexes into these, so the count matters.
+    stations = body.split('<table class="stations"', 1)[1].split("</table>", 1)[0]
+    assert len(re.findall(r"<th\b", stations)) == 11, "the stations table changed shape"
+
+    script = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.js").read_text(encoding="utf-8"),
+        language="javascript",
+    )
+    assert 'querySelectorAll(".stations thead th")' in script, (
+        "dashboard.js no longer reads the column names from the headings"
+    )
+    assert "data-label" in script or "dataset.label" in script, (
+        "cells do not name themselves, so a card shows bare values"
+    )
+    # Every column after the station name is addressed by index. A hard-coded
+    # label here would be a second copy of the heading that nothing updates.
+    for index in range(1, 11):
+        assert f"cell({index}," in script, f"no cell is built for column {index}"
+    for hardcoded in ('cell("Radios"', 'cell("Engine"', 'cell("Starved"'):
+        assert hardcoded not in script, (
+            f"{hardcoded} hard-codes a column name that the heading already carries"
+        )
+    # `display: block` drops the table out of the accessibility tree unless the
+    # roles are explicit - in the template and on every cell the script makes.
+    assert 'setAttribute("role", "cell")' in script, "cells drop their row/table semantics"
+
+    css = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.css").read_text(encoding="utf-8"),
+        language="css",
+    )
+    mobile = re.search(r"@media \(max-width: 64rem\) \{(.*)\n\}", css, re.S)
+    assert mobile, "the narrow-screen layout is gone; the table is back to scrolling"
+    block = mobile.group(1)
+    for needed in ("table.stations thead { display: none; }", "attr(data-label)"):
+        assert needed in block, f"the card layout no longer does {needed!r}"
+    # The settings list gets its own compaction rather than being squeezed.
+    assert "table.kv" in block, "the configuration table is not adjusted for a phone"
+
+
+def test_the_cards_read_as_cards_not_as_a_stack_of_rows():
+    """Reported: the first card layout was "rather ugly and unreadable".
+
+    It stacked one `label ......... value` row per cell: eleven lines on a
+    phone, mostly `0` and `-`, in the table's monospace, with a dotted rule
+    under every label. That is a spreadsheet turned sideways.
+
+    A card is a small grid of figures instead - label above value, two figures
+    to a row - in the page's own font, with the figures paired by what a person
+    compares rather than by the desktop's column order. Those are the things
+    that made it readable, so they are what this pins.
+    """
+    css = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.css").read_text(encoding="utf-8"),
+        language="css",
+    )
+    mobile = re.search(r"@media \(max-width: 64rem\) \{(.*)\n\}", css, re.S)
+    assert mobile, "the narrow-screen layout is gone"
+    block = mobile.group(1)
+
+    # Two figures per row, laid out as a grid rather than a list of rows.
+    assert "grid-template-columns: 1fr 1fr" in block, (
+        "the card is not a two-column grid any more; it is back to one line per "
+        "figure, which is eleven lines of mostly zeroes"
+    )
+    # ...with the name above its value, not across a row from it.
+    assert "flex-direction: column" in block, (
+        "the label sits beside its value again, which is the spreadsheet look"
+    )
+    # The table's monospace is for aligned columns of digits; a block of labels
+    # set in it is what made the card look like a terminal dump.
+    assert "font-family: var(--sans)" in block, (
+        "the card did not opt out of the table's monospace font"
+    )
+    assert "--sans:" in css, "the body font stack is not shared with the card"
+
+    # The reading order is chosen, not inherited: the first pair a person sees
+    # is radios and audio held, not radios and the `-` in Dropped.
+    for label in ("Radios", "Buffered", "Sent", "Engine", "Starved"):
+        assert f'td[data-label="{label}"] {{ order:' in block, (
+            f"{label} has no place in the card's reading order"
+        )
+    assert "order: 1" in block and "order: 2" in block, "the card's order rules are gone"
+
+    # Every label is reachable for its description, and the description is on
+    # the cell now that the headings are hidden.
+    script = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.js").read_text(encoding="utf-8"),
+        language="javascript",
+    )
+    assert "node.dataset.tooltip = column.tip" in script, (
+        "cards have no tooltips: the headings that carry them are hidden on a phone"
+    )
+
+
 def test_the_packaged_assets_are_declared_for_pyinstaller():
     """``packaging/radioconv.spec`` must ship the directories it now needs.
 

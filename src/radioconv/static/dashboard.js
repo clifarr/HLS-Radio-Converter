@@ -144,6 +144,48 @@
     return node;
   }
 
+  /* A table cell that also knows its own name, and what it counts.
+   *
+   * On a phone the station table is laid out as one card per station (see the
+   * narrow-screen block in dashboard.css) and the header row is hidden - so
+   * each cell prints `data-label` in front of its value, because "8.9s" alone
+   * on a line says nothing, and carries the column's description, because the
+   * explanation is otherwise attached to a heading nobody can see or tap.
+   *
+   * Both come from the heading itself rather than being repeated here: the
+   * header row is the one place that says what a column means, and a second
+   * copy in this file is the copy nobody re-reads.
+   *
+   * `role` is set explicitly for the same reason the template sets it: the card
+   * layout uses `display: block`, which otherwise removes the table from the
+   * accessibility tree and leaves a screen reader with a pile of loose text.
+   */
+  let headings = null;
+
+  function heading(index) {
+    if (!headings) {
+      headings = Array.from(document.querySelectorAll(".stations thead th")).map((th) => ({
+        label: th.textContent.trim(),
+        tip: th.dataset.tooltip || "",
+      }));
+    }
+    return headings[index];
+  }
+
+  function cell(index, className, text) {
+    const node = element("td", className, text);
+    const column = heading(index);
+    if (column) {
+      node.dataset.label = column.label;
+      // The Station cell is the card's title, and it is where a stalled or dead
+      // row states its problem (see streamRow) - a description of its own would
+      // sit on top of that.
+      if (column.tip && index > 0) node.dataset.tooltip = column.tip;
+    }
+    node.setAttribute("role", "cell");
+    return node;
+  }
+
   /* Whether ffmpeg is running, and nothing else.
    *
    * The codec used to be appended here as `transcode \u00b7 mp3`, taken from
@@ -181,6 +223,7 @@
     const dropped = subscribers.reduce((total, sub) => total + (sub.dropped || 0), 0);
 
     const row = element("tr");
+    row.setAttribute("role", "row");
     if (detail.fatal_error) {
       row.className = "row-dead";
       row.dataset.tooltip = detail.fatal_error;
@@ -194,7 +237,9 @@
         " - long enough to be heard as silence";
     }
 
-    const station = element("td");
+    // No label of its own: on a phone this cell is the card's title, and the
+    // place a stalled or dead row explains itself (see above).
+    const station = cell(0, "station-cell");
     station.appendChild(element("div", "station", detail.label || detail.key || detail.id));
     station.appendChild(
       element(
@@ -207,20 +252,20 @@
     );
     row.appendChild(station);
 
-    row.appendChild(element("td", "num", count(detail.listeners)));
-    row.appendChild(element("td", "num", dropped ? count(dropped) : "\u2013"));
-    row.appendChild(element("td", null, engineLabel(pipeline)));
-    row.appendChild(element("td", "num", bufferedSeconds(detail)));
+    row.appendChild(cell(1, "num", count(detail.listeners)));
+    row.appendChild(cell(2, "num", dropped ? count(dropped) : "\u2013"));
+    row.appendChild(cell(3, null, engineLabel(pipeline)));
+    row.appendChild(cell(4, "num", bufferedSeconds(detail)));
     // `bytes_sent`, not `bytes_out`: the latter counts what the pipeline
     // *produced*, which includes audio for a warm station nobody is listening to
     // and audio dropped for a listener that fell behind. The column and the
     // "audio sent" tile must mean the same thing or one of them is lying.
-    row.appendChild(element("td", "num", bytes(session.bytes_sent)));
-    row.appendChild(element("td", "num", count(session.restarts)));
-    row.appendChild(element("td", "num", count(pipeline.failures)));
-    row.appendChild(element("td", "num", duration(detail.starved_for)));
-    row.appendChild(element("td", "num", duration(pipeline.idle)));
-    row.appendChild(element("td", "num", duration(session.uptime)));
+    row.appendChild(cell(5, "num", bytes(session.bytes_sent)));
+    row.appendChild(cell(6, "num", count(session.restarts)));
+    row.appendChild(cell(7, "num", count(pipeline.failures)));
+    row.appendChild(cell(8, "num", duration(detail.starved_for)));
+    row.appendChild(cell(9, "num", duration(pipeline.idle)));
+    row.appendChild(cell(10, "num", duration(session.uptime)));
     return row;
   }
 
@@ -231,9 +276,13 @@
 
     tbody.textContent = "";
     if (!details.length) {
-      const cell = element("td", "empty", "Nothing is playing right now.");
-      cell.colSpan = 11;
-      tbody.appendChild(element("tr")).appendChild(cell);
+      const row = element("tr");
+      row.setAttribute("role", "row");
+      const placeholder = element("td", "empty", "Nothing is playing right now.");
+      placeholder.colSpan = 11;
+      placeholder.setAttribute("role", "cell");
+      row.appendChild(placeholder);
+      tbody.appendChild(row);
       return;
     }
     details.forEach((detail) => tbody.appendChild(streamRow(detail)));
