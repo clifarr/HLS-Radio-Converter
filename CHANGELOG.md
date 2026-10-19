@@ -3,6 +3,48 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.0] - 2026-10-19
+
+Dashboard-clarity release: the Engine column says what it means, the two
+throughput figures are read as a pair, and the header stops looking like an
+unstyled list.
+
+### Changed
+
+- **The Engine column shows only the engine** (`passthrough`, `transcode` or
+  `starting…`). It used to append a codec built as
+  `detected_kind || detected_codec` - the *source* kind first, the *output*
+  codec as a fallback - so one slot meant two different things: a station with
+  ADTS AAC inside a transport stream read `transcode · adts`, while one serving
+  bare `.aac` segments read `transcode · mp3` because nothing had been detected
+  and the fallback named the output. Neither told a listener anything
+  actionable, and the first looked like it contradicted the second. What the
+  column now answers is the only question it was ever read for: is FFmpeg
+  running? The codec fields remain in `/metrics.json` as diagnostics, and
+  `detected_kind` still drives the `codec=auto` Content-Type.
+- **Received and audio-sent share one tile.** They were two tiles in an
+  `auto-fit` grid, so whether they landed side by side depended on the column
+  count - at an ordinary desktop width the row broke exactly between them,
+  separating the two figures a reader compares. They now live in one tile that
+  spans two grid cells, so no column count can split them; below ~330px the
+  pair falls back to a single cell with both halves still side by side.
+
+### Added
+
+- **The header marks the current page.** The links were plain text at body
+  size, which read as an unstyled list next to the title. They are now chips in
+  the same visual language as the tiles and the status pill, and the current
+  page is marked with `aria-current="page"` - styled, and announced to a
+  screen reader.
+
+### Testing
+
+- New guards: the throughput figures must resolve to the *same* `.tile`
+  ancestor (a text search cannot tell one tile holding both from two adjacent
+  tiles, which is the bug); `engineLabel` is driven under Node with real
+  snapshot shapes and must ignore both codec fields; each page marks its own
+  nav link and styles it. 324 tests in total.
+
 ## [2.0.3] - 2026-10-19
 
 Song-titles and rejoin-continuity release: standard HLS timed metadata now
@@ -142,6 +184,8 @@ for the FFmpeg-free pass-through path, per-listener pacing with drop
 isolation, a dashboard with health metrics, and a systemd installer for the
 Raspberry Pi.
 
+[2.1.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.1.0
+[2.0.3]: https://github.com/clifarr/HLS-Radio-Converter/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/clifarr/HLS-Radio-Converter/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/clifarr/HLS-Radio-Converter/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.0.0

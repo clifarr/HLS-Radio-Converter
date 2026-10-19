@@ -46,15 +46,22 @@
     <span class="value" data-metric="uptime" data-format="duration">&ndash;</span>
     <span class="label">running for</span>
   </div>
-  <div class="tile" tabindex="0"
-       data-tooltip="Bytes downloaded from the stations during the last 60 minutes (playlists and audio segments). This is network traffic IN. It keeps rising on a warm station that has no radios listening, which is normal.">
-    <span class="value" data-metric="gauges.bytes_in_last_hour" data-format="bytes">&ndash;</span>
-    <span class="label">received, last hour</span>
-  </div>
-  <div class="tile" tabindex="0"
-       data-tooltip="Audio bytes handed to radios during the last 60 minutes. This is what actually left the machine towards a radio - audio produced while no radio was listening is deliberately not counted here.">
-    <span class="value" data-metric="gauges.bytes_out_last_hour" data-format="bytes">&ndash;</span>
-    <span class="label">audio sent, last hour</span>
+  {# Received and sent are one figure read as a pair - they are what a person
+     compares when asking "what is this station costing me?". As two tiles in
+     an auto-fit grid, the row broke between them on any screen wide enough for
+     eight tiles, so they were never side by side where it mattered. Both live
+     in one tile now, which the grid cannot split. #}
+  <div class="tile pair">
+    <span class="half" tabindex="0"
+          data-tooltip="Bytes downloaded from the stations during the last 60 minutes (playlists and audio segments). This is network traffic IN. It keeps rising on a warm station that has no radios listening, which is normal.">
+      <span class="value" data-metric="gauges.bytes_in_last_hour" data-format="bytes">&ndash;</span>
+      <span class="label">received, last hour</span>
+    </span>
+    <span class="half" tabindex="0"
+          data-tooltip="Audio bytes handed to radios during the last 60 minutes. This is what actually left the machine towards a radio - audio produced while no radio was listening is deliberately not counted here.">
+      <span class="value" data-metric="gauges.bytes_out_last_hour" data-format="bytes">&ndash;</span>
+      <span class="label">audio sent, last hour</span>
+    </span>
   </div>
   <div class="tile" tabindex="0"
        data-tooltip="Chunks of audio thrown away because a radio was not reading fast enough. A few is harmless; a number that keeps climbing means a slow or congested radio, or one with a tiny buffer.">
@@ -87,7 +94,7 @@
       <th tabindex="0" data-tooltip="The name the radio gave with its &amp;name= parameter, or the source URL when it gave none. Radios asking for the same URL share one row.">Station</th>
       <th class="num" tabindex="0" data-tooltip="Radio connections attached to this station right now.">Radios</th>
       <th class="num" tabindex="0" data-tooltip="Chunks of audio discarded for a listener on this station that fell too far behind. Anything other than 0 means a radio is not keeping up.">Dropped</th>
-      <th tabindex="0" data-tooltip="How the audio is produced: 'passthrough' means it is forwarded without FFmpeg running at all, 'transcode' means FFmpeg is re-encoding it to the configured bitrate, 'starting' means the first segment has not arrived yet.">Engine</th>
+      <th tabindex="0" data-tooltip="How the audio is produced: 'passthrough' means it is forwarded without FFmpeg running at all, 'transcode' means FFmpeg is producing it (re-encoding, or remuxing the source codec), 'starting' means the first segment has not arrived yet.">Engine</th>
       <th class="num" tabindex="0" data-tooltip="Seconds of audio currently held for this station's listeners - the least-buffered listener, since a station is only as safe as its worst-served radio. This is the jitter buffer that covers the gap between one HLS segment arriving and the next. A new listener is given recent audio immediately, so this does not start at 0.">Buffered</th>
       <th class="num" tabindex="0" data-tooltip="Audio bytes handed to radios for this station since it started. Excludes audio that was produced while nobody was listening.">Sent</th>
       <th class="num" tabindex="0" data-tooltip="Times this station's pipeline was torn down and rebuilt, because fetching kept failing or because it went quiet for too long.">Restarts</th>

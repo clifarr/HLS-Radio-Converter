@@ -55,9 +55,23 @@ code { font-size: .88em; background: #fff; border: 1px solid var(--line); border
   border-bottom: 1px solid var(--line);
   padding-bottom: .5rem;
 }
-.head nav { display: flex; gap: 1rem; }
-.head nav a { text-decoration: none; }
-.head nav a:hover { text-decoration: underline; }
+.head nav { display: flex; gap: .15rem; font-size: .875rem; }
+/* The links are chrome, not content. Inheriting the body size made them the
+   largest thing in the header after the title, which read as an unstyled list
+   rather than part of the page. They are chips in the same visual language as
+   the tiles and the status pill, and the current page is marked. */
+.head nav a {
+  color: var(--muted);
+  text-decoration: none;
+  padding: .2rem .55rem;
+  border-radius: .35rem;
+}
+.head nav a:hover { background: var(--card); color: var(--fg); }
+.head nav a[aria-current="page"] {
+  background: var(--card);
+  color: var(--fg);
+  font-weight: 600;
+}
 
 /* Status pill, filled in by dashboard.js once a poll has succeeded. */
 .pill {
@@ -123,6 +137,24 @@ code.block {
 }
 .tile .value { display: block; font-size: 1.4rem; line-height: 1.2; }
 .tile .label { display: block; color: var(--muted); font-size: .8rem; }
+
+/* Two readings a person compares, so they share one tile and cannot be
+   separated by a row break. The tile spans two grid cells, which keeps each
+   half as wide as a neighbouring tile; the halves are inside one element, so
+   they stay side by side whatever the column count does. */
+.tile.pair {
+  grid-column: span 2;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 1rem;
+}
+.tile.pair .half { display: block; min-width: 0; }
+
+/* One column (below about 330px): a two-cell span would reach past the page
+   edge, and the halves still fit side by side inside a single cell. */
+@media (max-width: 20.6rem) {
+  .tile.pair { grid-column: span 1; }
+}
 /* Tiles inside a card would otherwise be the same colour as it and stop reading
    as tiles at all - which is what the landing page does. */
 .card .tile { background: #fff; border: 1px solid var(--line); }
@@ -141,7 +173,7 @@ code.block {
  * absolutely-positioned child of a scrolling box is clipped by it.
  */
 [data-tooltip] { cursor: default; }
-.tile[data-tooltip] .label { border-bottom: 1px dotted currentColor; }
+[data-tooltip] .label { border-bottom: 1px dotted currentColor; }
 th[data-tooltip] { border-bottom: 1px dotted var(--muted); }
 
 /* Focusable so a keyboard (and a phone, which has no hover at all) can reach the

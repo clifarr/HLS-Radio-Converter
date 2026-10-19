@@ -152,6 +152,7 @@ def index_page(settings: Settings, request: Request, target: str = "") -> HTMLRe
 
     return _page(
         "index.html",
+        current="converter",
         base=base,
         target=target,
         usable=usable,
@@ -168,7 +169,12 @@ def dashboard_page(settings: Settings, request: Request) -> HTMLResponse:
     The figures themselves are fetched by the browser; what is rendered here is
     the shell and the configuration, which cannot change while we are running.
     """
-    return _page("dashboard.html", base=base_url(settings, request), config=_config(settings))
+    return _page(
+        "dashboard.html",
+        current="dashboard",
+        base=base_url(settings, request),
+        config=_config(settings),
+    )
 
 
 def _config(settings: Settings) -> Dict[str, str]:

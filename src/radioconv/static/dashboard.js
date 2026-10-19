@@ -144,11 +144,19 @@
     return node;
   }
 
+  /* Whether ffmpeg is running, and nothing else.
+   *
+   * The codec used to be appended here as `transcode \u00b7 mp3`, taken from
+   * `detected_kind` (the SOURCE kind) with `detected_codec` (the OUTPUT kind)
+   * as a fallback. The same slot therefore meant two different things: the
+   * same station with an ADTS-in-TS source read `transcode \u00b7 adts`, while
+   * one serving a bare `.aac` segment read `transcode \u00b7 mp3`, and neither
+   * said what was actually happening. A listener only needs the engine.
+   */
   function engineLabel(pipeline) {
     const mode = pipeline.mode || "starting";
-    const kind = pipeline.detected_kind || pipeline.detected_codec;
     if (mode === "unknown") return "starting\u2026";
-    return kind ? mode + " \u00b7 " + kind : mode;
+    return mode;
   }
 
   /* Seconds of audio buffered for this station's listeners.

@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import time
+from html.parser import HTMLParser
 
 import httpx
 import pytest
@@ -127,6 +128,88 @@ def test_the_javascript_parses():
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_the_engine_column_reports_only_the_engine(tmp_path):
+    """Reported: "the stream that is currently playing says transcode - mp3."
+
+    The Engine column appended a codec, built as ``detected_kind ||
+    detected_codec`` - the *source* kind first, the *output* codec second. One
+    slot therefore meant two different things: a station with ADTS AAC in a
+    transport stream read ``transcode · adts``, while a station serving bare
+    ``.aac`` segments read ``transcode · mp3`` (nothing was detected, so the
+    fallback named the output). Neither told a listener what to do, and the
+    first one looked like it contradicted the second.
+
+    What a listener needs is whether FFmpeg is running, so the column is the
+    mode alone. This runs the shipped ``engineLabel`` under Node: a text search
+    would pass for a comment, and rendering the page would need a browser.
+    """
+    node = shutil.which("node")
+    if node is None:
+        # ty mis-resolves pytest.skip (see tests/conftest.py).
+        pytest.skip("node is not installed")  # ty: ignore[too-many-positional-arguments]
+    script = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.js").read_text(encoding="utf-8"),
+        language="javascript",
+    )
+    match = re.search(r"function engineLabel\(pipeline\) \{.*?\n  \}", script, re.S)
+    assert match, (
+        "engineLabel has moved or changed shape - the column's text must stay "
+        "a pure function this test can drive"
+    )
+    # And the codec fields must not come back through another door.
+    for field in ("detected_kind", "detected_codec"):
+        assert field not in script, (
+            f"dashboard.js reads {field} again; the Engine column is the engine"
+        )
+
+    # Pipelines as the snapshot sends them, including the codec fields this
+    # column must ignore, and the text it must produce.
+    expectations = [
+        (
+            "forwarded without ffmpeg",
+            "{ mode: 'passthrough', detected_kind: 'mp3', detected_codec: 'mp3' }",
+            "passthrough",
+        ),
+        (
+            "ADTS source, re-encoded to mp3",
+            "{ mode: 'transcode', detected_kind: 'adts', detected_codec: 'mp3' }",
+            "transcode",
+        ),
+        (
+            "raw .aac source, nothing detected",
+            "{ mode: 'transcode', detected_codec: 'mp3' }",
+            "transcode",
+        ),
+        ("first segment not arrived", "{ mode: 'unknown' }", "starting\u2026"),
+        ("no reading yet", "{}", "starting"),
+    ]
+    checks = "\n".join(
+        f"check({label!r}, engineLabel({snap}), {want!r});" for label, snap, want in expectations
+    )
+    harness = (
+        match.group(0)
+        + "\n\nfunction check(label, actual, want) {\n"
+        + "  if (actual !== want) {\n"
+        + '    console.error(label + ": got " + JSON.stringify(actual) + ", want "'
+        + " + JSON.stringify(want));\n"
+        + "    process.exit(1);\n"
+        + "  }\n"
+        + "}\n"
+        + checks
+        + '\nconsole.log("engineLabel: the column is the engine and nothing else");\n'
+    )
+    script_file = tmp_path / "engine_label.js"
+    script_file.write_text(harness, encoding="utf-8")
+    result = subprocess.run(
+        [node, str(script_file)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def code_only(text: str, *, language: str) -> str:
@@ -271,6 +354,116 @@ def test_the_page_does_not_recompute_what_the_server_already_measured():
     assert "queued_chunks" not in script, (
         "the dashboard is recomputing the buffer from a chunk count again, which is "
         "the aggregation mismatch that made the two columns contradict each other"
+    )
+
+
+#: The two figures a person reads against each other. Both used to be separate
+#: tiles, which the auto-fit grid was free to put in different rows.
+THROUGHPUT = ("gauges.bytes_in_last_hour", "gauges.bytes_out_last_hour")
+
+
+class _NearestTile(HTMLParser):
+    """Map each ``data-metric`` to the ``.tile`` element that contains it.
+
+    Identity is an integer stamped on every element that carries the ``tile``
+    class, so two figures can be compared by which tile owns them. A text search
+    for the class name cannot tell "one tile holding both" from "two tiles in a
+    row that happens to be adjacent in the source" - which is the bug this
+    guards against.
+    """
+
+    def __init__(self, wanted):
+        super().__init__()
+        self.wanted = set(wanted)
+        self.open: list = []  # (tag, tile id or None) for each open element
+        self.owners: dict = {}
+        self.classes: dict = {}
+        self._next_id = 0
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        classes = (attributes.get("class") or "").split()
+        owner = None
+        if "tile" in classes:
+            self._next_id += 1
+            owner = self._next_id
+            self.classes[owner] = classes
+        self.open.append((tag, owner))
+        metric = attributes.get("data-metric")
+        if metric in self.wanted:
+            self.owners[metric] = next(
+                (tile for _tag, tile in reversed(self.open) if tile is not None), None
+            )
+
+    handle_startendtag = handle_starttag
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.open) - 1, -1, -1):
+            if self.open[index][0] == tag:
+                del self.open[index:]
+                return
+
+
+def test_received_and_sent_are_one_tile(live_server):
+    """Reported: "the received and sent metrics always appear in different rows."
+
+    They were two tiles in an ``auto-fit`` grid, so whether they landed side by
+    side depended on the column count - at eight columns, an ordinary desktop
+    width, "received" ended a row and "audio sent" started the next. Two figures
+    a reader compares are exactly the ones the grid must not separate, so they
+    share one tile, which no column count can split.
+    """
+    body = httpx.get(live_server + web.DASHBOARD_URL, timeout=10).text
+    finder = _NearestTile(THROUGHPUT)
+    finder.feed(body)
+
+    assert set(finder.owners) == set(THROUGHPUT), (
+        "the throughput figures are missing from the dashboard"
+    )
+    incoming, outgoing = (finder.owners[metric] for metric in THROUGHPUT)
+    assert incoming is not None, "received is not inside a tile at all"
+    assert incoming == outgoing, (
+        "received and sent are separate tiles again; the grid can put them in "
+        "different rows, which is the layout this guards against"
+    )
+    assert "pair" in finder.classes[incoming], (
+        "the throughput tile is not marked as a pair, so it will not span the "
+        "two cells that keep both halves readable"
+    )
+
+    css = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.css").read_text(encoding="utf-8"),
+        language="css",
+    )
+    assert ".tile.pair" in css and "grid-column: span 2" in css, (
+        "the pair tile no longer spans two cells; each half shrinks to half a "
+        "tile and the byte figures wrap"
+    )
+
+
+def test_the_header_marks_which_page_you_are_on(live_server):
+    """The links are chips, and the current one stays marked after a click.
+
+    They used to inherit the body size and read as an unstyled list next to the
+    title. The styling alone cannot say which page is open, so each page marks
+    its own link, and that mark is what ``aria-current`` is for - a reader with
+    a screen reader gets it too, not just the one seeing the highlight.
+    """
+    pages = {
+        "/": "Converter",
+        web.DASHBOARD_URL: "Dashboard",
+    }
+    for path, label in pages.items():
+        body = httpx.get(live_server + path, timeout=10).text
+        marked = re.findall(r'<a href="[^"]*" aria-current="page">([^<]+)</a>', body)
+        assert marked == [label], f"{path} marks {marked}, expected only {label!r}"
+
+    css = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.css").read_text(encoding="utf-8"),
+        language="css",
+    )
+    assert '.head nav a[aria-current="page"]' in css, (
+        "the current page is marked in the markup but not styled"
     )
 
 

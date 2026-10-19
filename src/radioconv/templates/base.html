@@ -22,8 +22,8 @@
     <span class="muted small">v{{ version }}</span>
   </h1>
   <nav>
-    <a href="/">Converter</a>
-    <a href="{{ dashboard_url }}">Dashboard</a>
+    <a href="/" {% if current == "converter" %}aria-current="page"{% endif %}>Converter</a>
+    <a href="{{ dashboard_url }}" {% if current == "dashboard" %}aria-current="page"{% endif %}>Dashboard</a>
     <a href="/docs">API reference</a>
   </nav>
   {# Hidden until the script runs, so a browser with scripting off shows

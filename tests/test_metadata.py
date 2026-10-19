@@ -498,13 +498,44 @@ def test_pyproject_has_no_package_index_metadata():
     assert "classifiers = [" not in pyproject, "classifiers only serve a package index"
     assert "keywords = [" not in pyproject, "keywords only serve a package index"
     # But the metadata an actual `pip install .` depends on must still be there.
+    # The version comes from the package itself rather than a literal: a literal
+    # makes every release edit this file (and a test that must be edited to pass
+    # stops being a guard), while comparing the two is the drift guard that
+    # matters - `radioconv --version` and the wheel must not disagree.
+    from radioconv import __version__
+
     for needed in (
         'name = "hls-radio-converter"',
-        'version = "2.0.3"',
+        f'version = "{__version__}"',
         'license = "MIT"',
         "[project.scripts]",
     ):
         assert needed in pyproject, f"pyproject.toml lost {needed}"
+
+
+def test_uv_lock_matches_the_package_version():
+    """The lockfile records the project version, so a release must regenerate it.
+
+    CI installs with ``uv sync --locked``, which refuses to run when ``uv.lock``
+    disagrees with ``pyproject.toml`` - and the failure reads "The lockfile needs
+    to be updated" rather than "you forgot to bump a version". That is how the
+    v2.1.0 tag was published red on every Python version and both lint gates,
+    while the local suite (which never consults the lockfile) stayed green.
+    Checking it here costs a file read and makes the mistake local.
+    """
+    from radioconv import __version__, _toml
+
+    lock = _toml.loads(_read("uv.lock"))
+    entries = [
+        package for package in lock.get("package", []) if package["name"] == "hls-radio-converter"
+    ]
+    assert entries, "uv.lock does not describe this project"
+
+    locked = {entry["version"] for entry in entries}
+    assert locked == {__version__}, (
+        f"uv.lock says {sorted(locked)} but the package is {__version__}; "
+        "run `uv lock` and commit it, or CI's `uv sync --locked` will fail"
+    )
 
 
 # ------------------------------------------------------------------ installer
