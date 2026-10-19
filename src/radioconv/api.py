@@ -665,6 +665,62 @@ class _Pacer:
             await asyncio.sleep(min(delay, self.MAX_SLEEP))
 
 
+#: Bytes of audio between ICY metadata blocks. The heritage Shoutcast grid:
+#: the length byte counts *16-byte blocks* of payload - verified against a live
+#: Icecast 2.4 capture (SomaFM), where direct-length decoding yields garbage,
+#: so this speaks the format every radio firmware has ever seen.
+ICY_METAINT = 16000
+
+
+def icy_metadata_block(title: str) -> bytes:
+    """One ICY metadata block: length (in 16-byte payload blocks), then payload.
+
+    There is no separate marker byte - the length byte itself (0 = nothing this
+    interval) is the whole preamble. Verified against a live Icecast capture:
+    reading a marker first desynchronises the grid and every later block decodes
+    as garbage.
+    """
+    text = f"StreamTitle='{title}';".encode()
+    if len(text) > 15 * 16:
+        text = text[: 15 * 16 - 2] + b"';"
+    payload = text + b"\x00" * (-len(text) % 16)
+    return bytes([len(payload) // 16]) + payload
+
+
+async def _insert_icy_metadata(
+    chunks: AsyncGenerator[bytes, None],
+    metaint: int,
+    title: Callable[[], str],
+    on_block: Optional[Callable[[int], None]] = None,
+) -> AsyncGenerator[bytes, None]:
+    """Interleave an ICY metadata block every *metaint* bytes of *chunks*.
+
+    The audio stream reassembles byte-identically when the blocks are removed,
+    which is the whole contract: clients count *audio* bytes up to ``metaint``,
+    swallow one block, and continue - a block on a wrong offset desynchronises
+    the decoder, so the split happens exactly on the grid, never mid-block.
+    Blocks carry whatever ``title()`` says *now* (titles change between
+    blocks, exactly like Icecast), empty ``StreamTitle=''`` until the source's
+    first ID3 tag has been seen.
+    """
+    since = 0
+    async for chunk in chunks:
+        offset = 0
+        while offset < len(chunk):
+            take = min(metaint - since, len(chunk) - offset)
+            yield chunk[offset : offset + take]
+            since += take
+            offset += take
+            if since == metaint:
+                block = icy_metadata_block(title())
+                yield block
+                if on_block is not None:
+                    # Blocks are bytes the radio reads, so they belong in the
+                    # same counters as audio - the metrics describe the socket.
+                    on_block(len(block))
+                since = 0
+
+
 def _pace_rate(settings: Settings, session: StreamSession) -> float:
     """Bytes per second to release to a listener of *session*.
 
@@ -744,6 +800,11 @@ async def _stream(
         "icy-url": "/",
         "Accept-Ranges": "none",
     }
+    if session_settings.icy_song_metadata:
+        # The body interleaves metadata blocks on this grid (see
+        # `_insert_icy_metadata`); clients only look for them if declared here,
+        # and only before the first byte, so this is decided with the headers.
+        headers["icy-metaint"] = str(ICY_METAINT)
 
     async def body() -> AsyncGenerator[bytes, None]:
         idle_limit = max(20.0, session_settings.stall_timeout * 2)
@@ -802,7 +863,24 @@ async def _stream(
             )
             await manager.unsubscribe(session, subscriber)
 
-    return StreamingResponse(body(), media_type=media_type, headers=headers, status_code=200)
+    stream: AsyncGenerator[bytes, None] = body()
+    if session_settings.icy_song_metadata:
+
+        def _count_metadata(size: int) -> None:
+            # The counters describe the socket, and these are bytes the radio
+            # reads just like audio; without this the wire total outruns
+            # bytes_out_total by exactly the metadata overhead.
+            subscriber.bytes_sent += size
+            session.stats.bytes_sent += size
+            manager.throughput.add_out(size)
+
+        stream = _insert_icy_metadata(
+            stream,
+            ICY_METAINT,
+            lambda: session.pipeline.stats.now_playing or "",
+            on_block=_count_metadata,
+        )
+    return StreamingResponse(stream, media_type=media_type, headers=headers, status_code=200)
 
 
 async def _settle_kind(

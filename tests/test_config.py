@@ -25,6 +25,7 @@ def test_defaults_are_sane_and_conservative():
     assert settings.bitrate == 192_000
     assert settings.output_codec == "mp3"
     assert settings.prefer_passthrough is True
+    assert settings.icy_song_metadata is True  # song titles on the radio's display
     assert settings.variant_selection == "highest"
     assert settings.mime_type == "audio/mpeg"
     # Bounded by default: no unbounded queue anywhere.

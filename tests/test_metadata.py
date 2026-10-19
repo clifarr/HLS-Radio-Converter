@@ -500,7 +500,7 @@ def test_pyproject_has_no_package_index_metadata():
     # But the metadata an actual `pip install .` depends on must still be there.
     for needed in (
         'name = "hls-radio-converter"',
-        'version = "2.0.2"',
+        'version = "2.0.3"',
         'license = "MIT"',
         "[project.scripts]",
     ):

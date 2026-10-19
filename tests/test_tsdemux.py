@@ -82,6 +82,72 @@ def test_skip_id3_offsets():
     assert T.skip_id3(tag + b"audio") == len(tag)
 
 
+def id3_frame(fid: bytes, payload: bytes, *, v24: bool = True) -> bytes:
+    """One ID3 frame: id, size (syncsafe for v2.4, plain for v2.3), flags."""
+    if v24:
+        size = bytes(
+            [
+                (len(payload) >> 21) & 0x7F,
+                (len(payload) >> 14) & 0x7F,
+                (len(payload) >> 7) & 0x7F,
+                len(payload) & 0x7F,
+            ]
+        )
+    else:
+        size = len(payload).to_bytes(4, "big")
+    return fid + size + b"\x00\x00" + payload
+
+
+SONG_JSON = (
+    '{"songInfo":{"present":{"mus_art_name":"Sombr","mus_sng_title":"My Body Isn\'t Ready"}}}'
+)
+
+
+def test_song_title_prefers_the_json_text_frame():
+    """TIT1 comes first on the wire; the JSON's *present* song still wins."""
+    tag = id3_tag(
+        id3_frame(b"TIT1", b"\x03SOMBR - MY BODY ISN'T READY\x00")
+        + id3_frame(b"TEXT", b"\x03" + SONG_JSON.encode())
+    )
+    assert T.id3_song_title(tag + ADTS_HEADER) == "Sombr - My Body Isn't Ready"
+
+
+def test_song_title_falls_back_to_tit1():
+    tag = id3_tag(id3_frame(b"TIT1", b"\x03SOMBR - MY BODY ISN'T READY\x00"))
+    assert T.id3_song_title(tag) == "SOMBR - MY BODY ISN'T READY"
+
+
+def test_song_title_is_none_between_songs_and_without_tags():
+    # `present` absent (only `future` remains) and a blank TIT1: nothing to
+    # show - the caller keeps the previous title rather than blanking it.
+    between = id3_tag(
+        id3_frame(b"TEXT", b'\x03{"songInfo":{"future":{"mus_sng_title":"X"}}}')
+        + id3_frame(b"TIT1", b"\x03   \x00")
+    )
+    assert T.id3_song_title(between) is None
+    assert T.id3_song_title(ADTS_HEADER + b"\x00" * 32) is None
+    assert T.id3_song_title(b"") is None
+    # The timing-only PRIV tag every msvdn segment carries is not a title.
+    priv = id3_tag(
+        id3_frame(b"PRIV", b"com.apple.streaming.transportStreamTimestamp\x00\x00\x00\x00\x01")
+    )
+    assert T.id3_song_title(priv) is None
+
+
+def test_song_title_reads_id3v2_3_frame_sizes_too():
+    """v2.3 encodes frame sizes plainly (v2.4 made them syncsafe)."""
+    frame = id3_frame(b"TEXT", b"\x03" + SONG_JSON.encode(), v24=False)
+    header = b"ID3\x03\x00\x00" + bytes(
+        [
+            (len(frame) >> 21) & 0x7F,
+            (len(frame) >> 14) & 0x7F,
+            (len(frame) >> 7) & 0x7F,
+            len(frame) & 0x7F,
+        ]
+    )
+    assert T.id3_song_title(header + frame) == "Sombr - My Body Isn't Ready"
+
+
 def test_an_absurd_id3_length_cannot_run_away():
     """A corrupt length must not walk off the end of the buffer."""
     # Length field claims ~268 MB, far more than the data we hold.

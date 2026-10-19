@@ -225,6 +225,26 @@ class Settings(BaseSettings):
     #: the property it provided: *there is always audio available to hand over*.
     #: This is that replacement, and it costs a few hundred kilobytes per station.
     preroll_seconds: float = 10.0
+    #: How far behind a reconnecting client's last-delivered position its rejoin
+    #: may be primed, in seconds - the *handoff overlap*.
+    #:
+    #: A radio that re-GETs the stream at the exact production edge would be
+    #: primed with nothing and then wait - up to a whole segment period - for
+    #: the next burst, which on a 3-second-cadence station was measured as
+    #: 0.5-2.1 s of starvation every few seconds (the reported "silent for a
+    #: second or less"). The audio it had received but not yet played is
+    #: discarded with its old socket on the handoff (the reported "skips a
+    #: second or so"). Re-sending at most this much already-delivered audio
+    #: bridges both: the rejoin always has an instant cushion, and the skipped
+    #: tail is reclaimed. The replay is bounded to this value; 0 restores
+    #: exact-resume joins, where an edge rejoin may wait for the next burst.
+    handoff_overlap_seconds: float = 1.5
+    #: Send now-playing song titles to listeners as ICY in-stream metadata
+    #: (``icy-metaint`` blocks carrying ``StreamTitle='...'``), read from the
+    #: source's in-band ID3 tags when it carries them. This is what puts the
+    #: current song on an internet radio's display. Off = responses carry no
+    #: metadata blocks at all.
+    icy_song_metadata: bool = True
     #: No output bytes for this long => kill and restart the pipeline.
     stall_timeout: float = 30.0
     #: Delay before restarting a failed pipeline (exponential up to 8x).
@@ -286,6 +306,17 @@ class Settings(BaseSettings):
         # playlist window could not be filled anyway.
         if not 0.0 <= v <= 60.0:
             raise ValueError("preroll_seconds must be between 0 and 60")
+        return v
+
+    @field_validator("handoff_overlap_seconds")
+    @classmethod
+    def _check_handoff_overlap(cls, v: float) -> float:
+        # Zero is allowed and means "exact resume: never re-send a byte the
+        # client was already sent", which is the diagnostic opposite of this
+        # setting. The ceiling keeps a typo from turning every radio handoff
+        # into a multi-second replay.
+        if not 0.0 <= v <= 10.0:
+            raise ValueError("handoff_overlap_seconds must be between 0 and 10")
         return v
 
     @field_validator("max_sessions", "max_listeners_per_session")

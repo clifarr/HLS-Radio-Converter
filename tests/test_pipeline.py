@@ -26,6 +26,7 @@ from radioconv import pipeline
 from radioconv.config import Settings
 from radioconv.hls import Segment
 from radioconv.pipeline import WorkItem
+from radioconv.throughput import Throughput
 from radioconv.tsdemux import build_test_ts
 
 
@@ -200,3 +201,39 @@ async def test_passthrough_startup_feeds_every_pending_segment():
         "segment discarded the rest of the backlog"
     )
     assert offsets == sorted(offsets), f"segments emitted out of order: {offsets}"
+
+
+def _id3_song_segment(json_text: str) -> bytes:
+    """A leading ID3v2.4 tag with one TEXT frame, as msvdn segments start."""
+    payload = b"\x03" + json_text.encode()
+
+    def syncsafe(n: int) -> bytes:
+        return bytes([(n >> 21) & 0x7F, (n >> 14) & 0x7F, (n >> 7) & 0x7F, n & 0x7F])
+
+    frame = b"TEXT" + syncsafe(len(payload)) + b"\x00\x00" + payload
+    return b"ID3\x04\x00\x00" + syncsafe(len(frame)) + frame + b"\xff\xf1\x50\x80" + b"\x00" * 32
+
+
+def test_note_input_reads_the_now_playing_title():
+    """`_note_input` is where every fetched segment passes through exactly once,
+    which makes it the hook for the now-playing title (ICY StreamTitle)."""
+    pipe = pipeline.StreamPipeline.__new__(pipeline.StreamPipeline)
+    pipe.stats = pipeline.PipelineStats()
+    pipe.throughput = Throughput()
+
+    pipe._note_input(
+        Segment(url="http://x/1.aac", sequence=1, duration=3.0),
+        _id3_song_segment(
+            '{"songInfo":{"present":{"mus_art_name":"Sombr",'
+            '"mus_sng_title":"My Body Isn\'t Ready"}}}'
+        ),
+    )
+    assert pipe.stats.now_playing == "Sombr - My Body Isn't Ready"
+    assert pipe.stats.as_dict()["now_playing"] == "Sombr - My Body Isn't Ready"
+
+    # A segment with no title must not clear the last known one.
+    pipe._note_input(
+        Segment(url="http://x/2.aac", sequence=2, duration=3.0),
+        b"\xff\xf1" + b"\x00" * 64,
+    )
+    assert pipe.stats.now_playing == "Sombr - My Body Isn't Ready"

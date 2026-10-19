@@ -623,9 +623,14 @@ async def test_a_rejoining_client_resumes_instead_of_replaying():
         primed = _queued(second)
         assert primed, "the rejoining client got no audio at all"
         stamps = [stamp for stamp, _ in primed]
-        assert all(stamp > floor for stamp in stamps), (
-            "the rejoin was primed with audio this client already received: "
+        window = session.settings.handoff_overlap_seconds
+        assert all(stamp > floor - window for stamp in stamps), (
+            "the rejoin was primed from beyond the handoff overlap window: "
             f"floor={floor}, primed={stamps}"
+        )
+        assert max(stamps) > floor, (
+            "the rejoin must still resume forward of the old floor - the "
+            "window extends backward only, it does not turn into a replay"
         )
     finally:
         await manager.aclose()
@@ -670,9 +675,10 @@ async def test_an_overlapping_connection_resumes_from_the_still_open_one():
     listening) then detach (1 remaining)". Recording floors only at departure
     would leave the second case replaying everything the first connection
     delivered while both were open, so a live same-key connection must
-    contribute its floor too.
+    contribute its floor too (within the handoff overlap window).
     """
-    manager = SessionManager(fast_settings(queue_chunks=128))
+    settings = fast_settings(queue_chunks=128)
+    manager = SessionManager(settings)
     await manager.start()
     try:
         _session, old = await manager.subscribe(
@@ -696,9 +702,57 @@ async def test_an_overlapping_connection_resumes_from_the_still_open_one():
         )
         stamps = [stamp for stamp, _ in _queued(new)]
         assert stamps, "the overlapping connection got no audio at all"
-        assert all(stamp > floor for stamp in stamps), (
-            "the overlapping connection was primed with audio already sent on "
-            f"the live one: floor={floor}, primed={stamps}"
+        assert all(stamp > floor - settings.handoff_overlap_seconds for stamp in stamps), (
+            "the overlapping connection was primed from beyond the handoff "
+            f"window: floor={floor}, primed={stamps}"
         )
     finally:
         await manager.aclose()
+
+
+def _edge_session(settings: Settings, session: session_mod.StreamSession):
+    """Drive one connection right up to the production edge, then rejoin it."""
+    sub = session.add_subscriber(client="radio", user_agent="Frontier/1")
+    stamps = []
+    for _ in range(5):
+        session._fan_out(b"a" * settings.chunk_size)
+        stamp, _piece = sub.queue.get_nowait()
+        stamps.append(stamp)
+    sub.last_delivered = max(stamps)
+    session.remove_subscriber(sub)  # records the floor at the production edge
+    return session.add_subscriber(client="radio", user_agent="Frontier/1")
+
+
+async def test_a_rejoin_at_the_production_edge_is_never_primed_empty():
+    """ "0 chunks prerolled" at the edge means waiting a full segment period.
+
+    On a 3-second-cadence station this was the reported "silent for a second
+    or less": with exact-floor joins, every rejoin that caught up to the
+    production edge was primed with nothing and sat starved until the next
+    burst. The handoff overlap must always leave an edge rejoin a cushion.
+    """
+    settings = fast_settings()
+    session = session_mod.StreamSession(settings, "key", ["http://x/one.m3u8"])
+
+    rejoin = _edge_session(settings, session)
+
+    primed = _queued(rejoin)
+    assert primed, (
+        "a rejoin at the production edge was primed with nothing and would "
+        "wait up to a whole segment period for the next burst"
+    )
+    stamps = [stamp for stamp, _ in primed]
+    assert min(stamps) > max(stamps) - settings.handoff_overlap_seconds - 1e-6, (
+        f"the cushion exceeds the configured window: {stamps}"
+    )
+
+
+async def test_handoff_overlap_zero_restores_exact_resume():
+    """0 disables the window: an edge rejoin is primed with nothing (2.0.1)."""
+    settings = fast_settings()
+    settings.handoff_overlap_seconds = 0.0
+    session = session_mod.StreamSession(settings, "key", ["http://x/one.m3u8"])
+
+    rejoin = _edge_session(settings, session)
+
+    assert not _queued(rejoin), "handoff_overlap_seconds = 0 must reproduce the exact-resume join"

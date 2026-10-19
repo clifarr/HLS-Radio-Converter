@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from radioconv.api import _Pacer
+from radioconv.api import ICY_METAINT, _insert_icy_metadata, _Pacer
 from radioconv.config import Settings
 from radioconv.pipeline import PipelineStats, StreamPipeline
 from radioconv.session import SessionManager
@@ -263,6 +263,52 @@ async def test_a_delay_beyond_the_sleep_cap_still_waits_for_its_deadline():
         f"wait returned after {elapsed:.3f}s of a 0.3s delay: the capped sleep "
         "was not repeated, so the chunk was sent early"
     )
+
+
+# ------------------------------------------------------- ICY song metadata
+async def test_icy_metadata_blocks_land_on_the_audio_grid():
+    """A block every `metaint` audio bytes; removing blocks restores the stream.
+
+    The heritage Shoutcast grid - the length byte counts 16-byte payload
+    blocks - pinned against a live Icecast capture.
+    """
+    audio = b"\xff\xf1" * 8000  # exactly ICY_METAINT bytes = one grid window
+
+    async def chunks():
+        yield audio[:9000]
+        yield audio[9000:]
+
+    gen = _insert_icy_metadata(chunks(), ICY_METAINT, lambda: "Sombr - My Body Isn't Ready")
+    out = bytearray()
+    async for piece in gen:
+        out.extend(piece)
+
+    # Audio up to the first block is untouched and on the grid.
+    assert bytes(out[:ICY_METAINT]) == audio[:ICY_METAINT]
+    blocks = out[ICY_METAINT]
+    payload = bytes(out[ICY_METAINT + 1 : ICY_METAINT + 1 + blocks * 16])
+    assert blocks == len(payload) // 16 and blocks > 0
+    assert payload.split(b"\x00", 1)[0] == b"StreamTitle='Sombr - My Body Isn't Ready';"
+    # Everything after the block is byte-identical: audio reassembles exactly.
+    rest = bytes(out[ICY_METAINT + 1 + blocks * 16 :])
+    assert bytes(out[:ICY_METAINT]) + rest == audio
+
+
+async def test_icy_empty_title_still_keeps_the_grid():
+    """Before the source's first ID3 title, blocks still arrive - just empty."""
+
+    async def chunks():
+        yield b"\xff" * ICY_METAINT
+
+    gen = _insert_icy_metadata(chunks(), ICY_METAINT, lambda: "")
+    out = bytearray()
+    async for piece in gen:
+        out.extend(piece)
+
+    blocks = out[ICY_METAINT]
+    payload = bytes(out[ICY_METAINT + 1 : ICY_METAINT + 1 + blocks * 16])
+    assert blocks == 1
+    assert payload.split(b"\x00", 1)[0] == b"StreamTitle='';"
 
 
 async def test_no_gap_appears_while_a_segment_plays_out():

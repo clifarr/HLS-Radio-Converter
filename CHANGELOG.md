@@ -3,6 +3,48 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.0.3] - 2026-10-19
+
+Song-titles and rejoin-continuity release: standard HLS timed metadata now
+reaches the radio's display, and the recurring silence/skip loop on reconnect
+is fixed.
+
+### Added
+
+- **ICY song metadata (on by default; `icy_song_metadata = false` turns it
+  off).** Every 16 000 bytes of the outgoing stream are followed by a
+  heritage-style ICY metadata frame - `StreamTitle='artist - title';` - which
+  is the now-playing line Frontier-Silicon radios display (VLC, ffplay and
+  mpg123 show it too). The title comes from the standard mechanism for this in
+  HLS: ID3 timed-metadata tags carried inside the segments (TEXT frames
+  holding the station's songInfo JSON, with the TIT1 text frame as fallback),
+  extracted once per segment and kept as the last known title between songs.
+  Stations that ship ID3 - Radio 105 verified live end to end, from segment to
+  radio display. A station whose segments carry no ID3 at all (radiom2o:
+  proven to be a bare AAC transport stream with no metadata PID and no tags)
+  correctly sends empty titles, because there is nothing standard to send. The
+  current title is also exposed as `now_playing` under `pipeline` in
+  `/metrics.json`, and the metadata bytes are counted into the output
+  counters.
+
+### Fixed
+
+- **The recurring "silent for a second, then skips a second" loop is gone.**
+  A radio re-joining exactly at the production edge was primed with zero
+  chunks and starved until the next segment deadline - up to ~3 s of silence
+  on a 3 s cadence, alternating with skipping the unplayed tail it should
+  have resumed from. The join floor now overlaps that discarded tail by
+  `handoff_overlap_seconds` (default 1.5, configurable 0-10), so a rejoin
+  always has audio to play immediately. Set it to 0 to restore exact,
+  piece-exact resume.
+
+### Testing
+
+- 321 tests plus all four guard scripts (20 + 15 + 7 + 7 mutations). Verified
+  live on the Pi: a listener re-joining at the production edge primes ~30-35
+  chunks instead of 0 (60/60 samples no longer starve), and ICY frames decoded
+  off the live wire carry real titles from the ID3 extraction.
+
 ## [2.0.2] - 2026-10-18
 
 Status-pill fix: the dashboard header claimed "live" even when nothing was

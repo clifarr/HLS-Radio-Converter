@@ -94,6 +94,20 @@ linger_seconds = 25.0
 # without this a radio that tunes in during a gap hears nothing until the next
 # burst, which was measured at a median of 8 seconds. 0 disables it.
 preroll_seconds = 10.0
+# How far behind a reconnecting client's last-delivered position its rejoin may
+# be primed, in seconds - the handoff overlap. At the exact production edge a
+# rejoin would be primed with nothing and wait up to a segment period for the
+# next burst (a sub-second silence every few seconds on short-cadence stations),
+# while the audio it received but had not yet played is discarded with its old
+# socket (a ~1 s skip). Re-sending at most this much already-delivered audio
+# bridges the handoff; the replay is bounded to this value. 0 restores exact
+# resumes, where an edge rejoin may wait for the next burst.
+handoff_overlap_seconds = 1.5
+# Send now-playing song titles to listeners as ICY in-stream metadata
+# (icy-metaint blocks with StreamTitle='...'), read from the source's in-band
+# ID3 tags when it carries any - this is what puts the song name on an internet
+# radio's display. Off = no metadata blocks in the response at all.
+icy_song_metadata = true
 # No audio for this long => the pipeline is killed and restarted. Also the point
 # at which a session whose listeners have nothing buffered is counted as a
 # *silent* session and the service reports `degraded` on /health, /metrics and

@@ -32,6 +32,7 @@ FFmpeg, which is the correct answer for those.
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -170,6 +171,90 @@ def skip_id3(data: bytes) -> int:
             break
         offset += size
     return offset
+
+
+def _decode_id3_text(payload: bytes) -> str:
+    """Decode an ID3 text-frame payload (encoding byte + text)."""
+    if not payload:
+        return ""
+    encoding, text = payload[0], payload[1:]
+    if encoding == 3:
+        return text.decode("utf-8", "replace")
+    if encoding in (1, 2):
+        return text.decode("utf-16" if encoding == 1 else "utf-16-be", "replace")
+    return text.decode("latin-1", "replace")
+
+
+def _song_from_text_frame(payload: bytes) -> Optional[str]:
+    """``songInfo.present`` as "Artist - Title" from the CDN's JSON TEXT frame.
+
+    msvdn.net segments carry a ``TEXT`` frame whose payload is JSON:
+    ``{"songInfo":{"present":{"mus_art_name":..., "mus_sng_title":...}}}``.
+    Between songs ``present`` is absent (only ``future`` remains) - returning
+    ``None`` there lets the caller keep showing the last real title.
+    """
+    text = _decode_id3_text(payload).strip("\x00")
+    if not text.startswith("{"):
+        return None
+    try:
+        present = json.loads(text).get("songInfo", {}).get("present")
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not isinstance(present, dict):
+        return None
+    title = present.get("mus_sng_title")
+    if not isinstance(title, str) or not title.strip():
+        return None
+    artist = present.get("mus_art_name")
+    if isinstance(artist, str) and artist.strip():
+        return f"{artist.strip()} - {title.strip()}"
+    return title.strip()
+
+
+def id3_song_title(data: bytes) -> Optional[str]:
+    """Now-playing "Artist - Title" from the leading ID3 tags of *data*.
+
+    Two sources, in priority order: the JSON ``TEXT`` frame (proper casing and
+    the authoritative *present* song), then the plain ``TIT1`` frame
+    ("SOMBR - MY BODY ISN'T READY" on the observed CDN). ``None`` when the
+    segment carries no usable title - which is the normal answer for stations
+    without in-band metadata, so every caller can treat None as "keep the
+    previous title" without special-casing the station.
+    """
+    offset = 0
+    titl: Optional[str] = None
+    for _ in range(MAX_ID3_TAGS):
+        total = id3_tag_size(data[offset:])
+        if not total:
+            break
+        tag = data[offset : offset + total]
+        offset += total
+        if len(tag) < ID3_HEADER_SIZE or tag[3] not in (3, 4):
+            continue  # truncated, or ID3v2.2 whose frame layout differs
+        footer = ID3_HEADER_SIZE if tag[5] & 0x10 else 0
+        body = tag[ID3_HEADER_SIZE : len(tag) - footer]
+        frame = 0
+        while frame + 10 <= len(body):
+            fid = body[frame : frame + 4]
+            if fid == b"\x00\x00\x00\x00":
+                break  # padding
+            if tag[3] == 4:
+                size = 0
+                for byte in body[frame + 4 : frame + 8]:
+                    size = (size << 7) | (byte & 0x7F)
+            else:
+                size = int.from_bytes(body[frame + 4 : frame + 8], "big")
+            payload = body[frame + 10 : frame + 10 + size]
+            frame += 10 + size
+            if fid == b"TEXT":
+                title = _song_from_text_frame(payload)
+                if title:
+                    return title
+            elif fid == b"TIT1" and titl is None:
+                text = _decode_id3_text(payload).strip("\x00").strip()
+                if text:
+                    titl = text
+    return titl
 
 
 def looks_like_mp3(data: bytes) -> bool:

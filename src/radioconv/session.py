@@ -387,7 +387,18 @@ class StreamSession:
                 and (floor is None or other.last_delivered > floor)
             ):
                 floor = other.last_delivered
-        return floor
+        if floor is None:
+            return None
+        # Pull the join point back by the handoff overlap. At the exact
+        # production edge the post-floor stock is zero, so an exact-floor rejoin
+        # is primed with nothing and waits for the next burst - measured as
+        # 0.5-2.1 s of starvation every few seconds on a 3 s-cadence station,
+        # which is the reported "silent for a second or less". The audio the
+        # old socket delivered but the radio never played (discarded on the
+        # handoff) is the reported "skips a second or so". Re-sending at most
+        # `handoff_overlap_seconds` of already-delivered audio bridges both,
+        # with the replay bounded to that window (see Settings for the tradeoff).
+        return floor - self.settings.handoff_overlap_seconds
 
     def _note_floor(self, subscriber: Subscriber) -> None:
         """Remember how far a departing connection got, for its next attach."""

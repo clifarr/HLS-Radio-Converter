@@ -51,7 +51,7 @@ from . import ffmpeg as ffmpeg_mod
 from .config import Settings
 from .hls import HLSClient, HLSError, HLSFatal, PlaylistTracker, Segment
 from .throughput import Throughput
-from .tsdemux import PASSTHROUGH_TYPES, TSDemuxer, classify_segment, scan_tables
+from .tsdemux import PASSTHROUGH_TYPES, TSDemuxer, classify_segment, id3_song_title, scan_tables
 
 log = logging.getLogger(__name__)
 
@@ -125,6 +125,11 @@ class PipelineStats:
     last_data_at: float = field(default_factory=time.time)
     detected_codec: Optional[str] = None
     detected_kind: Optional[str] = None
+    #: "Artist - Title" of the audio currently being produced, read from the
+    #: source's in-band ID3 tags when it carries them (msvdn-style CDNs do).
+    #: Exposed through ``as_dict`` and injected into responses as ICY
+    #: ``StreamTitle`` metadata by the API layer.
+    now_playing: Optional[str] = None
 
     def as_dict(self) -> dict:
         return {
@@ -140,6 +145,7 @@ class PipelineStats:
             "idle": round(time.time() - self.last_data_at, 1),
             "detected_codec": self.detected_codec,
             "detected_kind": self.detected_kind,
+            "now_playing": self.now_playing,
         }
 
 
@@ -236,11 +242,20 @@ class StreamPipeline:
         and ``seconds_in`` cannot disagree with each other - they are used
         together to derive the stream's bitrate, and a site that forgot one of
         them would skew it silently.
+
+        It is also the single place the now-playing title is read: every fetch
+        site sees the whole segment exactly once, and none of them has to care
+        what metadata the station happens to carry.
         """
         self.stats.segments += 1
         self.stats.bytes_in += len(data)
         self.throughput.add_in(len(data))
         self.stats.seconds_in += segment.duration or 0.0
+        title = id3_song_title(data)
+        if title:
+            # None means "no title in this segment" (between songs, or a station
+            # without metadata) - keep showing the last real one.
+            self.stats.now_playing = title
 
     async def aclose(self) -> None:
         self._closed = True
