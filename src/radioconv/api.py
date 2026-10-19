@@ -234,6 +234,31 @@ API_TAGS = [
 ]
 
 
+class _RevalidatingStaticFiles(StaticFiles):
+    """Static assets a browser must check before reusing.
+
+    ``StaticFiles`` sends ``last-modified`` and ``etag`` but no
+    ``cache-control``, and a response with no explicit policy is cached by
+    *heuristic freshness* - in practice about 10% of the time since the file
+    was last modified. A script fetched while the file was a day old can
+    therefore be reused for hours **without the browser asking**, which is how
+    a shipped change to the dashboard kept showing the old column: the server
+    was serving the new file the whole time, and the page in front of the user
+    was running the previous one.
+
+    ``no-cache`` does not mean "do not cache"; it means "revalidate before
+    reusing", and the conditional request that follows costs a 304 with no
+    body. The templates also add ``?v=<version>`` to the asset URLs, so an
+    upgrade is a new URL as well - this header covers the case where a browser,
+    proxy or phone ignores the query string.
+    """
+
+    async def get_response(self, path: str, scope: Any) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers["cache-control"] = "no-cache"
+        return response
+
+
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     settings = settings or Settings()
 
@@ -295,7 +320,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     # `/{encoded_url:path}` would swallow it and answer "not a stream URL".
     app.mount(
         web.STATIC_URL,
-        StaticFiles(directory=str(web.resource_dir(web.STATIC))),
+        _RevalidatingStaticFiles(directory=str(web.resource_dir(web.STATIC))),
         name="static",
     )
 

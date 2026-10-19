@@ -333,6 +333,62 @@ def test_the_status_pill_tells_idle_from_live(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_assets_must_be_revalidated_before_reuse(live_server):
+    """Reported: "the engine still says transcode - mp3" after a deploy that fixed it.
+
+    The server was serving the new script the whole time; the browser was never
+    asking for it. ``StaticFiles`` sends ``last-modified`` and ``etag`` but no
+    ``cache-control``, and a response with no explicit policy is cached by
+    *heuristic freshness* - roughly 10% of the file's age - so a script fetched
+    while the file was a day old could be reused for hours without a request.
+    The user sees the old UI, and re-running the deploy changes nothing.
+
+    ``no-cache`` means "revalidate before reusing", not "do not cache", and the
+    conditional request it triggers is still answered 304 with no body.
+    """
+    asset = httpx.get(live_server + "/static/dashboard.js", timeout=10)
+    assert asset.status_code == 200
+    assert "no-cache" in asset.headers.get("cache-control", ""), (
+        "static assets are cacheable by heuristic freshness again - a browser "
+        "can keep running an old dashboard.js after an upgrade"
+    )
+    etag = asset.headers.get("etag")
+    assert etag, "without an etag the revalidation this header forces costs a full body"
+
+    conditional = httpx.get(
+        live_server + "/static/dashboard.js",
+        headers={"if-none-match": etag},
+        timeout=10,
+    )
+    assert conditional.status_code == 304, (
+        "revalidation must be cheap; a full 200 on every page load is a cost the Pi should not pay"
+    )
+    assert "no-cache" in conditional.headers.get("cache-control", ""), (
+        "the 304 must restate the policy, or the next fetch goes back to guessing"
+    )
+
+
+def test_asset_urls_change_with_the_version(live_server):
+    """A release must be a *different* URL, not just a different file.
+
+    ``no-cache`` covers a browser that honours it, but the query string covers
+    the ones that do not - a phone's webview, a proxy, an offline cache. Both
+    assets are versioned, because the CSS is as capable of going stale as the
+    script.
+    """
+    for path in ("/", web.DASHBOARD_URL):
+        body = httpx.get(live_server + path, timeout=10).text
+        for name in ("dashboard.css", "dashboard.js"):
+            expected = f"/static/{name}?v={web.__version__}"
+            assert expected in body, f"{path} does not request {expected}"
+        assert "no-cache" in httpx.get(live_server + path, timeout=10).headers.get(
+            "cache-control", ""
+        ), (
+            f"{path} can be cached heuristically, so a browser may never see the "
+            "new asset URLs at all - which is the same bug one level up"
+        )
+
+
 def test_the_page_does_not_recompute_what_the_server_already_measured():
     """Buffered and Starved must be two readings of one number, not two sums.
 

@@ -131,7 +131,13 @@ def _page(name: str, **context: Any) -> HTMLResponse:
             poll_seconds=f"{POLL_MS / 1000:g}",
             refresh_ms=POLL_MS,
             **context,
-        )
+        ),
+        # The markup carries the version that the asset URLs are keyed on, so a
+        # stale copy is as bad as a stale script: the browser would keep asking
+        # for the previous release's assets. It costs a conditional request and
+        # the page is a few kilobytes, rendered from a template on every load
+        # anyway - there is nothing cheap to preserve except the bytes.
+        headers={"cache-control": "no-cache"},
     )
 
 

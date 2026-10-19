@@ -3,6 +3,34 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.1] - 2026-10-19
+
+A deploy that changes the dashboard now actually reaches the browser.
+
+### Fixed
+
+- **Static assets and pages are revalidated instead of being cached by
+  heuristic freshness.** Reported: after 2.1.0 was deployed, the Engine column
+  still read `transcode · mp3`. The server was serving the new script the whole
+  time; the browser was never asking for it. `StaticFiles` sends `last-modified`
+  and `etag` but no `cache-control`, and a response with no explicit policy is
+  cached for roughly 10% of the file's age, so a script fetched while the file
+  was a day old could be reused for hours without a single request. Both assets
+  now carry `cache-control: no-cache`, which means "revalidate before reusing"
+  (the conditional request is answered 304, no body), and the HTML pages carry
+  it too, so the page cannot keep pointing at a previous release's assets.
+- **Asset URLs are versioned** (`/static/dashboard.js?v=2.1.1`). `no-cache`
+  only helps browsers that honour it; a query string that changes with the
+  release makes an upgrade a different URL for every cache in the path,
+  including a phone's webview or an offline copy.
+
+### Testing
+
+- The static response must carry `cache-control: no-cache`, an `etag`, and
+  answer a conditional request with 304 (a full 200 on every page load is a
+  cost the Pi should not pay). Both pages must request the assets at the
+  current version and must themselves be non-cacheable. 327 tests in total.
+
 ## [2.1.0] - 2026-10-19
 
 Dashboard-clarity release: the Engine column says what it means, the two
@@ -184,6 +212,7 @@ for the FFmpeg-free pass-through path, per-listener pacing with drop
 isolation, a dashboard with health metrics, and a systemd installer for the
 Raspberry Pi.
 
+[2.1.1]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.1.1
 [2.1.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.1.0
 [2.0.3]: https://github.com/clifarr/HLS-Radio-Converter/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/clifarr/HLS-Radio-Converter/compare/v2.0.1...v2.0.2

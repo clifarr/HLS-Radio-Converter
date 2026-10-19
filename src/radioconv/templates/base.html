@@ -6,8 +6,14 @@
 <title>{% block title %}HLS Radio Converter{% endblock %}</title>
 {# An empty favicon, so a browser does not ask for /favicon.ico: the legacy
    catch-all route would answer that with "expected a percent-encoded URL". #}
+{# The version in the query is what makes a release visible. Without it the
+   asset URL never changes, and a browser that cached the old script under
+   HTTP's heuristic freshness rules (no Cache-Control, so it infers a lifetime
+   from Last-Modified) keeps running it after an upgrade - which is exactly how
+   a shipped change to the dashboard looked like it had not been deployed. The
+   server also sends `Cache-Control: no-cache`, so this is belt and braces. #}
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="{{ static_url }}/dashboard.css">
+<link rel="stylesheet" href="{{ static_url }}/dashboard.css?v={{ version }}">
 </head>
 {# `data-refresh-ms` and `data-metrics-url` are how the server tells the static
    JavaScript what to poll and how often, so that file stays a constant with no
@@ -39,7 +45,7 @@
 {% block main %}{% endblock %}
 </main>
 
-<script src="{{ static_url }}/dashboard.js" defer></script>
+<script src="{{ static_url }}/dashboard.js?v={{ version }}" defer></script>
 {% block scripts %}{% endblock %}
 </body>
 </html>
