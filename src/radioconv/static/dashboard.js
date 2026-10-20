@@ -172,7 +172,7 @@
     return headings[index];
   }
 
-  function cell(index, className, text) {
+  function cell(index, className, text, key) {
     const node = element("td", className, text);
     const column = heading(index);
     if (column) {
@@ -180,8 +180,18 @@
       // The Station cell is the card's title, and it is where a stalled or dead
       // row states its problem (see streamRow) - a description of its own would
       // sit on top of that.
-      if (column.tip && index > 0) node.dataset.tooltip = column.tip;
+      if (column.tip && index > 0) {
+        node.dataset.tooltip = column.tip;
+        // Focusable, like every other description on the page. A cell that
+        // carries a description and cannot be reached is a description that
+        // only a mouse can read - and the point of the table on a phone is
+        // that it can be read without one.
+        node.tabIndex = 0;
+      }
     }
+    // The key names this cell in a way that survives the table being rebuilt
+    // every second: a station and a column, not a DOM node (see restoreTip).
+    if (key) node.dataset.tipKey = key;
     node.setAttribute("role", "cell");
     return node;
   }
@@ -224,6 +234,11 @@
 
     const row = element("tr");
     row.setAttribute("role", "row");
+    // The key names this station's row in a way that survives the table being
+    // rebuilt every second (see restoreTip). The session id is unique for as
+    // long as the station exists.
+    const key = detail.id || detail.key || "";
+    if (key) row.dataset.tipKey = "row:" + key;
     if (detail.fatal_error) {
       row.className = "row-dead";
       row.dataset.tooltip = detail.fatal_error;
@@ -239,7 +254,7 @@
 
     // No label of its own: on a phone this cell is the card's title, and the
     // place a stalled or dead row explains itself (see above).
-    const station = cell(0, "station-cell");
+    const station = cell(0, "station-cell", undefined, key ? "cell:" + key + ":0" : null);
     station.appendChild(element("div", "station", detail.label || detail.key || detail.id));
     station.appendChild(
       element(
@@ -252,20 +267,20 @@
     );
     row.appendChild(station);
 
-    row.appendChild(cell(1, "num", count(detail.listeners)));
-    row.appendChild(cell(2, "num", dropped ? count(dropped) : "\u2013"));
-    row.appendChild(cell(3, null, engineLabel(pipeline)));
-    row.appendChild(cell(4, "num", bufferedSeconds(detail)));
+    row.appendChild(cell(1, "num", count(detail.listeners), key ? "cell:" + key + ":1" : null));
+    row.appendChild(cell(2, "num", dropped ? count(dropped) : "\u2013", key ? "cell:" + key + ":2" : null));
+    row.appendChild(cell(3, null, engineLabel(pipeline), key ? "cell:" + key + ":3" : null));
+    row.appendChild(cell(4, "num", bufferedSeconds(detail), key ? "cell:" + key + ":4" : null));
     // `bytes_sent`, not `bytes_out`: the latter counts what the pipeline
     // *produced*, which includes audio for a warm station nobody is listening to
     // and audio dropped for a listener that fell behind. The column and the
     // "audio sent" tile must mean the same thing or one of them is lying.
-    row.appendChild(cell(5, "num", bytes(session.bytes_sent)));
-    row.appendChild(cell(6, "num", count(session.restarts)));
-    row.appendChild(cell(7, "num", count(pipeline.failures)));
-    row.appendChild(cell(8, "num", duration(detail.starved_for)));
-    row.appendChild(cell(9, "num", duration(pipeline.idle)));
-    row.appendChild(cell(10, "num", duration(session.uptime)));
+    row.appendChild(cell(5, "num", bytes(session.bytes_sent), key ? "cell:" + key + ":5" : null));
+    row.appendChild(cell(6, "num", count(session.restarts), key ? "cell:" + key + ":6" : null));
+    row.appendChild(cell(7, "num", count(pipeline.failures), key ? "cell:" + key + ":7" : null));
+    row.appendChild(cell(8, "num", duration(detail.starved_for), key ? "cell:" + key + ":8" : null));
+    row.appendChild(cell(9, "num", duration(pipeline.idle), key ? "cell:" + key + ":9" : null));
+    row.appendChild(cell(10, "num", duration(session.uptime), key ? "cell:" + key + ":10" : null));
     return row;
   }
 
@@ -274,6 +289,19 @@
     if (!tbody || !snapshot) return;
     const details = (snapshot.streams && snapshot.streams.details) || [];
 
+    // The table is rebuilt from scratch every second, so anything a reader has
+    // the focus in - or a description they are reading - is about to be
+    // destroyed. Remember both, and put them back (see restoreTip).
+    //
+    // The pointer's element is destroyed too, so a mouse resting over the
+    // table ends up pointing at nothing. The browser fires a fresh
+    // `pointerover` when the element under the mouse is replaced, so the
+    // description is restored the same way - by key, against the new markup.
+    const key = focusedKey();
+    const wasOpen = tipSource.focus ? tipSource.focus.dataset.tipKey : null;
+    const wasHovered = tipSource.pointer ? tipSource.pointer.dataset.tipKey : null;
+
+    repainting = true;
     tbody.textContent = "";
     if (!details.length) {
       const row = element("tr");
@@ -283,9 +311,17 @@
       placeholder.setAttribute("role", "cell");
       row.appendChild(placeholder);
       tbody.appendChild(row);
-      return;
+    } else {
+      details.forEach((detail) => tbody.appendChild(streamRow(detail)));
     }
-    details.forEach((detail) => tbody.appendChild(streamRow(detail)));
+    repainting = false;
+
+    // The focus first: it is what `focusout` reports when the old cell is
+    // removed, and the description is put back against the element that holds
+    // it.
+    if (key) restoreFocus(key);
+    if (wasOpen) restoreTip(wasOpen);
+    if (wasHovered) restoreHover(wasHovered);
   }
 
   function paintAll() {
@@ -311,7 +347,28 @@
    *
    * `data-tooltip`, not `title`, so the native tooltip cannot appear as well.
    */
-  const tip = { node: null, owner: null };
+  const tip = { node: null };
+
+  /* What is currently showing a description, and why.
+   *
+   * Two reasons, kept apart: a pointer is over something, or something has the
+   * focus. They are not the same thing and they do not end at the same time - a
+   * finger that lifts leaves the focus behind, and a mouse that moves away
+   * leaves the focus where it was. A single "who owns the tooltip" variable
+   * cannot tell those apart, and guessing wrong is what made the description
+   * disappear the moment a tap ended.
+   */
+  const tipSource = { pointer: null, focus: null };
+
+  /* Whether the stations table is being rebuilt at this moment.
+   *
+   * Rebuilding it replaces the element a reader has the focus in, and the
+   * browser reports that as a `focusout` - which would close a description that
+   * had nothing wrong with it, once a second, for as long as the table was on
+   * screen. The rebuild puts the description back afterwards (see
+   * `restoreTip`), so the close is suppressed while it runs.
+   */
+  let repainting = false;
 
   function tipNode() {
     if (!tip.node) {
@@ -346,50 +403,287 @@
     node.style.left = Math.round(left) + "px";
   }
 
-  function showTip(owner) {
-    const text = owner.dataset.tooltip;
-    if (!text) return;
+  /* The element a description should point at, if any.
+   *
+   * The pointer wins over the focus: it is the one the reader is pointing at
+   * right now. But a pointer only counts when it is a mouse - a finger is "over"
+   * an element only while it is on the screen, and it is gone the moment it
+   * lifts, so a touch pointer is not a reason to show anything by itself.
+   *
+   * An element that has been removed from the page cannot be pointed at. The
+   * stations table is rebuilt every second, so a description whose trigger was
+   * a cell is briefly attached to nothing - which is why the rebuild puts the
+   * description back explicitly (see restoreTip).
+   */
+  function tipOwner() {
+    if (tipSource.pointer && tipSource.pointer.isConnected) return tipSource.pointer;
+    if (tipSource.focus && tipSource.focus.isConnected) return tipSource.focus;
+    return null;
+  }
+
+  /* Draw the description for whichever element owns it, or hide the bubble.
+   *
+   * The bubble is the one place that decides what is on screen, so that the
+   * events do not have to agree with each other: a pointer leaving, a focus
+   * arriving and the table being rebuilt all end up here.
+   */
+  function renderTip() {
+    const owner = tipOwner();
+    if (!owner || !owner.dataset.tooltip) {
+      if (tip.node) tip.node.dataset.open = "false";
+      return;
+    }
     const node = tipNode();
-    node.textContent = text;
+    node.textContent = owner.dataset.tooltip;
     node.dataset.open = "true";
-    tip.owner = owner;
     placeTip(owner, node);
   }
 
-  function hideTip() {
-    if (tip.node) tip.node.dataset.open = "false";
-    tip.owner = null;
+  /* Move a description to where its trigger is now.
+   *
+   * A description left where its trigger *was* is worse than none - but one
+   * that follows its trigger is neither. The page scrolls, the stations table
+   * scrolls sideways, and neither is a reason to throw the text away. It is
+   * closed only when the trigger has gone off the screen, or out of the page.
+   */
+  function refreshTip() {
+    const owner = tipOwner();
+    if (!owner) {
+      // The trigger is gone for good - the station was reaped, or the table was
+      // rebuilt without it. Drop the sources that point at nothing, and keep
+      // the one that is still there.
+      if (tipSource.pointer && !tipSource.pointer.isConnected) tipSource.pointer = null;
+      if (tipSource.focus && !tipSource.focus.isConnected) tipSource.focus = null;
+      renderTip();
+      return;
+    }
+    const box = owner.getBoundingClientRect();
+    const margin = 8;
+    if (box.bottom < margin || box.top > window.innerHeight - margin) {
+      // The trigger has scrolled off the screen. A description floating over
+      // whatever is there now would be pointing at the wrong thing.
+      if (tipSource.pointer === owner) tipSource.pointer = null;
+      if (tipSource.focus === owner) tipSource.focus = null;
+    }
+    renderTip();
+  }
+
+  /* What an event does to a description, as a pure function.
+   *
+   * The rules *are* the bug, so they are written as rules and tested as rules
+   * (see tests/test_web_ui.py). The handlers below do nothing but find the
+   * element and ask.
+   *
+   *   type        the event type
+   *   pointerType "mouse", "touch", or "" for a focus event
+   *   hasTip      whether the element under the pointer carries a description
+   *   leaves      whether the pointer left the element that had the description
+   *   nextHasTip  whether focus is moving to another element that has one
+   *   rebuilding  whether the stations table is being rebuilt right now
+   *
+   * The answer is one of "show", "hide", "hide-all" or "none". "hide" closes
+   * the source the event came from - a mouse leaving does not take the focus
+   * away from the element a keyboard reader is on, and vice versa - while
+   * "hide-all" closes both, which is what a deliberate tap on something
+   * without a description means: the reader asked for something else.
+   */
+  function tipAction({
+    type,
+    pointerType = "",
+    hasTip = false,
+    leaves = false,
+    nextHasTip = false,
+    rebuilding = false,
+  }) {
+    // A touch pointer is "over" an element only while a finger is on it, and
+    // it reports "out" the instant that finger lifts - with no relatedTarget,
+    // because the pointer is destroyed along with the touch. Read as "the
+    // pointer left", that closed the description the moment the tap ended: a
+    // tap showed the text for a single frame, and the only way to read it was
+    // to hold a finger down. So on a touch screen only `pointerdown` means
+    // anything, and `pointerout` means nothing at all.
+    if (pointerType === "touch") {
+      if (type === "pointerdown") return hasTip ? "show" : "hide-all";
+      return "none";
+    }
+
+    // A mouse: over is a hover, out is a departure.
+    if (type === "pointerover") return hasTip ? "show" : "hide";
+    if (type === "pointerout") return leaves ? "hide" : "none";
+
+    // Focus. `focusin` is how a keyboard - and a phone, which has no hover at
+    // all - reaches a description.
+    if (type === "focusin") return hasTip ? "show" : "none";
+    if (type === "focusout") {
+      // The table is being rebuilt: the description is about to be put back
+      // (see restoreTip), and closing it now would make it flicker.
+      if (rebuilding) return "none";
+      // Focus is moving to another described element, which `focusin` is about
+      // to show.
+      if (nextHasTip) return "none";
+      return "hide";
+    }
+
+    return "none";
+  }
+
+  /* Apply an answer to the source it came from.
+   *
+   * `source` is "pointer" for a pointer event and "focus" for a focus event.
+   * The two are kept apart on purpose: a mouse moving away does not take the
+   * focus away from the element a keyboard reader is on, and a keyboard reader
+   * tabbing away does not take the mouse away from the figure it is over.
+   */
+  function applyTip(action, owner, source) {
+    if (action === "show" && owner && owner.dataset.tooltip) {
+      tipSource[source] = owner;
+    } else if (action === "hide") {
+      tipSource[source] = null;
+    } else if (action === "hide-all") {
+      tipSource.pointer = null;
+      tipSource.focus = null;
+    }
+    renderTip();
   }
 
   // Delegated, so rows built later by `paintStreams` are covered without
   // rebinding anything on every poll.
   document.addEventListener("pointerover", (event) => {
     const owner = event.target.closest("[data-tooltip]");
-    if (owner) showTip(owner);
-    else hideTip();
+    applyTip(
+      tipAction({ type: event.type, pointerType: event.pointerType, hasTip: !!owner }),
+      owner,
+      "pointer"
+    );
   });
 
   document.addEventListener("pointerout", (event) => {
     const owner = event.target.closest("[data-tooltip]");
     // `relatedTarget` is where the pointer went. Moving onto a child of the same
     // tile must not dismiss the tooltip.
-    if (owner && !owner.contains(event.relatedTarget)) hideTip();
+    const leaves = !!owner && !owner.contains(event.relatedTarget);
+    applyTip(
+      tipAction({
+        type: event.type,
+        pointerType: event.pointerType,
+        hasTip: !!owner,
+        leaves: leaves,
+      }),
+      owner,
+      "pointer"
+    );
+  });
+
+  // A tap. On a touch screen this is the only way to reach any of this, so it
+  // is the event that decides what a finger on the screen means.
+  document.addEventListener("pointerdown", (event) => {
+    const owner = event.target.closest("[data-tooltip]");
+    applyTip(
+      tipAction({ type: event.type, pointerType: event.pointerType, hasTip: !!owner }),
+      owner,
+      "pointer"
+    );
   });
 
   // Keyboard and touch: `focus-visible`/tap focus lands here, which is the only
   // way a phone gets a tooltip at all - there is no hover on a touch screen.
   document.addEventListener("focusin", (event) => {
     const owner = event.target.closest("[data-tooltip]");
-    if (owner) showTip(owner);
+    applyTip(tipAction({ type: event.type, hasTip: !!owner }), owner, "focus");
   });
-  document.addEventListener("focusout", hideTip);
 
-  // A tooltip pointing at where its trigger *was* is worse than none.
-  window.addEventListener("scroll", hideTip, { passive: true });
-  window.addEventListener("resize", hideTip);
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") hideTip();
+  document.addEventListener("focusout", (event) => {
+    const next = event.relatedTarget;
+    applyTip(
+      tipAction({
+        type: event.type,
+        nextHasTip: !!(next && next.closest && next.closest("[data-tooltip]")),
+        rebuilding: repainting,
+      }),
+      null,
+      "focus"
+    );
   });
+
+  // A description that stays where its trigger was is worse than none; one
+  // that follows its trigger is neither. The table scrolls sideways and the
+  // page scrolls, and neither is a reason to throw the text away. Capturing,
+  // so the table's own scroller is caught as well as the page.
+  document.addEventListener("scroll", refreshTip, { passive: true, capture: true });
+  window.addEventListener("resize", refreshTip);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      tipSource.pointer = null;
+      tipSource.focus = null;
+      renderTip();
+    }
+  });
+
+  /* The key of the element that has the focus, if it is one of ours.
+   *
+   * Only the stations table is rebuilt, so only a focus inside it has to be
+   * put back.
+   */
+  function focusedKey() {
+    const active = document.activeElement;
+    if (!active || !active.closest) return null;
+    if (!active.closest("#streams")) return null;
+    return active.dataset.tipKey || null;
+  }
+
+  /* Put a description back after the stations table has been rebuilt.
+   *
+   * The key names a station and a column, so the description can be found
+   * again in the new markup. If the station has gone there is nothing to point
+   * at, and the bubble closes.
+   */
+  function restoreTip(key) {
+    if (!key) return;
+    const owner = document.querySelector('[data-tip-key="' + key + '"]');
+    if (owner) {
+      tipSource.focus = owner;
+      renderTip();
+    } else {
+      tipSource.focus = null;
+      renderTip();
+    }
+  }
+
+  /* Put a *hovered* description back after the stations table was rebuilt.
+   *
+   * The mouse is still resting on the same place, but the cell it was over
+   * has been replaced - so the description would be pointing at a node that
+   * is no longer in the page. The browser fires a fresh `pointerover` when
+   * the element under the mouse is replaced, but that is not guaranteed for
+   * every browser, and the description should not depend on it.
+   */
+  function restoreHover(key) {
+    if (!key) return;
+    const owner = document.querySelector('[data-tip-key="' + key + '"]');
+    if (owner) {
+      tipSource.pointer = owner;
+      renderTip();
+    } else {
+      tipSource.pointer = null;
+      renderTip();
+    }
+  }
+
+  /* Give the focus back to the cell it was in.
+   *
+   * Without this a keyboard reader is thrown back to the top of the page every
+   * second, which makes the stations table unusable without a mouse. The focus
+   * only goes back to something that is on screen, so a reader who has scrolled
+   * away from the table is not yanked back to it.
+   */
+  function restoreFocus(key) {
+    if (!key) return;
+    const owner = document.querySelector('[data-tip-key="' + key + '"]');
+    if (!owner) return;
+    const box = owner.getBoundingClientRect();
+    if (box.bottom <= 0 || box.top >= window.innerHeight) return;
+    owner.focus({ preventScroll: true });
+  }
 
   /* ---------------------------------------------------------------- polling */
 

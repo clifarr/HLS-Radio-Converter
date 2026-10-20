@@ -3,6 +3,94 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+The tooltips stay put on a phone, and a commit that CI would reject cannot be
+made in the first place.
+
+### Added
+
+- **A pre-commit hook that runs the CI checks before the commit.** Reported
+  repeatedly: a commit was pushed, CI went red on something a local run
+  would have caught in seconds, and the commit had to be undone and redone.
+  The hook runs *the same commands CI runs* - ruff format, ruff check, ty,
+  the installer tests, pytest, the end-to-end self-test and the wheel build
+  - so a commit that passes it is a commit CI will pass.
+
+  The split is deliberate. The **commit** stage runs the fast test subset
+  (`pytest -q -k "not stream"`, about 21s) plus the linters, the type
+  checker, the installer tests and the wheel check. The **push** stage runs
+  the full test matrix, the end-to-end self-test and a clean build. Charging
+  45s to every commit is how a hook gets bypassed with `--no-verify`, and a
+  bypassed hook is worse than no hook.
+
+  The hooks are `local` rather than fetched from a `repo:` URL: every tool
+  here is already a pinned dev dependency, and `uv run` resolves them from
+  `uv.lock` - so a hook in its own isolated environment would check the code
+  with *different* versions of the tools than CI uses. That is the same class
+  of bug as a stale lockfile: a green check that does not mean what it says.
+
+  It cannot fall behind CI either. `tests/test_metadata.py` compares the two
+  and fails if a check is added to one and not the other, in either
+  direction, so "add a CI job" now also means "add a hook" - and the test
+  says so.
+
+### Changed
+
+- **The wheel's asset check is now a script, shared with CI.** The `package`
+  job inlined a Python heredoc that looked inside the built wheel for
+  `templates/` and `static/`. That check is now
+  `scripts/verify-wheel-assets.py`, which both CI and the pre-commit hook
+  call - so the two cannot drift apart, and the failure message says what
+  would actually happen (the service starts, streams audio, and then serves a
+  500 on its own pages) instead of just naming a missing file.
+
+### Fixed
+
+- **A tapped description no longer vanishes the moment the finger lifts.**
+  Reported: "the tooltips tend to disappear" - on a figure that changes every
+  second it went almost at once, and on the stations list it went *always*;
+  the only way to read one was to hold a finger down. The cause was the
+  browser's touch events: a finger is "over" an element only while it is on
+  the screen, and the pointer reports "out" the instant it lifts, with no
+  `relatedTarget` - the pointer is destroyed along with the touch. The page
+  read that as "the pointer left", so it closed the description the tap had
+  just opened, after a single frame. On a touch screen only `pointerdown`
+  now means anything; a `pointerout` from a finger means nothing at all.
+- **The stations table no longer closes a description once a second.** The
+  table is rebuilt from scratch every poll, which replaces the cell the
+  reader had tapped, and the browser reports that as a `focusout` - so the
+  description was closed by the very repaint that was meant to update it.
+  The rebuild now announces itself, and the description is put back against
+  the cell it belongs to. Descriptions are keyed by station and column rather
+  than by DOM node, so they survive the rebuild; the *focus* is put back too,
+  which stops a keyboard reader being thrown to the top of the page every
+  second.
+- **Scrolling no longer closes a description.** It used to: any scroll closed
+  it, even though the element it described was still on screen - and on a
+  phone the sideways scroll of the stations table is the very gesture that
+  shows it. A description now *follows* its trigger, and is closed only when
+  the trigger has gone off the screen.
+
+### Changed
+
+- **A pointer and the focus are tracked separately.** A mouse leaving a figure
+  does not take the focus away from the element a keyboard reader is on, and
+  tabbing away does not take the mouse away from the figure it is over. One
+  "who owns the tooltip" variable could not tell those apart, and guessing
+  wrong was the bug.
+- **The stations table's cells are focusable.** A cell that carries a
+  description and cannot be reached is a description only a mouse can read.
+
+### Testing
+
+- The rules that decide when a description shows are now one pure function
+  (`tipAction`), and the suite drives it through every case - a tap, a lifted
+  finger, a mouse over, a mouse leaving, focus arriving, focus leaving, and
+  the table being rebuilt. Three more guards in
+  `scripts/verify-web-guards.py` break the page deliberately and assert the
+  suite notices.
+
 ## [2.1.2] - 2026-10-19
 
 The dashboard fits a phone.

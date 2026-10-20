@@ -69,6 +69,52 @@ two concurrent runs will corrupt the tree - which is exactly what happened once.
 To run just the fast tests, skip the names that stream:
 `uv run pytest -q -k "not stream"`.
 
+## The pre-commit hook
+
+**Install it once, after cloning:**
+
+```bash
+uv sync
+uv run pre-commit install
+```
+
+That puts a hook in `.git/hooks/pre-commit`, and from then on a commit that
+CI would reject cannot be made in the first place. This exists because that
+has happened repeatedly: a commit is pushed, CI goes red on something a local
+run would have caught in seconds, and the commit has to be undone and redone.
+
+The hook runs **the same commands CI runs** - the same ruff, the same ty, the
+same pytest, the same installer tests - in the same order, so a commit that
+passes them is a commit CI will pass. The configuration is
+[`.pre-commit-config.yaml`](.pre-commit-config.yaml).
+
+```bash
+uv run pre-commit run --all-files   # run every check without committing
+uv run pre-commit run --all-files --hook-stage pre-push   # the slow ones
+```
+
+Two things about the split:
+
+- **The commit stage runs the fast test subset** (`pytest -q -k "not stream"`,
+  about 21s). The **full matrix**, the end-to-end self-test and a clean
+  wheel build run on **push**, where they cost the same but buy something
+  real. Charging 45s to every commit is how a hook gets bypassed with
+  `--no-verify`, and a bypassed hook is worse than no hook.
+- **The hooks are `local`, not fetched from a `repo:` URL.** Every tool
+  this project uses is already a pinned dev dependency, and `uv run` resolves
+  them from `uv.lock` - so a hook running in its own isolated environment
+  would check the code with *different* versions of the tools than CI uses.
+  That is the same class of bug as a stale lockfile: a green check that does
+  not mean what it says.
+
+The hook cannot fall behind CI. `tests/test_metadata.py` compares the two and
+fails if a check is added to one and not the other, in either direction - so
+"add a CI job" now also means "add a hook", and the test says so.
+
+If a hook is genuinely wrong for your workflow, fix it in
+`.pre-commit-config.yaml` rather than reaching for `--no-verify`: the hook is
+the thing that makes the next commit cheap.
+
 ## Linting and type checking
 
 Two tools, both from [Astral](https://astral.sh/), both configured in

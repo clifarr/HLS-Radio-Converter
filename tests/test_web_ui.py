@@ -751,7 +751,7 @@ def test_descriptions_are_not_native_title_tooltips(live_server):
     script = (web.resource_dir(web.STATIC) / "dashboard.js").read_text(encoding="utf-8")
     # The id the stylesheet keys off, and the handlers that make it appear.
     assert 'node.id = "tooltip"' in script, "the tooltip element is not the one the CSS styles"
-    for needed in ("data-tooltip", "showTip", "hideTip", "pointerover", "focusin"):
+    for needed in ("data-tooltip", "renderTip", "tipAction", "pointerover", "focusin"):
         assert needed in script, f"dashboard.js does not implement {needed}"
     # And the script itself must not describe anything with a native `title`
     # either: the status pill used one, where it is delayed about a second,
@@ -774,6 +774,229 @@ def test_every_description_is_reachable_without_a_mouse(live_server):
         body = httpx.get(live_server + path, timeout=10).text
         for tag in re.findall(r"<(?:div|th)\b[^>]*data-tooltip=[^>]*>", body, re.S):
             assert "tabindex=" in tag, f"{path}: a description is not focusable:\n  {tag[:160]}"
+
+
+#: The rules the tooltip follows, as they are meant to behave. Each row is
+#: (label, event, expected action). The event is the dictionary ``tipAction``
+#: takes, and the action is what it must answer: "show" opens the description,
+#: "hide" closes the source the event came from, "hide-all" closes both, and
+#: "none" leaves things exactly as they are.
+#:
+#: This is the bug, written down. It was reported as "the tooltips tend to
+#: disappear" on a phone: a description that changed every second vanished
+#: almost at once, and on the stations list it vanished *always* - the only
+#: way to read it was to hold a finger down.
+TIP_RULES = [
+    # A tap is what a finger does, and it is the only way to reach a
+    # description on a touch screen at all. It must show.
+    (
+        "tap a described figure",
+        {"type": "pointerdown", "pointerType": "touch", "hasTip": True},
+        "show",
+    ),
+    # A tap on something with no description means the reader asked for
+    # something else, so the description goes - including the one the tap left
+    # the focus sitting on.
+    (
+        "tap something with no description",
+        {"type": "pointerdown", "pointerType": "touch", "hasTip": False},
+        "hide-all",
+    ),
+    # The finger lifting. The browser reports this as the pointer leaving,
+    # with no relatedTarget, because the pointer dies with the touch. Read
+    # as a departure it closed the description the instant the tap ended -
+    # which is the whole of the reported bug.
+    (
+        "the finger lifts",
+        {"type": "pointerout", "pointerType": "touch", "hasTip": True, "leaves": True},
+        "none",
+    ),
+    (
+        "a touch pointer hovers",
+        {"type": "pointerover", "pointerType": "touch", "hasTip": True},
+        "none",
+    ),
+    # A mouse still works the way it always did.
+    ("mouse over", {"type": "pointerover", "pointerType": "mouse", "hasTip": True}, "show"),
+    (
+        "mouse over nothing",
+        {"type": "pointerover", "pointerType": "mouse", "hasTip": False},
+        "hide",
+    ),
+    (
+        "mouse leaves",
+        {"type": "pointerout", "pointerType": "mouse", "hasTip": True, "leaves": True},
+        "hide",
+    ),
+    (
+        "mouse moves to a child of the same figure",
+        {"type": "pointerout", "pointerType": "mouse", "hasTip": True, "leaves": False},
+        "none",
+    ),
+    # The keyboard, and a phone that gives the tapped element the focus.
+    ("focus lands on a described figure", {"type": "focusin", "hasTip": True}, "show"),
+    (
+        "focus lands on nothing described",
+        {"type": "focusin", "hasTip": False},
+        "none",
+    ),
+    ("focus leaves", {"type": "focusout"}, "hide"),
+    # Focus moving to another described figure: `focusin` is about to show
+    # it, so closing here would make it flicker.
+    ("focus moves to another described figure", {"type": "focusout", "nextHasTip": True}, "none"),
+    # The stations table is rebuilt every second, which replaces the element
+    # the focus was in and makes the browser report a `focusout`. The
+    # description is put straight back, so closing it would flicker.
+    (
+        "the stations table is rebuilt",
+        {"type": "focusout", "rebuilding": True},
+        "none",
+    ),
+]
+
+
+def test_a_tapped_description_stays_until_it_is_dismissed(tmp_path):
+    """Reported: "the tooltips tend to disappear" - on a phone, on their own.
+
+    A touch pointer is "over" an element only while a finger is on the screen,
+    and the browser reports "out" the instant that finger lifts - with no
+    relatedTarget, because the pointer is destroyed along with the touch. The
+    old code read that as "the pointer left", so it closed the description the
+    moment the tap ended. On a tile whose figure changes every second it looked
+    intermittent, because the repaint happened to land near the tap; on the
+    stations list it was always, because the table is rebuilt every second and
+    the repaint killed the description too.
+
+    The rules are the bug, so they are written down as rules and driven
+    through the real function - a text search would pass for a comment, and
+    rendering the page would need a browser the suite does not have.
+    """
+    node = shutil.which("node")
+    if node is None:
+        # ty mis-resolves pytest.skip (see tests/conftest.py).
+        pytest.skip("node is not installed")  # ty: ignore[too-many-positional-arguments]
+    script = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.js").read_text(encoding="utf-8"),
+        language="javascript",
+    )
+    match = re.search(r"function tipAction\(\{.*?^[ ]{2}\}\) \{.*?^[ ]{2}\}", script, re.S | re.M)
+    assert match, (
+        "tipAction has moved or changed shape - the rules that decide when a "
+        "description shows must stay a pure function this test can drive"
+    )
+
+    # The rules are written in Python, so the booleans have to be translated:
+    # Python's `True` is not JavaScript's `true`, and Node says so.
+    def js(value):
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, dict):
+            return "{" + ", ".join(f"{k}: {js(v)}" for k, v in value.items()) + "}"
+        return repr(value)
+
+    checks = "\n".join(
+        f"check({label!r}, tipAction({js(event)}), {want!r});" for label, event, want in TIP_RULES
+    )
+    harness = (
+        match.group(0)
+        + "\n\nfunction check(label, actual, want) {\n"
+        + "  if (actual !== want) {\n"
+        + '    console.error(label + ": got " + actual + ", want " + want);\n'
+        + "    process.exit(1);\n"
+        + "  }\n"
+        + "}\n"
+        + checks
+        + '\nconsole.log("tipAction: every rule behaves as the page promises");\n'
+    )
+    script_file = tmp_path / "tip_action.js"
+    script_file.write_text(harness, encoding="utf-8")
+    result = subprocess.run(
+        [node, str(script_file)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_description_survives_the_table_being_rebuilt():
+    """The stations table is rebuilt every second, and the description must not blink.
+
+    Two things go wrong when it is, and both were reported as "the tooltip
+    disappears":
+
+    * The cell the reader had tapped is replaced, so the browser reports a
+      `focusout` - which closed the description. It is put back afterwards, so
+      the close has to be suppressed while the rebuild runs.
+    * The description has to find its trigger again in the new markup, which
+      means it needs a *key* - a station and a column - rather than a
+      reference to a DOM node that is about to be thrown away.
+    """
+    script = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.js").read_text(encoding="utf-8"),
+        language="javascript",
+    )
+    # The key, and the look-up that uses it.
+    assert "data-tip-key" in script or "dataset.tipKey" in script, (
+        "the descriptions are still keyed to a DOM node, so they cannot survive "
+        "the table being rebuilt"
+    )
+    assert "restoreTip" in script, "the description is not put back after a rebuild"
+    # The rebuild has to be *announced* while it runs - that is what suppresses
+    # the `focusout` the removal of the old cell causes. A bare mention of the
+    # flag is not enough: it has to be set before the table is emptied and
+    # cleared after, and it has to be what the `focusout` handler reads.
+    assert "repainting = true" in script, (
+        "the rebuild does not mark itself, so the focusout it causes closes the "
+        "description it is about to restore"
+    )
+    assert "repainting = false" in script, (
+        "the rebuild never clears its mark, so the description can never be "
+        "closed by a focus change again"
+    )
+    assert re.search(r"rebuilding:\s*repainting", script), (
+        "the focusout handler does not read the rebuild flag, so the focusout "
+        "caused by a rebuild still closes the description"
+    )
+    # The focus has to be put back too, or a keyboard reader is thrown to the
+    # top of the page every second.
+    assert "restoreFocus" in script, "the focus is lost every time the table is rebuilt"
+
+    # Every cell must carry the key, or the description cannot be found again.
+    for index in range(1, 11):
+        assert f'"cell:" + key + ":{index}"' in script, (
+            f"column {index} does not carry a key, so its description cannot "
+            "survive the table being rebuilt"
+        )
+
+
+def test_the_description_follows_its_trigger_when_the_page_scrolls():
+    """Scrolling is not a reason to throw the description away.
+
+    It used to be: any scroll closed it, even though the element it described
+    was still on screen. The stations table scrolls sideways, and the page
+    scrolls, so on a phone the description was closed by the very gesture that
+    showed it.
+    """
+    script = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.js").read_text(encoding="utf-8"),
+        language="javascript",
+    )
+    assert "refreshTip" in script, "the description is not moved when the page scrolls"
+    # The scroll listener must *move* it, not close it.
+    scroll = re.search(r'addEventListener\("scroll",\s*(\w+)', script)
+    assert scroll, "the page does not listen for scrolling at all"
+    assert scroll.group(1) == "refreshTip", (
+        f"scrolling calls {scroll.group(1)!r}, which closes the description; it "
+        "should move it to where its trigger now is"
+    )
+    # And it has to catch the table's own sideways scroller, which does not
+    # bubble to the window.
+    assert "capture: true" in script, (
+        "the scroll listener does not capture, so the stations table's own "
+        "sideways scroll is not seen"
+    )
 
 
 def test_dashboard_is_not_the_legacy_wildcard_route(live_server):

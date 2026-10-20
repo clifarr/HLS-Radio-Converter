@@ -70,6 +70,10 @@ dev = [
     "anyio>=4",
     "ruff>=0.17",
     "ty>=0.0.88",
+    # The pre-commit hook. It runs the same checks as CI, so a commit that
+    # would fail CI cannot be made in the first place. `uv run pre-commit
+    # install` puts it in .git/hooks; see CONTRIBUTING.md.
+    "pre-commit>=3.8",
 ]
 
 # ---------------------------------------------------------------- ruff (lint)

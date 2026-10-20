@@ -96,14 +96,6 @@ jobs:
       - name: Build the wheel
         run: uv build
       - name: Check the packaged assets made it in
-        run: |
-          python - <<'PY'
-          import glob, zipfile
-          wheel = glob.glob("dist/*.whl")[0]
-          names = zipfile.ZipFile(wheel).namelist()
-          for needed in ("templates/base.html", "templates/dashboard.html",
-                         "templates/index.html", "static/dashboard.css",
-                         "static/dashboard.js"):
-              assert any(n.endswith(needed) for n in names), f"{needed} is not in the wheel"
-          print(f"{wheel}: assets present")
-          PY
+        # The same script the pre-commit hook runs, so the two cannot drift
+        # apart. It builds the wheel again (cheap) and looks inside it.
+        run: uv run python scripts/verify-wheel-assets.py

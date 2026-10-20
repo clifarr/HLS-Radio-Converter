@@ -165,6 +165,43 @@ CASES: List[Case] = [
         "",
         "test_the_status_pill_tells_idle_from_live",
     ),
+    Case(
+        # Reported on a phone: "the tooltips tend to disappear", and on the
+        # stations list they always did. A touch pointer reports "out" the
+        # instant the finger lifts, with no relatedTarget - and reading that as
+        # a departure closed the description the moment the tap ended, so the
+        # only way to read it was to hold a finger down. This is that line
+        # coming back.
+        "a lifted finger closes the description again",
+        PKG / "static" / "dashboard.js",
+        '      if (type === "pointerdown") return hasTip ? "show" : "hide-all";\n      return "none";',
+        '      if (type === "pointerdown") return hasTip ? "show" : "hide-all";\n'
+        '      if (type === "pointerout") return leaves ? "hide" : "none";\n'
+        '      return "none";',
+        "test_a_tapped_description_stays_until_it_is_dismissed",
+    ),
+    Case(
+        # The other half of the same report: the stations table is rebuilt
+        # every second, and the rebuild made the browser report a `focusout`,
+        # which closed the description. The rebuild has to say it is rebuilding,
+        # and the focusout handler has to read that. Breaking the *reading* is
+        # the honest breakage: the flag is still there, but nothing consults it.
+        "the rebuild stops suppressing the focusout it causes",
+        PKG / "static" / "dashboard.js",
+        "      rebuilding: repainting,",
+        "      rebuilding: false,",
+        "test_the_description_survives_the_table_being_rebuilt",
+    ),
+    Case(
+        # Scrolling used to close the description, even though the element it
+        # described was still on screen - and on a phone the sideways scroll of
+        # the stations table is the gesture that shows it.
+        "scrolling closes the description again",
+        PKG / "static" / "dashboard.js",
+        'document.addEventListener("scroll", refreshTip, { passive: true, capture: true });',
+        'document.addEventListener("scroll", hideAll, { passive: true, capture: true });',
+        "test_the_description_follows_its_trigger_when_the_page_scrolls",
+    ),
 ]
 
 

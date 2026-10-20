@@ -538,6 +538,102 @@ def test_uv_lock_matches_the_package_version():
     )
 
 
+# ------------------------------------------------------------------ pre-commit
+#: Every command CI runs, and the hook that must run it too. The point of the
+#: pre-commit hook is that a commit which would fail CI cannot be made - so a
+#: check added to CI but not to the hook is a check that only runs *after* the
+#: push, which is the exact waste this hook exists to remove.
+#:
+#: The pairs are (a phrase that identifies the command in CI, the hook id in
+#: ``.pre-commit-config.yaml``). Matching on a phrase rather than the whole
+#: command line keeps the test from breaking every time a flag is added.
+CI_CHECKS = [
+    ("uv sync --locked", "uv-lock-is-current"),
+    ("ruff format --check", "ruff-format"),
+    ("ruff check", "ruff-lint"),
+    ("ty check", "ty-check"),
+    ("bash -n packaging/install.sh", "shell-syntax"),
+    ("bash scripts/test-installer-helpers.sh", "installer-helper-tests"),
+    ("pytest -q", "pytest"),
+    ("radioconv check --end-to-end", "end-to-end-self-test"),
+    ("uv build", "build-wheel"),
+    ("verify-wheel-assets.py", "wheel-contains-assets"),
+]
+
+
+def test_the_pre_commit_hook_runs_every_check_ci_runs():
+    """The hook must not fall behind CI, or it stops being worth having.
+
+    A pre-commit hook that runs *fewer* checks than CI is the worst kind: it
+    gives the feeling of safety while still letting the failing commit through.
+    So this compares the two, both ways round.
+
+    The check lives in the test suite rather than in a comment, because a
+    comment is not evidence - and this file is the one that decides whether a
+    new CI job is also a new hook.
+    """
+    workflow = _read(".github/workflows/ci.yml")
+    config = _read(".pre-commit-config.yaml")
+
+    for ci_command, hook_id in CI_CHECKS:
+        assert ci_command in workflow, (
+            f"CI no longer runs {ci_command!r}, so this test's list of CI checks "
+            "is out of date - update CI_CHECKS"
+        )
+        assert f"id: {hook_id}" in config, (
+            f"CI runs {ci_command!r} but the pre-commit hook {hook_id!r} does not. "
+            "A check that only runs after the push is a check the pre-commit "
+            "hook was supposed to prevent."
+        )
+
+    # And the other way round: a hook that CI does not run is not a "same as
+    # CI" hook, it is a local opinion. It is allowed to exist - the fast
+    # pytest subset is one - but it must be a deliberate choice, so it is
+    # named here explicitly.
+    ci_only = {
+        # The full matrix. The hook runs `pytest -q -k "not stream"` instead,
+        # and the whole matrix on push.
+        "pytest-full",
+    }
+    hook_ids = set(re.findall(r"^\s*-?\s*id:\s*(\S+)\s*$", config, re.M))
+    for hook_id in hook_ids - ci_only:
+        assert hook_id in {name for _cmd, name in CI_CHECKS}, (
+            f"the hook {hook_id!r} does not correspond to anything CI runs. "
+            "Either add it to CI_CHECKS (and to CI) or remove it - a check that "
+            "only exists locally is a check nobody else gets."
+        )
+
+
+def test_the_pre_commit_hook_is_documented():
+    """A hook nobody knows about is a hook that gets bypassed with --no-verify."""
+    contributing = _read("CONTRIBUTING.md")
+    assert "pre-commit" in contributing, "CONTRIBUTING.md does not mention the pre-commit hook"
+    assert "pre-commit install" in contributing, (
+        "CONTRIBUTING.md does not say how to install the hook"
+    )
+
+    # And the config must be the one pre-commit actually reads.
+    assert (PROJECT_ROOT / ".pre-commit-config.yaml").is_file(), (
+        "the pre-commit configuration is missing"
+    )
+
+
+def test_pre_commit_is_a_dev_dependency():
+    """The hook has to be installable from the locked environment.
+
+    ``uv sync`` is the whole development setup - there is no Makefile and no
+    separate tool install - so a hook that needs a tool the project does not
+    declare is a hook that works on this machine and nowhere else.
+    """
+    pyproject = _read("pyproject.toml")
+    assert '"pre-commit' in pyproject, (
+        "pre-commit is not in the dev dependency group, so `uv sync` does not install it"
+    )
+    # And it has to be in the lockfile too, or `uv sync --locked` fails.
+    lock = _read("uv.lock")
+    assert "pre-commit" in lock, "pre-commit is in pyproject.toml but not in uv.lock"
+
+
 # ------------------------------------------------------------------ installer
 def test_installer_is_valid_bash():
     """`bash -n` is the only linter we have for the install script."""

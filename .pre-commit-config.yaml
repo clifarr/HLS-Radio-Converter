@@ -1,0 +1,140 @@
+# Pre-commit hooks: the CI checks, run before the commit instead of after it.
+#
+# The problem this exists to solve: a commit that CI rejects is a commit that
+# has to be undone and redone. The checks here are the *same* commands CI
+# runs, in the same order, so a commit that passes them is a commit CI will
+# pass too.
+#
+#   uv sync              # once, to get pre-commit itself
+#   uv run pre-commit install
+#
+# Then the hook runs on every `git commit`. To run the checks without
+# committing:
+#
+#   uv run pre-commit run --all-files
+#
+# The hooks are `local` rather than `repo: https://github.com/...` on purpose.
+# Every tool this project uses is already a pinned dev dependency, and
+# `uv run` resolves them from the lockfile - so a hook that ran in its own
+# isolated environment would be checking the code with *different* versions of
+# the tools than CI uses, which is the same class of bug as a stale lockfile.
+# One environment, one set of versions.
+#
+# There is a guard for this file: tests/test_metadata.py asserts that every
+# command CI runs also appears here, and the other way round. A check added to
+# CI but not to the hook would be a check that only runs after the push, which
+# is the thing this file is meant to prevent.
+#
+# `pass_filenames: false` throughout: these tools take a directory, not a
+# list of files, and passing filenames would make ruff and ty check a
+# *different* set of files than CI does.
+#
+# The slow hooks are marked `stages: [pre-push]` rather than `pre-commit`:
+#   - The full test matrix (streaming, 22 extra tests) takes ~43s, and the
+#     end-to-end self-test another ~3s. Charging that to every commit is how
+#     a hook gets bypassed with `--no-verify`.
+#   - `pytest -k "not stream"` covers the same tests minus the ones that
+#     stream live audio, and runs in ~21s. That is the pre-commit gate.
+#   - The full suite, the end-to-end self-test and the wheel build run on
+#     push instead, where they cost the same but buy something real.
+# `pre-commit` also refuses to run the same hook twice in one commit unless
+# `stages` are distinct, which is why the push-only hooks are not in the
+# pre-commit stage at all.
+
+default_language_version:
+  python: python3
+
+repos:
+  - repo: local
+    hooks:
+      # ---- the CI "lint" job -------------------------------------------
+      # Same three commands, same order, as .github/workflows/ci.yml.
+      - id: uv-lock-is-current
+        name: uv lock is up to date
+        entry: uv lock --check
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|uv\.lock)$
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --check .
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: ruff-lint
+        name: ruff lint
+        entry: uv run ruff check .
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: ty-check
+        name: ty type check
+        entry: uv run ty check
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      # ---- the CI "shell" job ------------------------------------------
+      - id: shell-syntax
+        name: bash syntax check
+        entry: bash -n packaging/install.sh
+        language: system
+        pass_filenames: false
+        files: ^packaging/install\.sh$
+
+      - id: installer-helper-tests
+        name: installer helper tests
+        entry: bash scripts/test-installer-helpers.sh
+        language: system
+        pass_filenames: false
+        files: ^(packaging/install\.sh|scripts/test-installer-helpers\.sh)$
+
+      # ---- the CI "test" job -------------------------------------------
+      # The fast subset: every test except the ones that stream live audio.
+      # The full matrix runs on push (see below) because it is three times
+      # slower and the streaming tests are the flaky-prone ones - exactly the
+      # ones worth NOT making a developer wait for on every commit.
+      - id: pytest
+        name: pytest (fast)
+        entry: uv run pytest -q -k "not stream"
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      # ---- the CI "package" job ----------------------------------------
+      # The wheel must contain templates/ and static/, or a Pi install
+      # produces a service that starts, streams audio, and 500s on its own
+      # pages. Cheap enough (1.3s) to do on every commit.
+      - id: wheel-contains-assets
+        name: wheel contains the templates and static assets
+        entry: uv run python scripts/verify-wheel-assets.py
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|src/radioconv/(templates|static)/.*)$
+
+      # ---- on push only -------------------------------------------------
+      # The full test matrix, the end-to-end self-test and a clean build.
+      - id: pytest-full
+        name: pytest (full matrix, including streaming)
+        entry: uv run pytest -q
+        language: system
+        pass_filenames: false
+        types: [python]
+        stages: [pre-push]
+
+      - id: end-to-end-self-test
+        name: radioconv check --end-to-end
+        entry: uv run radioconv check --end-to-end --skip-port
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: build-wheel
+        name: build the wheel
+        entry: uv run uv build
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
