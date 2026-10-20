@@ -38,6 +38,14 @@ from typing import Any, Coroutine, Deque, Dict, List, Optional, Set, Tuple
 from .config import Settings
 from .pipeline import PipelineFatal, StreamPipeline
 from .throughput import SAMPLE_SECONDS, Throughput
+from .tsdemux import (
+    adts_align_offset,
+    adts_frame_size,
+    adts_has_sync,
+    mp3_align_offset,
+    mp3_frame_size,
+    mp3_has_sync,
+)
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +59,12 @@ NEVER_STARTED_GRACE = 5.0
 #: sent, and the reserve has moved on - but the map must not grow without limit
 #: on a service that runs for months.
 MAX_JOIN_FLOORS = 64
+
+#: The smallest MPEG audio frame we will cut a reserve piece at. 576 bytes is
+#: the frame of a 192 kbit/s 48 kHz stream - the size this project produces -
+#: and is used only as a *floor* while searching: the real size always comes
+#: from the frame header itself (see ``mp3_frame_size``).
+FRAME_HINT = 576
 
 
 class CapacityError(RuntimeError):
@@ -143,6 +157,16 @@ class StreamSession:
         #: Partial chunk held back by `_fan_out` while it accumulates to
         #: `chunk_size`. See `_fan_out` for why the size has to be fixed.
         self._pending = bytearray()
+        #: Audio held back while the session finds the first MP3 frame boundary
+        #: and then cuts every piece on one. See `_frame_aligned`.
+        self._align_pending = bytearray()
+        #: Whether the MP3 frame grid has been located yet. ``None`` means "not
+        #: looked yet"; ``False`` means "this is not MP3, pass it through".
+        self._frame_grid: Optional[bool] = None
+        #: Size in bytes of the MP3 frame this stream uses (576 for the
+        #: 192 kbit/s 48 kHz output this project produces), once it is known.
+        #: ``None`` until the first frame is found.
+        self._frame_size: Optional[int] = None
         #: Recent audio, ``(produced_at, piece)``, oldest first. Handed to a
         #: listener that connects later so it does not start in silence.
         self._reserve: Deque[Tuple[float, bytes]] = deque()
@@ -273,6 +297,48 @@ class StreamSession:
                 subscriber.queue.get_nowait()
                 subscriber.queue.put_nowait(None)
 
+    def _output_format(self) -> Optional[str]:
+        """The format the listener actually receives: ``"mp3"``, ``"adts"`` or ``None``.
+
+        This cannot be read off `settings.output_codec`, because that is a
+        *setting* and the pipeline may not honour it:
+
+        * ``output_codec = "mp3"`` with an AAC source -> FFmpeg transcodes to
+          MP3, so the listener gets MP3.
+        * ``output_codec = "adts"`` with an MP3 source -> FFmpeg transcodes to
+          AAC, so the listener gets ADTS.
+        * ``output_codec = "auto"`` -> the source is forwarded untouched, so
+          the listener gets whatever the source carries - MP3 or ADTS
+          depending on the station.
+
+        The pipeline knows: `pipeline.stats.detected_codec` is what we emit -
+        ``"mp3"``, ``"aac"``, or the source's own kind for a passthrough
+        stream. Before the first segment arrives it is not known, and the
+        answer is deferred until it is - which is fine, because the alignment
+        is decided on the *first audio*, not on the configuration.
+
+        The distinction matters: the frame grid a radio resynchronises on is
+        the one of the format it is *actually* being sent. Aligning an MP3
+        stream as if it were ADTS (or skipping an MP3 stream because the
+        setting says "auto") is exactly the bug this fixes.
+        """
+        codec = self.pipeline.stats.detected_codec
+        if codec == "mp3":
+            return "mp3"
+        if codec == "aac":
+            return "adts"
+        # The passthrough path records the source's own kind, which is either
+        # "mp3" or "adts" - the same two names.
+        if codec == "adts":
+            return "adts"
+        # Not known yet: fall back to the setting, which is right for the
+        # transcode paths (where we always know what we asked for).
+        if self.settings.output_codec == "mp3":
+            return "mp3"
+        if self.settings.output_codec == "adts":
+            return "adts"
+        return None
+
     def _fan_out(self, chunk: bytes) -> None:
         """Re-chunk to `chunk_size` and queue the result for every listener.
 
@@ -296,15 +362,218 @@ class StreamSession:
         queue operations and paced wake-ups drop by more than an order of
         magnitude on a Pi, which matters when eight listeners each need 40 of them
         a second.
+
+        For MP3 the pieces are additionally cut on **frame boundaries** (see
+        :meth:`_frame_aligned`), which is not a tidiness detail but the
+        difference between a radio showing the title and a radio showing
+        binary noise.
         """
+        chunk = self._frame_aligned(chunk)
+        if not chunk:
+            return
         self.stats.bytes_out += len(chunk)
-        size = max(1024, self.settings.chunk_size)
         self._pending += chunk
 
-        while len(self._pending) >= size:
-            piece = bytes(self._pending[:size])
-            del self._pending[:size]
+        while len(self._pending) >= self._piece_size():
+            piece = self._cut_piece()
+            if piece is None:
+                break
             self._enqueue(piece)
+
+    def _cut_piece(self) -> Optional[bytes]:
+        """Cut the next piece off the pending buffer, on a frame boundary.
+
+        The piece is at least `chunk_size` bytes and ends on a frame boundary,
+        so it is a whole number of frames - 15 frames = 8640 bytes for the
+        192 kbit/s stream this project produces, because 8192 is not a
+        multiple of 576.
+
+        Cutting on a frame boundary matters because a piece is the unit a
+        *joining* listener starts from (see `_join_floor`): a piece that
+        began mid-frame forces the radio to resynchronise its decoder, and a
+        radio that resynchronises re-anchors its metadata grid - which is
+        what makes the title garble.
+
+        The pending buffer holds whole frames (see `_frame_aligned`), so the
+        cut is a walk over the frame sizes rather than a guess.
+        """
+        target = self._piece_size()
+        if len(self._pending) < target:
+            return None
+        fmt = self._output_format()
+        if fmt is None or not self._frame_grid:
+            # No frame grid: cut on the size, as before.
+            piece = bytes(self._pending[:target])
+            del self._pending[:target]
+            return piece
+        # Cut at the first frame boundary at or after the target.
+        cut = 0
+        while True:
+            size = self._frame_size_at(bytes(self._pending), cut, fmt)
+            if size is None or cut + size > len(self._pending):
+                break
+            cut += size
+            if cut >= target:
+                break
+        if cut == 0:
+            # No complete frame yet: wait for more.
+            return None
+        piece = bytes(self._pending[:cut])
+        del self._pending[:cut]
+        return piece
+
+    def _piece_size(self) -> int:
+        """Bytes per piece: `chunk_size`.
+
+        The queue bound is counted in pieces, so the piece size has to be a
+        known number of bytes. The piece itself is a whole number of frames
+        (see `_cut_piece`), which is very slightly larger than this for MP3:
+        15 frames = 8640 bytes rather than 8192.
+        """
+        return max(1024, self.settings.chunk_size)
+
+    def _frame_aligned(self, chunk: bytes) -> bytes:
+        """Return audio that starts on an audio frame boundary.
+
+        Which frame boundary depends on the format the listener is actually
+        being sent (see `_output_format`): an MP3 frame for MP3, an ADTS
+        frame for AAC.
+
+        Why a radio needs this
+        ----------------------
+        A radio is two state machines over one byte stream: an MP3 decoder that
+        looks for frame syncs, and an ICY metadata parser that counts
+        ``metaint`` bytes and then reads a block. They have to agree about
+        where the stream starts. If the audio begins in the middle of a frame,
+        the radio discards the partial frame to resynchronise - and the two
+        state machines then disagree about where they are, so the radio reads
+        audio bytes as metadata (a garbled title) and metadata bytes as audio
+        (glitching). Both symptoms at once, and neither explained by the
+        station.
+
+        The offset is a *constant*, so it does not heal: the radio's counter
+        stays wrong for the life of the connection, and the display stays
+        garbled until the radio reconnects and re-anchors. That is exactly
+        what was reported.
+
+        Why the pieces were not aligned
+        -------------------------------
+        The audio was cut into fixed-size pieces, and those sizes are not a
+        multiple of a frame: the produced stream is 192 kbit/s at 48 kHz, so a
+        frame is 576 bytes, while the pieces are 8192 (8192 % 576 = 128).
+        Every listener therefore started at a random point *inside* a frame.
+        Measured on a real radio's own TCP traffic, the first frame of each
+        connection began at offsets 320, 384, 262, 390, 517 and 454 - never
+        reliably 0.
+
+        How it is done
+        --------------
+        The frame grid is found **once**, on the first audio that arrives, and
+        then maintained: the session keeps the leftover of a partial frame and
+        prepends it to the next chunk, so every piece starts exactly on a frame
+        boundary and **no audio is lost** after the very first frame.
+
+        Which grid
+        ----------
+        The grid is the one of the format the listener is *actually* being
+        sent - see `_output_format`. That is MP3 for a transcoded stream and
+        for an MP3 source forwarded as-is, and ADTS for an AAC one. Both have
+        their own frame structure, and a radio resynchronises on whichever it
+        is decoding.
+
+        A stream whose format is not known yet is passed through untouched
+        until it is: aligning to a *guessed* grid would throw away audio for
+        nothing.
+        """
+        fmt = self._output_format()
+        if fmt is None:
+            # We do not yet know what we are sending, so we cannot align it.
+            # The first bytes go out as they are.
+            return chunk
+        if self._frame_grid is None:
+            # The first audio we see: find where a frame starts. Only the
+            # leading partial frame is dropped - the radio would have discarded
+            # it anyway, and it is the only thing that is ever lost.
+            #
+            # The search runs over everything held so far, not over this
+            # chunk alone: FFmpeg's pipe hands back 578 bytes at a time, and
+            # 578 bytes cannot contain a frame *pair* (576 + 576 for MP3), so
+            # looking only at the first read would never find the grid. The
+            # bytes are kept until the search succeeds, and only then is the
+            # partial frame at the front dropped.
+            self._align_pending += chunk
+            pending = bytes(self._align_pending)
+            offset = self._align_offset(pending, fmt)
+            if offset is None:
+                # Still no frame. Either the stream is not in the format we
+                # expect, or a frame is still incomplete.
+                #
+                # "Not this format" can be answered at once: a buffer with no
+                # sync byte anywhere in it is not a stream of this format.
+                # This matters - buffering blindly would hold the audio back
+                # for no reason, and a stream that is *not* in this format
+                # must be passed through untouched anyway (aligning it to a
+                # guessed grid would throw audio away for nothing).
+                if not self._has_sync(pending, fmt):
+                    self._frame_grid = False
+                    out = bytes(self._align_pending)
+                    self._align_pending.clear()
+                    return out
+                # There IS a sync byte, so it probably is this format but the
+                # frame pair is not complete yet. Keep the bytes and try again
+                # with the next chunk.
+                if len(self._align_pending) > 4 * FRAME_HINT:
+                    # A lot of bytes and still no frame: give up on the grid
+                    # rather than stall the audio indefinitely.
+                    self._frame_grid = False
+                    out = bytes(self._align_pending)
+                    self._align_pending.clear()
+                    return out
+                return b""
+            self._frame_grid = True
+            self._frame_size = self._frame_size_at(pending, offset, fmt)
+            # Drop everything before the boundary, and keep the rest.
+            chunk = bytes(self._align_pending[offset:])
+            self._align_pending.clear()
+        if not self._frame_grid:
+            return chunk
+
+        # Cut the audio at frame boundaries: keep the whole frames, and hold
+        # the tail of a partial frame for the next chunk.
+        self._align_pending += chunk
+        data = bytes(self._align_pending)
+        cut = 0
+        while True:
+            size = self._frame_size_at(data, cut, fmt)
+            if size is None or cut + size > len(data):
+                break
+            cut += size
+        if cut == 0:
+            return b""
+        out = data[:cut]
+        self._align_pending = bytearray(data[cut:])
+        return out
+
+    @staticmethod
+    def _align_offset(data: bytes, fmt: str) -> Optional[int]:
+        """Offset of the first frame of *fmt* in *data*, or ``None``."""
+        if fmt == "mp3":
+            return mp3_align_offset(data)
+        return adts_align_offset(data)
+
+    @staticmethod
+    def _has_sync(data: bytes, fmt: str) -> bool:
+        """True if *data* contains anything that looks like a frame of *fmt*."""
+        if fmt == "mp3":
+            return mp3_has_sync(data)
+        return adts_has_sync(data)
+
+    @staticmethod
+    def _frame_size_at(data: bytes, offset: int, fmt: str) -> Optional[int]:
+        """Length of the frame of *fmt* at *offset*, or ``None``."""
+        if fmt == "mp3":
+            return mp3_frame_size(data, offset)
+        return adts_frame_size(data, offset)
 
     def _enqueue(self, piece: bytes) -> None:
         self.stats.chunks += 1
@@ -424,8 +693,13 @@ class StreamSession:
         ``floor`` (from ``_join_floor``) skips the pieces this particular client
         was already sent - what turns "attach" from a replay into a resume. A
         new client has no floor and gets the full reserve, as before.
+
+        The reserve is already frame-aligned: it is filled from the same
+        frame-aligned pieces that live listeners receive (see
+        :meth:`_fan_out`), so a joining radio's decoder and its ICY metadata
+        parser start in agreement.
         """
-        for produced_at, piece in list(self._reserve):
+        for produced_at, piece in self._reserve:
             if floor is not None and produced_at <= floor:
                 continue
             try:
@@ -512,10 +786,33 @@ class StreamSession:
         Without this the tail of a stream - up to `chunk_size` bytes, a third of a
         second - would be held back and discarded, which is audible as a clipped
         ending when a station fails over or a session is closed.
+
+        The tail is padded out to a whole number of frames when the stream is
+        MP3, so the listener's last piece is still frame-aligned. Padding is
+        silence (an MP3 frame of zeroes decodes to silence), and it is at most
+        one frame - 24 ms - which is far less than the clipped ending this
+        replaces.
         """
-        if self._pending:
-            self._enqueue(bytes(self._pending))
-            self._pending.clear()
+        if not self._pending:
+            return
+        tail = bytes(self._pending)
+        self._pending.clear()
+        frame = self._frame_size
+        if frame and self._frame_grid:
+            remainder = len(tail) % frame
+            if remainder:
+                # Zero-fill the last frame. A frame header of zeros is not a
+                # valid frame, so the *next* thing the radio sees is still a
+                # frame boundary in the byte count - but the decoder would
+                # lose sync on the padding itself.
+                #
+                # So instead of padding, the partial frame is simply dropped:
+                # at most 575 bytes (24 ms) at the very end of a stream, and
+                # only when the stream is being closed.
+                tail = tail[: len(tail) - remainder]
+                if not tail:
+                    return
+        self._enqueue(tail)
 
     # ------------------------------------------------------------------- run
     async def _run(self) -> None:

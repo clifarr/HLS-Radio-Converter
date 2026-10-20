@@ -451,6 +451,11 @@ class StreamPipeline:
             async def emit(segment: Segment, data: bytes) -> None:
                 plain = demux.feed(data)
                 if plain:
+                    # The format is recorded *before* the audio is queued, not
+                    # after the backlog has been fed: the listener's first
+                    # bytes need to know what they are, because the frame
+                    # grid they are aligned to depends on it.
+                    self.stats.detected_codec = demux.output_kind or self.stats.detected_codec
                     await queue.put(plain)
 
             # The first couple of segments may not carry PAT/PMT, so the
@@ -468,8 +473,6 @@ class StreamPipeline:
                 await emit(segment, data)
             if not demux.ready:
                 raise PipelineError("no usable MPEG-TS audio stream found; use ffmpeg instead")
-
-            self.stats.detected_codec = demux.output_kind or self.stats.detected_codec
 
             while not self._closed:
                 try:

@@ -290,6 +290,186 @@ def looks_like_adts(data: bytes) -> bool:
     return ((data[2] >> 2) & 0x0F) != 0x0F and ((data[3] >> 6) & 0x03) != 0x03
 
 
+#: MPEG audio bitrates, in kbit/s, indexed by ``[version][layer][index]``.
+#: ``version`` 3 = MPEG-1, 2 = MPEG-2, 0 = MPEG-2.5; ``layer`` 1 = Layer III,
+#: 2 = Layer II, 3 = Layer I. A zero entry means "not allowed".
+_MP3_BITRATES: Dict[Tuple[int, int], Tuple[int, ...]] = {
+    (3, 1): (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0),
+    (2, 1): (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0),
+    (0, 1): (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0),
+    (3, 2): (0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0),
+    (2, 2): (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0),
+    (0, 2): (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0),
+    (3, 3): (0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0),
+    (2, 3): (0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0),
+    (0, 3): (0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0),
+}
+
+#: MPEG audio sample rates, indexed by ``[version][index]``.
+_MP3_RATES: Dict[int, Tuple[int, int, int, int]] = {
+    3: (44100, 48000, 32000, 0),
+    2: (22050, 24000, 16000, 0),
+    0: (11025, 12000, 8000, 0),
+}
+
+
+def mp3_frame_size(data: bytes, offset: int = 0) -> Optional[int]:
+    """Length in bytes of the MPEG audio frame at *offset*, or ``None``.
+
+    Knows the size of a frame from its header, which is what makes it possible
+    to tell where the *next* frame begins without decoding anything.
+
+    This is what a radio's own decoder does, and it is why the start of a
+    stream matters so much: a radio that begins mid-frame has to throw the
+    partial frame away and resynchronise, and a radio whose *metadata parser*
+    is a byte offset from its *audio decoder* (the Shoutcast/ICY grid) loses
+    both at once when the two disagree.
+
+    The frame length is ``144 * bitrate / sample_rate`` for Layer III and
+    Layer II (with a padding byte for MPEG-1 at 32/48 kHz), and
+    ``12 * bitrate / sample_rate`` samples of 4 bytes for Layer I.
+    """
+    if offset + 4 > len(data):
+        return None
+    if data[offset] != 0xFF or (data[offset + 1] & 0xE0) != 0xE0:
+        return None
+    version = (data[offset + 1] >> 3) & 0x03
+    layer = (data[offset + 1] >> 1) & 0x03
+    if version == 1 or layer == 0:
+        return None
+    table = _MP3_BITRATES.get((version, layer))
+    if table is None:
+        return None
+    bitrate_index = (data[offset + 2] >> 4) & 0x0F
+    rate_index = (data[offset + 2] >> 2) & 0x03
+    if bitrate_index in (0, 15) or rate_index == 3:
+        return None
+    bitrate = table[bitrate_index] * 1000
+    rate = _MP3_RATES[version][rate_index]
+    if bitrate == 0 or rate == 0:
+        return None
+    padding = (data[offset + 2] >> 1) & 0x01
+    if layer == 3:  # Layer I: 12 samples per frame, 4 bytes per sample
+        return (12 * bitrate // rate + padding) * 4
+    # Layer II and III: one frame is 144 (MPEG-1) or 72 (MPEG-2/2.5)
+    # samples of the bitstream.
+    samples = 144 if version == 3 else 72
+    return samples * bitrate // rate + padding
+
+
+def mp3_frame_aligned(data: bytes, offset: int = 0) -> bool:
+    """True if *offset* is the start of an MPEG audio frame.
+
+    Checks the header at *offset* **and** that the header at the next
+    expected frame position is a header too - a single ``0xFF 0xFx`` is not
+    enough, because those byte pairs occur by chance inside the payload of
+    every other frame.
+    """
+    size = mp3_frame_size(data, offset)
+    if size is None:
+        return False
+    return mp3_frame_size(data, offset + size) is not None
+
+
+def adts_frame_size(data: bytes, offset: int = 0) -> Optional[int]:
+    """Length in bytes of the ADTS (AAC) frame at *offset*, or ``None``.
+
+    ADTS frames have a **variable** length - the header carries the frame
+    length - so the size of a frame is only known by reading the header.
+
+    The sync word is 12 bits (``0xFFF``), and the layer bits must be 00, which
+    is what separates an ADTS frame from an MPEG audio frame: ``FF FB`` (an
+    MP3 frame) has layer 11, and ``FF F1`` (ADTS) has layer 00. Getting this
+    wrong makes every MP3 frame look like an ADTS frame - the ambiguity
+    ``looks_like_adts`` already has to avoid.
+
+    A frame is only a frame if the *next* one is a frame too (see
+    ``mp3_frame_aligned``): a bare ``0xFFF`` occurs by chance inside the
+    payload of other frames.
+    """
+    if offset + 7 > len(data):
+        return None
+    if data[offset] != 0xFF or (data[offset + 1] & 0xF6) != 0xF0:
+        return None
+    length = (
+        ((data[offset + 3] & 0x03) << 11)
+        | (data[offset + 4] << 3)
+        | ((data[offset + 5] >> 5) & 0x07)
+    )
+    if length < 7:
+        return None
+    return length
+
+
+def adts_frame_aligned(data: bytes, offset: int = 0) -> bool:
+    """True if *offset* is the start of an ADTS frame.
+
+    Checks the header at *offset* **and** that the header at the next frame
+    position is a header too, for the same reason as
+    :func:`mp3_frame_aligned`.
+    """
+    size = adts_frame_size(data, offset)
+    if size is None:
+        return False
+    return adts_frame_size(data, offset + size) is not None
+
+
+def adts_align_offset(data: bytes, window: int = 8192) -> Optional[int]:
+    """Offset of the first ADTS frame in *data*, or ``None``.
+
+    Scans the first *window* bytes for a position that starts a frame whose
+    successor is also a frame header.
+    """
+    limit = min(len(data) - 7, window)
+    for offset in range(max(0, limit) + 1):
+        if adts_frame_aligned(data, offset):
+            return offset
+    return None
+
+
+def adts_has_sync(data: bytes, window: int = 4096) -> bool:
+    """True if *data* contains anything that looks like an ADTS frame sync.
+
+    The cheap "is there any ADTS in here at all" test - the counterpart of
+    :func:`mp3_has_sync`.
+    """
+    limit = min(len(data) - 1, window)
+    return any(data[i] == 0xFF and (data[i + 1] & 0xF6) == 0xF0 for i in range(max(0, limit)))
+
+
+def mp3_has_sync(data: bytes, window: int = 4096) -> bool:
+    """True if *data* contains anything that looks like an MPEG frame sync.
+
+    A cheap, decisive "is there any MP3 in here at all" test.
+
+    ``mp3_align_offset`` has to find a frame *pair* to be certain, because a
+    lone ``0xFF 0xFx`` occurs by chance inside every other frame's payload.
+    That is the right rule for finding the grid, but the wrong rule for
+    deciding whether a stream is MP3 at all: a buffer with no sync byte in it
+    anywhere is definitely not MP3, and that can be answered immediately
+    instead of after buffering more data.
+
+    Only the first *window* bytes are examined, so this stays cheap on a
+    large buffer.
+    """
+    limit = min(len(data) - 1, window)
+    return any(data[i] == 0xFF and (data[i + 1] & 0xE0) == 0xE0 for i in range(max(0, limit)))
+
+
+def mp3_align_offset(data: bytes, window: int = 8192) -> Optional[int]:
+    """Offset of the first MPEG audio frame in *data*, or ``None``.
+
+    Scans the first *window* bytes for a position that starts a frame whose
+    successor is also a frame header. Returns the offset, which is what a
+    radio would have to discard before it can start playing cleanly.
+    """
+    limit = min(len(data) - 4, window)
+    for offset in range(max(0, limit) + 1):
+        if mp3_frame_aligned(data, offset):
+            return offset
+    return None
+
+
 # ----------------------------------------------------------------------- CRC
 def mpeg_crc32(data: bytes) -> int:
     """CRC-32/MPEG-2 as used by PSI sections (polynomial 0x04C11DB7)."""

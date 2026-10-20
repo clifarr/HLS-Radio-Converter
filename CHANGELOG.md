@@ -3,6 +3,83 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.1] - 2026-10-20
+
+Garbled-title release: the radio's display no longer turns to binary noise
+because the audio it is sent starts in the middle of an MP3 frame.
+
+### Fixed
+
+- **The stream now starts on an MP3 frame boundary, so the radio's display
+  shows the title instead of binary noise.** This is the cause of the
+  "garbled text and glitching audio" that had been reported intermittently
+  for months - on a station that does not even carry song names, which is
+  what finally ruled out every explanation that involved the metadata.
+
+  A radio is **two independent state machines over one byte stream**: an MP3
+  decoder that looks for frame syncs, and an ICY metadata parser that counts
+  `metaint` audio bytes and then reads a block. They have to agree about
+  where the stream starts. They did not, because the audio was cut into
+  8192-byte pieces and 8192 is not a multiple of a 576-byte MP3 frame
+  (`8192 % 576 = 128`), so the phase drifted and every connection began at a
+  random point *inside* a frame.
+
+  Measured on the radio's own TCP traffic, the first frame of each connection
+  began at offsets 320, 384, 262, 390, 517 and 454 - never reliably 0. The
+  radio then counts bytes from its own first frame while the server counts
+  them from the start of the response, so the two are out of step: the radio
+  reads its "length byte" out of the middle of an audio frame and gets
+  215, 200, 244, 91, 53 ... followed by binary. That is what "garbled
+  characters in the title area" looks like from the inside.
+
+  The offset is a **constant**, so it does not heal. It stays garbled for the
+  life of the connection and clears only when the radio reconnects and
+  re-anchors - exactly as reported.
+
+  The audio is now aligned where it is produced: the frame grid is found once
+  (by parsing the frame header, not by guessing), and every piece is cut on a
+  frame boundary. Verified against the radio's real captured traffic: the
+  stream now starts at offset **0**, **all 338 pieces** start on a frame
+  boundary, the stream is **one unbroken chain of 5062 frames**, and at most
+  one frame is lost - the partial one at the very front, which the radio
+  discarded anyway.
+
+  The grid is the one of the format the listener is **actually** being sent,
+  which is not always the format the configuration names: a station with
+  `output_codec = "auto"` forwards its source untouched, so it sends MP3 to
+  the radio whatever the setting says. ADTS AAC has its own frame grid, and
+  a radio resynchronises on that one too, so it is aligned as well - on its
+  own frame boundaries, which are variable-length and therefore read from
+  each frame's header.
+
+  A stream whose format is not known yet - before the first segment arrives
+  - is passed through untouched: aligning to a *guessed* grid would throw
+  away audio for nothing.
+
+  A piece is now a whole number of frames, so it is very slightly larger
+  than the configured `chunk_size`: 15 frames = 8640 bytes rather than 8192,
+  because 8192 is not a multiple of 576. The queue bound is counted in
+  *pieces*, so a listener holds 128 * 8640 bytes instead of 128 * 8192 - 5 %
+  more of an already-small buffer - and every piece is now a valid decoder
+  resynchronisation point.
+
+### Testing
+
+- Six new regression tests cover the defect from both sides: that a new
+  listener starts on a frame boundary, that *every* piece it receives does,
+  that the whole stream it receives is one unbroken chain of frames (aligning
+  the pieces but not joining them up would still make the radio lose sync at
+  every boundary), that the alignment survives FFmpeg's 578-byte pipe reads
+  (a single one of those cannot contain a frame *pair*, so an alignment
+  search that looked only at the current read would never find the grid), and
+  that an ADTS stream and a forwarded MP3 stream are aligned to their own
+  frame grids.
+- The guards were mutation-checked: 25 reintroduced defects, all caught.
+  Three of the guards found real gaps while this was being written - the
+  alignment was keyed off the *setting* rather than the format actually
+  being sent, which left every ADTS output and every `output_codec = "auto"`
+  station unaligned.
+
 ## [2.2.0] - 2026-10-20
 
 Playback-continuity release: a radio no longer gets a corrupt MP3 stream when

@@ -36,24 +36,106 @@ CASES: List[Case] = [
         # queue is a three-second buffer, not a forty-three-second one.
         "fan-out stops normalising chunk size",
         PKG / "session.py",
-        "        size = max(1024, self.settings.chunk_size)\n        self._pending += chunk",
-        "        size = max(1024, self.settings.chunk_size)\n        if True:\n"
-        "            self._enqueue(chunk)\n            return",
+        "        while len(self._pending) >= self._piece_size():\n"
+        "            piece = self._cut_piece()",
+        "        while len(self._pending) >= self._piece_size():\n"
+        "            piece = bytes(self._pending[: self._piece_size()])\n"
+        "            del self._pending[: self._piece_size()]\n"
+        "            if True:\n"
+        "                self._enqueue(chunk)\n"
+        "                return",
         f"{CONTINUITY}::test_small_pipe_reads_are_accumulated_into_full_chunks",
     ),
     Case(
         "fan-out no longer accumulates small reads",
         PKG / "session.py",
-        "        while len(self._pending) >= size:",
-        "        while len(self._pending) >= size * 1000:",
+        "        while len(self._pending) >= self._piece_size():",
+        "        while len(self._pending) >= self._piece_size() * 1000:",
         f"{CONTINUITY}::test_small_pipe_reads_are_accumulated_into_full_chunks",
     ),
     Case(
         "fan-out no longer splits large blobs",
         PKG / "session.py",
-        "        while len(self._pending) >= size:",
+        "        while len(self._pending) >= self._piece_size():",
         "        while False:",
         f"{CONTINUITY}::test_large_blobs_are_split_into_full_chunks",
+    ),
+    Case(
+        # The garbled-title defect: the pieces are cut on 8192-byte boundaries
+        # and 8192 is not a multiple of a 576-byte MP3 frame, so every
+        # listener starts inside a frame and the radio's decoder and its
+        # metadata parser desynchronise.
+        #
+        # The mutation has to remove the *cutting* as well as the alignment:
+        # aligning the incoming audio but still cutting the pieces at a fixed
+        # 8192 bytes would leave every piece starting mid-frame, which is the
+        # defect this case is about.
+        "the pieces are no longer cut on MP3 frame boundaries",
+        PKG / "session.py",
+        "        # Cut at the first frame boundary at or after the target.\n"
+        "        cut = 0\n"
+        "        while True:\n"
+        "            size = self._frame_size_at(bytes(self._pending), cut, fmt)",
+        "        # Cut at the first frame boundary at or after the target.\n"
+        "        cut = 0\n"
+        "        while True:\n"
+        "            size = None\n"
+        "            if False:\n"
+        "                size = self._frame_size_at(bytes(self._pending), cut, fmt)",
+        f"{CONTINUITY}::test_every_piece_a_listener_receives_starts_on_a_frame_boundary",
+    ),
+    Case(
+        # The alignment search must span the bytes held so far, not just the
+        # current read: FFmpeg's pipe hands back 578 bytes, and 578 bytes
+        # cannot contain a frame *pair*.
+        "the alignment search no longer spans the held-back bytes",
+        PKG / "session.py",
+        "            self._align_pending += chunk\n"
+        "            pending = bytes(self._align_pending)\n"
+        "            offset = self._align_offset(pending, fmt)",
+        "            pending = chunk\n"
+        "            self._align_pending += chunk\n"
+        "            offset = self._align_offset(pending, fmt)",
+        f"{CONTINUITY}::test_the_alignment_survives_ffmpegs_small_pipe_reads",
+    ),
+    Case(
+        # The alignment search must span the bytes held so far, not just the
+        # current read: FFmpeg's pipe hands back 578 bytes, and 578 bytes
+        # cannot contain a frame *pair*.
+        "the alignment search no longer spans the held-back bytes",
+        PKG / "session.py",
+        "            self._align_pending += chunk\n"
+        "            pending = bytes(self._align_pending)\n"
+        "            offset = self._align_offset(pending, fmt)",
+        "            pending = chunk\n"
+        "            self._align_pending += chunk\n"
+        "            offset = self._align_offset(pending, fmt)",
+        f"{CONTINUITY}::test_the_alignment_survives_ffmpegs_small_pipe_reads",
+    ),
+    Case(
+        # The alignment must follow the format ACTUALLY being sent, not the
+        # setting. Keying it off the setting left every ADTS output and
+        # every `output_codec = "auto"` station unaligned.
+        "the alignment follows the setting instead of the format sent",
+        PKG / "session.py",
+        '        codec = self.pipeline.stats.detected_codec\n        if codec == "mp3":',
+        "        codec = self.pipeline.stats.detected_codec\n"
+        '        if self.settings.output_codec != "mp3":\n'
+        "            return None\n"
+        '        if codec == "mp3":',
+        f"{CONTINUITY}::test_an_adts_stream_is_also_aligned_to_its_own_frames",
+    ),
+    Case(
+        # A forwarded MP3 stream (`output_codec = "auto"`) must be aligned
+        # too - this is the case the setting-based gate missed. The mutation
+        # has to make the *format* undetectable, not the setting wrong:
+        # returning None for "auto" would pass for the wrong reason.
+        "a forwarded MP3 stream is no longer aligned",
+        PKG / "session.py",
+        '        if codec == "mp3":\n            return "mp3"',
+        '        if codec == "mp3" and self.settings.output_codec != "auto":\n'
+        '            return "mp3"',
+        f"{CONTINUITY}::test_an_auto_codec_station_sending_mp3_is_aligned",
     ),
     Case(
         "the pacer stops pacing entirely",
@@ -209,11 +291,8 @@ CASES: List[Case] = [
         # behind. Counting it at the fan-out is exactly that mistake.
         "audio is counted as sent when it is produced, not when it is delivered",
         PKG / "session.py",
-        "        self.stats.bytes_out += len(chunk)\n"
-        "        size = max(1024, self.settings.chunk_size)",
-        "        self.stats.bytes_out += len(chunk)\n"
-        "        self.throughput.add_out(len(chunk))\n"
-        "        size = max(1024, self.settings.chunk_size)",
+        "        self.stats.bytes_out += len(chunk)",
+        "        self.stats.bytes_out += len(chunk)\n        self.throughput.add_out(len(chunk))",
         "tests/test_session.py::test_audio_produced_for_nobody_is_not_counted_as_sent",
     ),
 ]

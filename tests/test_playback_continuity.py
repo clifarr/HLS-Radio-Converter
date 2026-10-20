@@ -38,6 +38,7 @@ from radioconv.api import ICY_METAINT, _insert_icy_metadata, _Pacer, icy_metadat
 from radioconv.config import Settings
 from radioconv.pipeline import PipelineStats, StreamPipeline
 from radioconv.session import SessionManager
+from radioconv.tsdemux import adts_align_offset, mp3_align_offset, mp3_frame_size
 
 #: A deliberately high rate so the pacing arithmetic is real but the tests run in
 #: seconds. Chunk time is 8192/200000 = 41ms.
@@ -665,3 +666,330 @@ def test_the_old_reload_rule_really_did_drift():
     target = 10.0
     assert max(1.0, target * 0.75) * 2 > target, "two old intervals exceeded one segment"
     assert min(4.0, max(0.5, target / 2)) * 2 <= target, "two new intervals fit inside one"
+
+
+# ------------------------------------------- the radio's two state machines
+#: A real MPEG-1 Layer III frame header: 192 kbit/s, 48 kHz, stereo.
+#: 144 * 192000 / 48000 = 576 bytes per frame.
+MP3_FRAME_HEADER = bytes([0xFF, 0xFB, 0xB4, 0x64])
+MP3_FRAME_SIZE = 576
+
+
+def _mp3_frames(count: int) -> bytes:
+    """*count* valid MPEG audio frames of 192 kbit/s / 48 kHz."""
+    return (MP3_FRAME_HEADER + b"\x00" * (MP3_FRAME_SIZE - 4)) * count
+
+
+def _frame_offset(data: bytes) -> int:
+    """Offset of the first MPEG audio frame in *data*, or -1.
+
+    Uses the project's own parser, so the test and the fix agree on what a
+    frame is - and a frame is only a frame if the *next* one is a frame too
+    (a bare ``0xFF 0xFx`` occurs by chance inside every other frame).
+    """
+    offset = mp3_align_offset(data)
+    return -1 if offset is None else offset
+
+
+async def _drain(session) -> list[bytes]:
+    """Everything the session's first subscriber has been handed."""
+    pieces = []
+    while session.subscribers and not session.subscribers[0].queue.empty():
+        item = session.subscribers[0].queue.get_nowait()
+        if item is None:
+            break
+        pieces.append(item[1])
+    return pieces
+
+
+async def test_a_new_listener_starts_on_an_mp3_frame_boundary():
+    """A radio's decoder and its metadata parser must start together.
+
+    A radio is two state machines over one byte stream: an MP3 decoder looking
+    for frame syncs, and an ICY metadata parser counting ``metaint`` bytes. If
+    the stream begins in the middle of a frame, the radio discards the partial
+    frame - and the two state machines then disagree about where they are, so
+    the radio reads audio bytes as metadata (garbled title) and metadata bytes
+    as audio (glitching).
+
+    The reserve is cut into fixed-size pieces, and those sizes are not a
+    multiple of a frame: the produced stream is 192 kbit/s at 48 kHz, so a
+    frame is 576 bytes, while the pieces are 8192 (8192 % 576 = 128). Every
+    listener therefore started at a random point *inside* a frame. Measured on
+    a real radio's own TCP traffic, the first frame of each connection began
+    at offsets 384, 448, 512, 0, 256, 320, 128, 64 - never reliably 0.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="mp3"))
+    session, _ = await subscribe(manager)
+    try:
+        # A stream whose frames start 384 bytes in - the phase the real radio
+        # was measured at.
+        session._fan_out(b"\x00" * 384 + _mp3_frames(40))
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        assert pieces, "the listener was given nothing"
+
+        handed_over = b"".join(pieces)
+        offset = _frame_offset(handed_over)
+        assert offset == 0, (
+            f"the listener's audio starts {offset} bytes into an MP3 frame; the radio "
+            "has to resynchronise, and its metadata parser desynchronises with it"
+        )
+    finally:
+        await session.close("test")
+
+
+async def test_every_piece_a_listener_receives_starts_on_a_frame_boundary():
+    """Not just the first piece: every piece must be frame-aligned.
+
+    A piece that begins mid-frame is as bad as a stream that begins mid-frame:
+    the radio's decoder resynchronises at every piece boundary, and its
+    metadata parser - which counts a fixed number of bytes and does not care
+    about frames - drifts away from it.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="mp3"))
+    session, _ = await subscribe(manager)
+    try:
+        session._fan_out(b"\x00" * 384 + _mp3_frames(200))
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        assert len(pieces) > 1, "expected several pieces"
+
+        for index, piece in enumerate(pieces):
+            offset = _frame_offset(piece)
+            assert offset == 0, (
+                f"piece {index} starts {offset} bytes into an MP3 frame ({len(piece)} bytes)"
+            )
+    finally:
+        await session.close("test")
+
+
+async def test_alignment_does_not_lose_the_audio():
+    """Aligning must not cost more than the partial frame it discards.
+
+    The whole point of the reserve is that a joining radio has something to
+    play immediately. Throwing away real audio to achieve the alignment would
+    trade a garbled display for a silent one.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="mp3"))
+    session, _ = await subscribe(manager)
+    try:
+        prefix = 384
+        frames = 200
+        session._fan_out(b"\x00" * prefix + _mp3_frames(frames))
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        handed_over = b"".join(pieces)
+
+        # At most one frame may be lost - the partial one at the front.
+        whole_frames = len(handed_over) // MP3_FRAME_SIZE
+        assert whole_frames >= frames - 1, (
+            f"only {whole_frames} whole frames survived out of {frames}: the "
+            "alignment is throwing away audio"
+        )
+    finally:
+        await session.close("test")
+
+
+async def test_the_alignment_survives_ffmpegs_small_pipe_reads():
+    """The real producer hands back 578 bytes at a time - and that broke it.
+
+    FFmpeg's pipe returns whatever has been written, so the session is fed
+    578-byte reads. A single one of those cannot contain a frame *pair* (576 +
+    576 bytes), so an alignment search that only looked at the current read
+    would never find the frame grid: it concluded the stream was not MP3 and
+    passed everything through unaligned.
+
+    The search has to run over the bytes held so far, not over one read.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="mp3"))
+    session, _ = await subscribe(manager)
+    try:
+        audio = b"\x00" * 384 + _mp3_frames(200)
+        for offset in range(0, len(audio), MEASURED_PIPE_READ):
+            session._fan_out(audio[offset : offset + MEASURED_PIPE_READ])
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        assert pieces, "the listener was given nothing"
+
+        for index, piece in enumerate(pieces):
+            offset = _frame_offset(piece)
+            assert offset == 0, (
+                f"piece {index} starts {offset} bytes into an MP3 frame "
+                f"({len(piece)} bytes) - the alignment did not survive the "
+                "small pipe reads"
+            )
+
+        # And the audio must still be there: 200 frames in, nearly 200 out.
+        frames_out = len(b"".join(pieces)) // MP3_FRAME_SIZE
+        assert frames_out >= 200 - 1, (
+            f"only {frames_out} of 200 frames survived: the alignment is throwing away audio"
+        )
+    finally:
+        await session.close("test")
+
+
+async def test_the_whole_stream_a_listener_receives_is_one_frame_chain():
+    """Frame-aligned pieces, but the stream between them must still chain.
+
+    Aligning each piece is not enough: if the pieces do not join up, the
+    radio's decoder loses sync at every boundary - which is the glitching
+    half of the same defect. The whole handed-over stream has to be one
+    unbroken run of frames.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="mp3"))
+    session, _ = await subscribe(manager)
+    try:
+        audio = b"\x00" * 384 + _mp3_frames(200)
+        for offset in range(0, len(audio), MEASURED_PIPE_READ):
+            session._fan_out(audio[offset : offset + MEASURED_PIPE_READ])
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        handed_over = b"".join(pieces)
+
+        position = 0
+        frames = 0
+        while position + 4 <= len(handed_over):
+            size = mp3_frame_size(handed_over, position)
+            assert size is not None, (
+                f"the stream breaks at byte {position} of {len(handed_over)}: "
+                "the radio's decoder would lose sync here"
+            )
+            position += size
+            frames += 1
+        assert frames >= 199, f"only {frames} frames in the handed-over stream"
+    finally:
+        await session.close("test")
+
+
+async def test_a_stream_that_is_not_mp3_is_handed_over_unchanged():
+    """ADTS (or a forwarded stream) has no frame grid to align to.
+
+    Aligning to a *wrong* grid would throw away audio for nothing, so the
+    alignment is skipped when the output is not MP3.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="adts"))
+    session, _ = await subscribe(manager)
+    try:
+        payload = bytes([0xFF, 0xF1, 0x50, 0x80]) + b"\x00" * 20000
+        session._fan_out(payload)
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        handed_over = b"".join(pieces)
+        assert len(handed_over) == len(payload), (
+            f"{len(payload)} bytes in, {len(handed_over)} bytes out: a non-MP3 "
+            "stream must not be altered"
+        )
+    finally:
+        await session.close("test")
+
+
+# ------------------------------------------------------- the format we send
+#: An ADTS frame header: sync 0xFFF, layer 00, a 13-bit frame length.
+#: ADTS frames are variable-length - the header carries the length - so a
+#: frame is only a frame if the next one is a frame too.
+def _adts_frames(count: int, length: int = 256) -> bytes:
+    """*count* ADTS frames of *length* bytes each."""
+    out = bytearray()
+    for _ in range(count):
+        header = bytearray(7)
+        header[0] = 0xFF
+        header[1] = 0xF1  # sync 0xFFF, layer 00 (ADTS, not MPEG audio)
+        header[2] = 0x50  # MPEG-4, AAC LC, 48 kHz
+        header[3] = 0x80  # channel config 1
+        header[3] |= (length >> 11) & 0x03
+        header[4] = (length >> 3) & 0xFF
+        header[5] = ((length & 0x07) << 5) | 0x1F
+        header[6] = 0xFC
+        out += bytes(header) + b"\x00" * (length - 7)
+    return bytes(out)
+
+
+async def test_an_adts_stream_is_also_aligned_to_its_own_frames():
+    """ADTS has its own frame grid, and a radio resynchronises on it too.
+
+    The alignment used to be keyed off the *setting* (`output_codec !=
+    "mp3"`), which left every ADTS output unaligned - and ADTS is what a
+    station with `output_codec = "adts"` sends to the radio. The grid has to
+    follow the format actually being sent, not the setting.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="adts"))
+    session, _ = await subscribe(manager)
+    try:
+        # The pipeline says what it is sending.
+        session.pipeline.stats.detected_codec = "aac"
+        audio = b"\x00" * 137 + _adts_frames(60)
+        for offset in range(0, len(audio), MEASURED_PIPE_READ):
+            session._fan_out(audio[offset : offset + MEASURED_PIPE_READ])
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        assert pieces, "the listener was given nothing"
+
+        for index, piece in enumerate(pieces):
+            offset = adts_align_offset(piece)
+            assert offset == 0, (
+                f"piece {index} starts {offset} bytes into an ADTS frame "
+                f"({len(piece)} bytes) - the ADTS stream is not aligned"
+            )
+    finally:
+        await session.close("test")
+
+
+async def test_an_auto_codec_station_sending_mp3_is_aligned():
+    """`output_codec = "auto"` forwards the source untouched - which may be MP3.
+
+    Keying the alignment off the *setting* would skip this case entirely,
+    because the setting is neither "mp3" nor "adts". The grid has to follow
+    what is actually sent.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="auto"))
+    session, _ = await subscribe(manager)
+    try:
+        # The pipeline detected an MP3 source and forwards it untouched.
+        session.pipeline.stats.detected_codec = "mp3"
+        audio = b"\x00" * 384 + _mp3_frames(60)
+        for offset in range(0, len(audio), MEASURED_PIPE_READ):
+            session._fan_out(audio[offset : offset + MEASURED_PIPE_READ])
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        assert pieces, "the listener was given nothing"
+
+        for index, piece in enumerate(pieces):
+            offset = _frame_offset(piece)
+            assert offset == 0, (
+                f"piece {index} starts {offset} bytes into an MP3 frame "
+                f"({len(piece)} bytes) - a forwarded MP3 stream is not aligned"
+            )
+    finally:
+        await session.close("test")
+
+
+async def test_a_stream_whose_format_is_not_known_yet_is_handed_over_unchanged():
+    """Before the first segment arrives, the format is unknown.
+
+    Aligning to a guessed grid would throw away audio for nothing, so the
+    audio goes out untouched until the pipeline says what it is sending.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="auto"))
+    session, _ = await subscribe(manager)
+    try:
+        payload = bytes([0xFF, 0xF1, 0x50, 0x80]) + b"\x00" * 20000
+        session._fan_out(payload)
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        handed_over = b"".join(pieces)
+        assert len(handed_over) == len(payload), (
+            f"{len(payload)} bytes in, {len(handed_over)} bytes out: a stream "
+            "of unknown format must not be altered"
+        )
+    finally:
+        await session.close("test")
