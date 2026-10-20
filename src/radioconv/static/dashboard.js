@@ -468,6 +468,25 @@
     renderTip();
   }
 
+  /* Whether the last thing that happened was a touch gesture ending.
+   *
+   * A tap gives the element the focus as a side effect, and that focus
+   * arrives just after the finger lifts. So a `focusin` right after a touch
+   * is the *browser's* doing, not the reader's - and treating it as "the
+   * reader wants this description" is wrong twice over:
+   *
+   * * a tap on the plain text around a figure would open the description of
+   *   whatever happened to be next to it, and
+   * * on a browser that also focuses after a scroll, a finger put down to
+   *   scroll past a figure would open its description - which is exactly the
+   *   complaint this flag exists to answer.
+   *
+   * The *click* is the event that carries the reader's intent, because the
+   * browser only sends one when the finger was not dragged. A keyboard
+   * focus is always preceded by a key press, so the flag is cleared there.
+   */
+  let touchJustEnded = false;
+
   /* What an event does to a description, as a pure function.
    *
    * The rules *are* the bug, so they are written as rules and tested as rules
@@ -480,6 +499,8 @@
    *   leaves      whether the pointer left the element that had the description
    *   nextHasTip  whether focus is moving to another element that has one
    *   rebuilding  whether the stations table is being rebuilt right now
+   *   touchFocus  whether this focus is the side effect of a touch, not a
+   *               keyboard
    *
    * The answer is one of "show", "hide", "hide-all" or "none". "hide" closes
    * the source the event came from - a mouse leaving does not take the focus
@@ -494,16 +515,26 @@
     leaves = false,
     nextHasTip = false,
     rebuilding = false,
+    touchFocus = false,
   }) {
     // A touch pointer is "over" an element only while a finger is on it, and
     // it reports "out" the instant that finger lifts - with no relatedTarget,
     // because the pointer is destroyed along with the touch. Read as "the
     // pointer left", that closed the description the moment the tap ended: a
     // tap showed the text for a single frame, and the only way to read it was
-    // to hold a finger down. So on a touch screen only `pointerdown` means
-    // anything, and `pointerout` means nothing at all.
+    // to hold a finger down.
+    //
+    // So on a touch screen the description is opened by the *click*, not by
+    // the touch. The browser only sends a click when the finger was not
+    // dragged: a scroll gesture makes it send `pointercancel` instead, and no
+    // click at all. That is the difference between "tapping a figure" and
+    // "putting a finger down on a figure to scroll past it", and it is the
+    // only signal that tells the two apart.
     if (pointerType === "touch") {
-      if (type === "pointerdown") return hasTip ? "show" : "hide-all";
+      if (type === "click") return hasTip ? "show" : "hide-all";
+      // The gesture turned into a scroll: the browser cancelled the tap. Any
+      // description the finger landed on was never asked for, so it closes.
+      if (type === "pointercancel") return "hide";
       return "none";
     }
 
@@ -511,9 +542,15 @@
     if (type === "pointerover") return hasTip ? "show" : "hide";
     if (type === "pointerout") return leaves ? "hide" : "none";
 
-    // Focus. `focusin` is how a keyboard - and a phone, which has no hover at
-    // all - reaches a description.
-    if (type === "focusin") return hasTip ? "show" : "none";
+    // Focus. `focusin` is how a keyboard reaches a description.
+    //
+    // It is deliberately NOT how a tap opens one - a tap gives the element
+    // the focus as a side effect, and the click has already decided the
+    // matter. See `touchJustEnded`.
+    if (type === "focusin") {
+      if (touchFocus) return "none";
+      return hasTip ? "show" : "none";
+    }
     if (type === "focusout") {
       // The table is being rebuilt: the description is about to be put back
       // (see restoreTip), and closing it now would make it flicker.
@@ -576,7 +613,13 @@
 
   // A tap. On a touch screen this is the only way to reach any of this, so it
   // is the event that decides what a finger on the screen means.
-  document.addEventListener("pointerdown", (event) => {
+  //
+  // The *click*, not the touch: the browser only sends one when the finger
+  // was not dragged, so a finger put down to scroll past a figure does not
+  // open a description. A mouse click arrives here too, but the mouse has
+  // already opened the description by hovering, and this only re-opens the
+  // same one.
+  document.addEventListener("click", (event) => {
     const owner = event.target.closest("[data-tooltip]");
     applyTip(
       tipAction({ type: event.type, pointerType: event.pointerType, hasTip: !!owner }),
@@ -585,11 +628,37 @@
     );
   });
 
-  // Keyboard and touch: `focus-visible`/tap focus lands here, which is the only
-  // way a phone gets a tooltip at all - there is no hover on a touch screen.
+  // The gesture turned into a scroll. The browser cancels the tap when the
+  // finger moves, and this is that cancellation - so anything the finger
+  // landed on is closed again. Without it, a figure the reader scrolled past
+  // would keep its description on screen.
+  document.addEventListener("pointercancel", (event) => {
+    const owner = event.target.closest("[data-tooltip]");
+    applyTip(
+      tipAction({ type: event.type, pointerType: event.pointerType, hasTip: !!owner }),
+      owner,
+      "pointer"
+    );
+  });
+
+  // Keyboard and touch: `focus-visible`/tap focus lands here, which is the
+  // only way a phone gets a tooltip at all - there is no hover on a touch
+  // screen.
   document.addEventListener("focusin", (event) => {
     const owner = event.target.closest("[data-tooltip]");
-    applyTip(tipAction({ type: event.type, hasTip: !!owner }), owner, "focus");
+    applyTip(
+      tipAction({
+        type: event.type,
+        hasTip: !!owner,
+        touchFocus: touchJustEnded,
+      }),
+      owner,
+      "focus"
+    );
+    // The flag is about *this* focus event, and it is cleared immediately
+    // afterwards - a keyboard focus that comes later must not be mistaken
+    // for the tail of a tap.
+    touchJustEnded = false;
   });
 
   document.addEventListener("focusout", (event) => {
@@ -604,6 +673,57 @@
       "focus"
     );
   });
+
+  // A touch has just finished. Whatever focus the browser gives the element
+  // as a side effect of that is not the reader asking for a description - the
+  // click already decided that.
+  //
+  // The flag is cleared when the *next* gesture starts, not when the click
+  // arrives: browsers disagree about whether the click or the focus comes
+  // first, and clearing it on the click would make a focus that arrives
+  // afterwards look like a keyboard focus.
+  document.addEventListener(
+    "pointerup",
+    (event) => {
+      if (event.pointerType === "touch") touchJustEnded = true;
+    },
+    true
+  );
+
+  // A new gesture begins, so the last one is over.
+  document.addEventListener(
+    "pointerdown",
+    () => {
+      touchJustEnded = false;
+    },
+    true
+  );
+
+  // A key press means the reader is using a keyboard, so the next focus is
+  // theirs and not the tail of a tap.
+  document.addEventListener(
+    "keydown",
+    () => {
+      touchJustEnded = false;
+    },
+    true
+  );
+
+  // A backstop. A tap on something that cannot take the focus never fires a
+  // `focusin`, so the flag would still be set when the reader next moves the
+  // focus - and a focus they asked for would be swallowed. The flag is only
+  // ever meant to cover the focus that is the immediate side effect of a
+  // tap, so it cannot usefully last longer than that.
+  document.addEventListener(
+    "pointerup",
+    (event) => {
+      if (event.pointerType !== "touch") return;
+      setTimeout(() => {
+        touchJustEnded = false;
+      }, 0);
+    },
+    true
+  );
 
   // A description that stays where its trigger was is worse than none; one
   // that follows its trigger is neither. The table scrolls sideways and the

@@ -786,12 +786,18 @@ def test_every_description_is_reachable_without_a_mouse(live_server):
 #: disappear" on a phone: a description that changed every second vanished
 #: almost at once, and on the stations list it vanished *always* - the only
 #: way to read it was to hold a finger down.
+#:
+#: Then the follow-up: putting a finger down on a figure to *scroll* past it
+#: opened the description, and it stayed. The tap and the scroll are the same
+#: gesture until the finger moves - so the rules below are about the one
+#: event that tells them apart.
 TIP_RULES = [
     # A tap is what a finger does, and it is the only way to reach a
-    # description on a touch screen at all. It must show.
+    # description on a touch screen at all. It must show - but on the
+    # *click*, which the browser only sends when the finger was not dragged.
     (
         "tap a described figure",
-        {"type": "pointerdown", "pointerType": "touch", "hasTip": True},
+        {"type": "click", "pointerType": "touch", "hasTip": True},
         "show",
     ),
     # A tap on something with no description means the reader asked for
@@ -799,8 +805,17 @@ TIP_RULES = [
     # the focus sitting on.
     (
         "tap something with no description",
-        {"type": "pointerdown", "pointerType": "touch", "hasTip": False},
+        {"type": "click", "pointerType": "touch", "hasTip": False},
         "hide-all",
+    ),
+    # The finger moving turns the gesture into a scroll, and the browser
+    # cancels the tap. This is that cancellation, and it is the only thing
+    # that distinguishes a scroll from a tap - without it, a finger put down
+    # to scroll past a figure opens its description.
+    (
+        "the gesture becomes a scroll",
+        {"type": "pointercancel", "pointerType": "touch", "hasTip": True},
+        "hide",
     ),
     # The finger lifting. The browser reports this as the pointer leaving,
     # with no relatedTarget, because the pointer dies with the touch. Read
@@ -814,6 +829,15 @@ TIP_RULES = [
     (
         "a touch pointer hovers",
         {"type": "pointerover", "pointerType": "touch", "hasTip": True},
+        "none",
+    ),
+    # A touch does not open a description by giving the element the focus.
+    # A tap focuses the element as a side effect, and the click has already
+    # decided the matter - so a focus straight after a tap must not open one
+    # for the plain text around the figures.
+    (
+        "the focus a tap left behind",
+        {"type": "focusin", "hasTip": True, "touchFocus": True},
         "none",
     ),
     # A mouse still works the way it always did.
@@ -833,7 +857,7 @@ TIP_RULES = [
         {"type": "pointerout", "pointerType": "mouse", "hasTip": True, "leaves": False},
         "none",
     ),
-    # The keyboard, and a phone that gives the tapped element the focus.
+    # The keyboard.
     ("focus lands on a described figure", {"type": "focusin", "hasTip": True}, "show"),
     (
         "focus lands on nothing described",
@@ -918,6 +942,120 @@ def test_a_tapped_description_stays_until_it_is_dismissed(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_a_finger_held_down_to_scroll_does_not_open_a_description(tmp_path):
+    """Reported: holding a finger on a figure to scroll past it opens the tooltip.
+
+    A tap and a scroll are the same gesture until the finger moves, so the
+    page cannot tell them apart on the way *down* - only on the way up. The
+    browser draws that line for us:
+
+    * a **tap** ends with a ``click`` (and the ``focusin`` that follows it);
+    * a **scroll** ends with ``pointercancel`` and **no click at all**.
+
+    So the description is opened by the click, not by the touch. Opening it on
+    the touch is what made a figure the reader was scrolling past light up
+    and stay lit.
+
+    This is also the answer to "how do other sites do it": they all open on
+    the click, for the same reason.
+    """
+    node = shutil.which("node")
+    if node is None:
+        # ty mis-resolves pytest.skip (see tests/conftest.py).
+        pytest.skip("node is not installed")  # ty: ignore[too-many-positional-arguments]
+    script = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.js").read_text(encoding="utf-8"),
+        language="javascript",
+    )
+    match = re.search(r"function tipAction\(\{.*?^[ ]{2}\}\) \{.*?^[ ]{2}\}", script, re.S | re.M)
+    assert match, (
+        "tipAction has moved or changed shape - the rules that decide when a "
+        "description shows must stay a pure function this test can drive"
+    )
+
+    # The whole gesture, as the browser reports it. A scroll is a touch that
+    # moves, and the browser cancels the tap: no click, and a `pointercancel`
+    # instead. A tap gets a click and never a cancellation.
+    def js(value):
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, dict):
+            return "{" + ", ".join(f"{k}: {js(v)}" for k, v in value.items()) + "}"
+        return repr(value)
+
+    tap = [
+        {"type": "pointerdown", "pointerType": "touch", "hasTip": True},
+        {"type": "pointerup", "pointerType": "touch", "hasTip": True},
+        {"type": "click", "pointerType": "touch", "hasTip": True},
+    ]
+    scroll = [
+        {"type": "pointerdown", "pointerType": "touch", "hasTip": True},
+        {"type": "pointermove", "pointerType": "touch", "hasTip": True},
+        {"type": "pointercancel", "pointerType": "touch", "hasTip": True},
+    ]
+
+    checks = []
+    # A tap: nothing opens it until the click, and the click opens it.
+    for event in tap[:-1]:
+        checks.append(f"checkNotShow('a tap', tipAction({js(event)}));")
+    checks.append(f"check('a tap', tipAction({js(tap[-1])}), 'show');")
+    # A scroll: nothing opens it, and the cancellation does not either.
+    for event in scroll:
+        checks.append(f"checkNotShow('a scroll', tipAction({js(event)}));")
+
+    harness = (
+        match.group(0)
+        + "\n\nfunction check(label, actual, want) {\n"
+        + "  if (actual !== want) {\n"
+        + '    console.error(label + ": got " + actual + ", want " + want);\n'
+        + "    process.exit(1);\n"
+        + "  }\n"
+        + "}\n"
+        + "function checkNotShow(label, actual) {\n"
+        + '  if (actual === "show") {\n'
+        + '    console.error(label + ": opened the description");\n'
+        + "    process.exit(1);\n"
+        + "  }\n"
+        + "}\n"
+        + "\n".join(checks)
+        + '\nconsole.log("tipAction: a scroll never opens a description");\n'
+    )
+    script_file = tmp_path / "tip_scroll.js"
+    script_file.write_text(harness, encoding="utf-8")
+    result = subprocess.run(
+        [node, str(script_file)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # And the focus a tap leaves behind must not open one either: a tap on the
+    # plain text around a figure would open the description of whatever
+    # happened to be next to it.
+    focus_harness = (
+        match.group(0)
+        + "\n\n"
+        + "const actual = tipAction({ type: 'focusin', hasTip: true, touchFocus: true });\n"
+        + "if (actual === 'show') {\n"
+        + "  console.error('the focus a tap left behind opened a description');\n"
+        + "  process.exit(1);\n"
+        + "}\n"
+        + "console.log('the focus a tap left behind opens nothing');\n"
+    )
+    focus_file = tmp_path / "tip_touch_focus.js"
+    focus_file.write_text(focus_harness, encoding="utf-8")
+    focus_result = subprocess.run(
+        [node, str(focus_file)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert focus_result.returncode == 0, focus_result.stdout + focus_result.stderr
 
 
 def test_the_description_survives_the_table_being_rebuilt():

@@ -172,13 +172,43 @@ CASES: List[Case] = [
         # a departure closed the description the moment the tap ended, so the
         # only way to read it was to hold a finger down. This is that line
         # coming back.
+        #
+        # The rule itself now lives in the touch branch of `tipAction`: a
+        # `pointerout` from a finger must be ignored. Breaking it is what puts
+        # the old behaviour back.
         "a lifted finger closes the description again",
         PKG / "static" / "dashboard.js",
-        '      if (type === "pointerdown") return hasTip ? "show" : "hide-all";\n      return "none";',
-        '      if (type === "pointerdown") return hasTip ? "show" : "hide-all";\n'
-        '      if (type === "pointerout") return leaves ? "hide" : "none";\n'
-        '      return "none";',
+        '      if (type === "click") return hasTip ? "show" : "hide-all";\n',
+        '      if (type === "click") return hasTip ? "show" : "hide-all";\n'
+        '      if (type === "pointerout") return leaves ? "hide" : "none";\n',
         "test_a_tapped_description_stays_until_it_is_dismissed",
+    ),
+    Case(
+        # Reported: holding a finger on a figure to scroll past it opened the
+        # description, and it stayed. A tap and a scroll are the same gesture
+        # until the finger moves, so the description was opened on the way
+        # down. It has to be opened by the click instead - the browser only
+        # sends one when the finger was not dragged.
+        "the touch opens the description again",
+        PKG / "static" / "dashboard.js",
+        '      if (type === "click") return hasTip ? "show" : "hide-all";\n'
+        "      // The gesture turned into a scroll: the browser cancelled the tap. Any\n"
+        "      // description the finger landed on was never asked for, so it closes.\n"
+        '      if (type === "pointercancel") return "hide";',
+        '      if (type === "pointerdown") return hasTip ? "show" : "hide-all";\n'
+        '      if (type === "pointercancel") return "hide";',
+        "test_a_finger_held_down_to_scroll_does_not_open_a_description",
+    ),
+    Case(
+        # The other half of the same report: a tap gives the element the focus
+        # as a side effect, and the focus was being read as the reader asking
+        # for a description - so a tap on the text around a figure opened the
+        # wrong one.
+        "the focus a tap leaves behind opens a description again",
+        PKG / "static" / "dashboard.js",
+        '      if (touchFocus) return "none";',
+        '      if (touchFocus) return hasTip ? "show" : "none";',
+        "test_a_finger_held_down_to_scroll_does_not_open_a_description",
     ),
     Case(
         # The other half of the same report: the stations table is rebuilt

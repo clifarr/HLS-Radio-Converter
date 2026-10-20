@@ -47,6 +47,20 @@ made in the first place.
 
 ### Fixed
 
+- **Holding a finger down on a figure to scroll past it no longer opens its
+  description.** A tap and a scroll are the same gesture until the finger
+  moves, so the page could not tell them apart on the way *down* - it opened
+  the description as soon as the finger landed, and the reader was left with a
+  tooltip stuck on screen over a figure they were scrolling past. The browser
+  draws the line for us on the way up: a tap ends with a `click`, and a
+  scroll ends with `pointercancel` and no click at all. The description is
+  opened by the click now, and the cancellation closes anything the finger
+  landed on. This is what other sites do, and for the same reason.
+- **A tap on the plain text around a figure no longer opens the description
+  of whatever happens to be next to it.** A tap gives the element the focus
+  as a side effect, and the focus was being read as the reader asking for a
+  description. The click already carries that intent; the focus is now only
+  for a keyboard.
 - **A tapped description no longer vanishes the moment the finger lifts.**
   Reported: "the tooltips tend to disappear" - on a figure that changes every
   second it went almost at once, and on the stations list it went *always*;
