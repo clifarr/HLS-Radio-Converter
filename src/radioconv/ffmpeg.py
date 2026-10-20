@@ -275,6 +275,30 @@ def build_command(settings: Settings, input_format: str, *, copy_audio: bool = F
         cmd += settings.ffmpeg_output_args.split()
 
     container = "adts" if (copy_audio or settings.output_codec == "adts") else "mp3"
+    if container == "mp3":
+        # No ID3v2 tag in the MP3 output.
+        #
+        # ffmpeg's MP3 muxer copies the *input's* ID3v2 metadata into the
+        # output as an ID3v2 tag. Our output is a pipe, which is not seekable,
+        # so the tag cannot be written once at the start and fixed up
+        # afterwards - it is written where the muxer is when it decides to
+        # write it. The tag is a blob of *non-audio* - about 1.5 KB on the
+        # station that showed the problem, and it varies with the song -
+        # inside an MP3 stream, and a radio's MP3 decoder cannot skip a tag in
+        # the middle of one: it loses frame sync and the bit reservoir
+        # breaks.
+        #
+        # That is not hypothetical. When the pipeline restarts its encoder
+        # (an upstream fetch failed, so a new ffmpeg is started), the second
+        # encode's tag lands in the MIDDLE of the listener's stream. Measured
+        # on a real station: a spliced encode decoded with "Header missing"
+        # and "invalid new backstep -1", while the same splice with the tag
+        # suppressed decoded with zero errors.
+        #
+        # We do not need the tag: the song title is delivered to the radio as
+        # ICY metadata, which is the standard way, and the tag would only
+        # ever be a second, non-standard copy of it.
+        cmd += ["-id3v2_version", "0"]
     cmd += ["-f", container, "-"]
     return cmd
 

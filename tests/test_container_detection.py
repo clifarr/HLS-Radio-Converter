@@ -241,6 +241,41 @@ def test_build_command_never_asks_ffmpeg_to_discard_startup_audio():
     assert "+genpts" in command, "genpts is still needed for missing timestamps"
 
 
+def test_the_mp3_output_carries_no_id3_tag():
+    """No ID3v2 tag in the MP3 we serve.
+
+    ffmpeg's MP3 muxer copies the *input's* ID3v2 metadata into the output.
+    Our output is a pipe, so the tag cannot be written once at the start and
+    fixed up afterwards - it lands where the muxer decides to write it. That
+    tag is a 1.6 KB blob of **non-audio** inside an MP3 stream, and a radio's
+    decoder cannot skip a tag in the middle of one.
+
+    It is not hypothetical. When the pipeline restarts its encoder (an upstream
+    fetch failed, so a new ffmpeg is started), the second encode's tag lands
+    in the MIDDLE of the listener's stream. Measured on a real station: the
+    spliced stream decoded with "Header missing" and "invalid new backstep -1",
+    while the same splice with the tag suppressed decoded with zero errors.
+
+    The song title is delivered to the radio as ICY metadata, which is the
+    standard way; the tag would only be a second, non-standard copy of it.
+    """
+    command = ffmpeg_mod.build_command(Settings(), "adts")
+    assert "-id3v2_version" in command, (
+        "ffmpeg would write an ID3 tag into the MP3, and it lands in the middle "
+        "of the listener's stream whenever the pipeline restarts"
+    )
+    assert command[command.index("-id3v2_version") + 1] == "0", (
+        "the tag must be suppressed, not merely downgraded"
+    )
+
+
+def test_the_adts_output_is_not_affected_by_the_id3_suppression():
+    """The suppression is for MP3 only; ADTS has no ID3 tag to begin with."""
+    command = ffmpeg_mod.build_command(Settings(), "adts", copy_audio=True)
+    assert "-id3v2_version" not in command
+    assert command[-3:] == ["-f", "adts", "-"]
+
+
 def test_the_default_container_is_honest_when_the_playlist_does_not_say():
     """The false dichotomy that caused all of this.
 

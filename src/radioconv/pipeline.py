@@ -559,6 +559,12 @@ class StreamPipeline:
                     if not job.done():
                         job.cancel()
                 await asyncio.gather(reader, errors, return_exceptions=True)
+                # The stdin pipe is closed *before* the child is killed, and in
+                # every case: the exception path (ffmpeg died, the playlist
+                # failed) never reaches the `_close_stdin` call above, and that
+                # is exactly the case where the pipe breaks and asyncio is left
+                # holding an unretrieved BrokenPipeError. See `_close_stdin`.
+                await self._close_stdin(proc)
                 await self._kill_child()
             await queue.put(None)
 
@@ -600,11 +606,37 @@ class StreamPipeline:
             raise PipelineError("ffmpeg stopped reading its input") from exc
 
     async def _close_stdin(self, proc: asyncio.subprocess.Process) -> None:
+        """Close ffmpeg's input pipe and *collect* whatever it says.
+
+        ``close()`` alone is not enough, and the reason is worth writing down
+        because the symptom is very far from the cause.
+
+        asyncio's subprocess stdin is a ``StreamWriter`` whose protocol holds a
+        ``_stdin_closed`` future. When the pipe breaks, asyncio puts the
+        ``BrokenPipeError`` on that future - and the only thing that ever
+        retrieves it is ``StreamWriter.close()``, which awaits the future
+        through ``_get_close_waiter()``. If the writer is never closed, the
+        future keeps an exception nobody asked for, and asyncio reports it
+        when the future is garbage collected:
+
+            Future exception was never retrieved
+            future: <Future finished exception=BrokenPipeError(32, 'Broken pipe')>
+
+        That message is not about the pipe, it is about *our* future being
+        dropped on the floor, and it turns a routine "ffmpeg exited" into
+        something that looks like a crash in the test output. So the close
+        waiter is awaited here and its exception is consumed.
+
+        Calling this twice is harmless: the second call finds the transport
+        already closed and the future already resolved.
+        """
         if proc.stdin is None:
             return
         # Closing a pipe whose process has already died is expected to fail.
         with contextlib.suppress(Exception):
             proc.stdin.close()
+        with contextlib.suppress(Exception):
+            await proc.stdin.wait_closed()
 
     async def _read_stdout(self, proc: asyncio.subprocess.Process, queue: asyncio.Queue) -> None:
         assert proc.stdout is not None

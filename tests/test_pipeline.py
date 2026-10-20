@@ -17,8 +17,10 @@ fallback and leaked the child.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
+import sys
 
 import pytest
 
@@ -237,3 +239,105 @@ def test_note_input_reads_the_now_playing_title():
         b"\xff\xf1" + b"\x00" * 64,
     )
     assert pipe.stats.now_playing == "Sombr - My Body Isn't Ready"
+
+
+# ------------------------------------------------------- the teardown noise
+async def test_a_broken_stdin_pipe_leaves_no_unretrieved_exception():
+    """A dead ffmpeg must not leave an exception nobody retrieves.
+
+    When the pipe to ffmpeg breaks, asyncio puts the ``BrokenPipeError`` on
+    the ``_stdin_closed`` future that the subprocess protocol holds. The only
+    thing that ever retrieves it is ``StreamWriter.close()`` - so if the
+    pipeline does not close the writer, the exception sits on that future
+    until it is garbage collected, and asyncio then prints:
+
+        Future exception was never retrieved
+        future: <Future finished exception=BrokenPipeError(32, 'Broken pipe')>
+
+    That is not a crash, but it is noise that looks like one, and it appears
+    at the end of every test run that kills an encoder.
+
+    The test drives the real thing: a child that closes its stdin, so the
+    pipe really does break, and then asserts that nothing is left behind.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import sys; sys.stdin.close()",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    writer = proc.stdin
+    assert writer is not None
+    # Write more than the pipe buffer holds, so the write is still pending
+    # when the reader is gone.
+    writer.write(b"x" * (1024 * 1024))
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(writer.drain(), timeout=0.5)
+    await proc.wait()
+
+    # The fix: close the writer and collect what it says.
+    await pipeline.StreamPipeline._close_stdin(
+        pipeline.StreamPipeline.__new__(pipeline.StreamPipeline), proc
+    )
+
+    # The future must be resolved AND its exception retrieved. asyncio's
+    # ``Future.__del__`` prints "Future exception was never retrieved" when a
+    # future is collected while ``_log_traceback`` is still set - that flag is
+    # cleared by ``Future.exception()``, which is what awaiting the close
+    # waiter does.
+    #
+    # The flag is checked *without* calling ``.exception()`` here, because
+    # calling it would retrieve the exception and hide the very bug this
+    # test is about.
+    #
+    # ``_protocol`` is asyncio's own private attribute; there is no public
+    # way to reach the close waiter, and the whole point is to inspect it.
+    protocol = proc._protocol  # ty: ignore[unresolved-attribute]
+    waiter = protocol._stdin_closed
+    assert waiter.done(), "the close waiter was never resolved"
+    assert not waiter._log_traceback, (
+        "the BrokenPipeError is still unretrieved; asyncio will print "
+        "'Future exception was never retrieved' when this future is collected"
+    )
+
+
+async def test_the_close_stdin_helper_is_safe_to_call_twice():
+    """`close()` runs on the normal path and in the `finally`, so it runs twice.
+
+    The second call must not raise: the transport is already closed and the
+    close waiter is already resolved.
+
+    ``async def`` rather than a sync test wrapping ``asyncio.run``: on
+    Python 3.9 ``asyncio.run`` closes and clears the main thread's event
+    loop, and every later test that builds an ``asyncio.Lock``
+    (``SessionManager.__init__`` does) then dies with "There is no current
+    event loop in thread 'MainThread'". Running it as a coroutine means
+    pytest-asyncio owns the loop.
+    """
+    pipe = pipeline.StreamPipeline.__new__(pipeline.StreamPipeline)
+
+    class _Writer:
+        def __init__(self) -> None:
+            self.closed = 0
+            self.waited = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+        async def wait_closed(self) -> None:
+            self.waited += 1
+
+    class _Proc:
+        def __init__(self) -> None:
+            self.stdin = _Writer()
+
+    proc = _Proc()
+    # The helper only touches ``proc.stdin``; the stand-in is not a real
+    # ``Process``, and it does not need to be.
+    await pipe._close_stdin(proc)  # ty: ignore[invalid-argument-type]
+    await pipe._close_stdin(proc)  # ty: ignore[invalid-argument-type]
+
+    assert proc.stdin.closed == 2
+    assert proc.stdin.waited == 2

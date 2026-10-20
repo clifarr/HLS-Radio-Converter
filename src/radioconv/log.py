@@ -55,10 +55,40 @@ class _ConsoleFormatter(logging.Formatter):
         return text
 
 
+class _StderrHandler(logging.StreamHandler):
+    """A handler that always writes to the *current* ``sys.stderr``.
+
+    ``logging.StreamHandler(sys.stderr)`` binds the stream object once, at
+    construction. If something replaces ``sys.stderr`` afterwards - pytest's
+    capture does exactly that - the handler keeps writing to the old object,
+    and if that object is later closed the write raises
+    ``ValueError: I/O operation on closed file`` and Python prints it as
+    "--- Logging error ---" instead of the log line.
+
+    Looking the stream up on every emit costs an attribute read, and it means
+    the log follows ``sys.stderr`` wherever it goes, which is what a caller
+    expects.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(stream=sys.stderr)
+
+    @property
+    def stream(self) -> Any:
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, value: Any) -> None:
+        # ``StreamHandler.__init__`` assigns to ``self.stream``; the property
+        # ignores the value on purpose, because the stream is looked up
+        # dynamically. The setter exists only so that assignment works.
+        pass
+
+
 def setup_logging(level: str = "INFO", json_output: bool = False) -> None:
     """Configure the root logger once, idempotently."""
     root = logging.getLogger()
-    handler = logging.StreamHandler(sys.stderr)
+    handler = _StderrHandler()
     handler.setFormatter(JsonFormatter() if json_output else _ConsoleFormatter())
 
     for existing in list(root.handlers):

@@ -696,6 +696,66 @@ class _Pacer:
 #: so this speaks the format every radio firmware has ever seen.
 ICY_METAINT = 16000
 
+#: The most payload bytes one ICY block can carry: the length byte counts
+#: 16-byte blocks and must fit in a byte, so 15 blocks = 240 bytes.
+ICY_MAX_PAYLOAD = 15 * 16
+
+#: The Shoutcast metadata value is a single-quoted string, and a radio ends it
+#: at the FIRST quote - exactly as a header parser would. A title containing an
+#: apostrophe therefore truncates the value and leaves the rest of the title
+#: to be parsed as further key=value pairs, which the radio renders as junk.
+#:
+#: A real title from a real station: ``Fool's Garden - Lemon Tree`` arrived as
+#: ``StreamTitle='Fool's Garden - Lemon Tree';`` and the radio showed
+#: ``Fool`` followed by ``s Garden - Lemon Tree';``.
+ICY_QUOTE = "'"
+
+
+def sanitize_icy_title(title: str) -> str:
+    """Make *title* safe to put inside a Shoutcast ``StreamTitle='...'`` value.
+
+    Three things can go wrong, and all three were seen on a real station
+    (RTL 102.5, whose segments carry per-song ID3):
+
+    * **An apostrophe** ends the value early. It is replaced with U+00B4, the
+      Latin-1 ACUTE ACCENT - a look-alike that is one byte, renders on every
+      radio, and does not terminate the value. The real title
+      ``Fool's Garden - Lemon Tree`` used to arrive as
+      ``StreamTitle='Fool's Garden - Lemon Tree';``, and the radio showed
+      ``Fool`` followed by ``s Garden - Lemon Tree';``.
+    * **Characters outside Latin-1** cannot be encoded at all, because the
+      metadata is a byte string and the heritage convention is ISO-8859-1.
+      The common ones are transliterated; the rest become ``?``. Characters
+      that *are* in Latin-1 - ``£``, ``È``, ``€`` - are kept exactly, because
+      a radio can render them.
+    * **A title longer than the block** is cut, and the cut must never land in
+      the middle of a multi-byte character.
+
+    The result is Latin-1 by construction, which is what the metadata format
+    is, and every radio firmware can display it.
+    """
+    if not title:
+        return ""
+    # 1. A quote would end the value. U+00B4 is one byte, looks like an
+    #    apostrophe, and does not terminate the quoted value.
+    text = title.replace(ICY_QUOTE, "´")
+    # 2. The typographic punctuation that is *not* in Latin-1, mapped to
+    #    equivalents that are. Everything else outside Latin-1 is replaced
+    #    with "?" by the encode below.
+    text = (
+        text.replace("‘", "'")
+        .replace("’", "'")
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("…", "...")
+        .replace(" ", " ")
+    )
+    text = text.encode("latin-1", "replace").decode("latin-1")
+    # 3. Control characters would confuse a parser that expects a line.
+    return "".join(ch for ch in text if ch >= " " or ch == "\t")
+
 
 def icy_metadata_block(title: str) -> bytes:
     """One ICY metadata block: length (in 16-byte payload blocks), then payload.
@@ -704,11 +764,32 @@ def icy_metadata_block(title: str) -> bytes:
     interval) is the whole preamble. Verified against a live Icecast capture:
     reading a marker first desynchronises the grid and every later block decodes
     as garbage.
+
+    The title is sanitised first (see :func:`sanitize_icy_title`): an
+    unescaped quote truncates the value, and a non-Latin-1 character cannot be
+    rendered. The payload is also cut on a *character* boundary, because the
+    240-byte limit can otherwise land in the middle of a multi-byte character
+    and leave the radio decoding a broken one.
     """
-    text = f"StreamTitle='{title}';".encode()
-    if len(text) > 15 * 16:
-        text = text[: 15 * 16 - 2] + b"';"
-    payload = text + b"\x00" * (-len(text) % 16)
+    text = f"StreamTitle='{sanitize_icy_title(title)}';"
+    encoded = text.encode("latin-1", "replace")
+    if len(encoded) > ICY_MAX_PAYLOAD:
+        # Cut the *title*, not the wrapper, so the block always ends with "';".
+        # The room is what is left of the 240-byte payload once the wrapper
+        # and the closing "'; " are accounted for.
+        room = ICY_MAX_PAYLOAD - len("StreamTitle='';")
+        # Cut on a character boundary: a multi-byte character is 2 bytes, and
+        # half of one is not a character a radio can decode.
+        cut = ""
+        used = 0
+        for ch in sanitize_icy_title(title):
+            width = len(ch.encode("latin-1", "replace"))
+            if used + width > room:
+                break
+            cut += ch
+            used += width
+        encoded = f"StreamTitle='{cut}';".encode("latin-1", "replace")
+    payload = encoded + b"\x00" * (-len(encoded) % 16)
     return bytes([len(payload) // 16]) + payload
 
 

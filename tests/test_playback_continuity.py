@@ -27,9 +27,14 @@ pipeline, so they measure those two mechanisms and nothing else.
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import time
 
-from radioconv.api import ICY_METAINT, _insert_icy_metadata, _Pacer
+import pytest
+from conftest import ffmpeg_binary, has_ffmpeg
+
+from radioconv import ffmpeg as ffmpeg_mod
+from radioconv.api import ICY_METAINT, _insert_icy_metadata, _Pacer, icy_metadata_block
 from radioconv.config import Settings
 from radioconv.pipeline import PipelineStats, StreamPipeline
 from radioconv.session import SessionManager
@@ -288,7 +293,12 @@ async def test_icy_metadata_blocks_land_on_the_audio_grid():
     blocks = out[ICY_METAINT]
     payload = bytes(out[ICY_METAINT + 1 : ICY_METAINT + 1 + blocks * 16])
     assert blocks == len(payload) // 16 and blocks > 0
-    assert payload.split(b"\x00", 1)[0] == b"StreamTitle='Sombr - My Body Isn't Ready';"
+    # The title carries an apostrophe, which a radio would take as the end of
+    # the value - so it is replaced with a look-alike that does not. See
+    # `test_icy_title_with_an_apostrophe_does_not_truncate_the_value`.
+    assert payload.split(b"\x00", 1)[0] == "StreamTitle='Sombr - My Body Isn´t Ready';".encode(
+        "latin-1"
+    )
     # Everything after the block is byte-identical: audio reassembles exactly.
     rest = bytes(out[ICY_METAINT + 1 + blocks * 16 :])
     assert bytes(out[:ICY_METAINT]) + rest == audio
@@ -309,6 +319,118 @@ async def test_icy_empty_title_still_keeps_the_grid():
     payload = bytes(out[ICY_METAINT + 1 : ICY_METAINT + 1 + blocks * 16])
     assert blocks == 1
     assert payload.split(b"\x00", 1)[0] == b"StreamTitle='';"
+
+
+# ------------------------------------------------- ICY titles a radio can read
+def _radio_reads(block: bytes) -> tuple[str, str]:
+    """Parse an ICY block the way a radio does, and return (value, leftover).
+
+    A radio ends the quoted value at the FIRST quote - the same rule a header
+    parser uses - and then tries to read the rest as further key=value pairs.
+    """
+    length = block[0]
+    payload = block[1 : 1 + length * 16]
+    text = payload.split(b"\x00", 1)[0].decode("latin-1")
+    marker = "StreamTitle='"
+    start = text.find(marker)
+    assert start >= 0, f"no StreamTitle in {text!r}"
+    start += len(marker)
+    end = text.find("'", start)
+    assert end >= 0, f"unterminated value in {text!r}"
+    return text[start:end], text[end + 1 :]
+
+
+def test_icy_title_with_an_apostrophe_does_not_truncate_the_value():
+    """A quote in the title must not end the value early.
+
+    Reported on a real station: the radio's display showed ``Fool`` and then
+    the rest of the title as junk, because the value ended at the apostrophe
+    in ``Fool's Garden - Lemon Tree``.
+    """
+    block = icy_metadata_block("Fool's Garden - Lemon Tree")
+    value, leftover = _radio_reads(block)
+    assert value == "Fool´s Garden - Lemon Tree"
+    assert leftover == ";", "the block must end cleanly after the value"
+
+
+def test_icy_title_is_latin1_so_a_radio_can_render_it():
+    """The metadata is a byte string; the heritage convention is ISO-8859-1.
+
+    A title sent as UTF-8 came out as ``Â£ MINI COUNTRYMAN`` on a radio that
+    decodes Latin-1. Latin-1 characters must survive unchanged, and anything
+    outside Latin-1 must be replaced rather than left as a broken byte.
+    """
+    # A character that IS Latin-1 is kept exactly.
+    value, _ = _radio_reads(icy_metadata_block("£ MINI COUNTRYMAN"))
+    assert value == "£ MINI COUNTRYMAN"
+    value, _ = _radio_reads(icy_metadata_block("ADÈLA"))
+    assert value == "ADÈLA"
+    # A character that is NOT Latin-1 cannot be sent at all.
+    value, _ = _radio_reads(icy_metadata_block(""))
+    assert value == ""
+    block = icy_metadata_block("歌")
+    # The block is still well-formed and the value still parses.
+    value, leftover = _radio_reads(block)
+    assert leftover == ";"
+    assert block[0] <= 15
+
+
+def test_icy_title_longer_than_the_block_is_cut_safely():
+    """A long title is cut, but never in the middle of a character.
+
+    The block holds at most 240 bytes of payload. Cutting a multi-byte
+    character in half would leave the radio decoding a broken one.
+    """
+    for title in ("x" * 500, "£" * 200, "È" * 200, "a" * 100 + "£" * 100):
+        block = icy_metadata_block(title)
+        payload = block[1:]
+        assert block[0] <= 15, "the length byte counts 16-byte blocks"
+        assert len(payload) <= 15 * 16
+        value, leftover = _radio_reads(block)
+        assert leftover == ";", "the closing quote and semicolon must survive"
+        # The payload must be valid Latin-1 with no broken character.
+        payload.split(b"\x00", 1)[0].decode("latin-1")
+        assert value
+
+
+async def test_icy_title_survives_a_song_change_on_the_grid():
+    """The title changes between blocks; the grid does not.
+
+    A station with per-song ID3 changes its title every few minutes. Each
+    change must produce a well-formed block on the grid, and the audio must
+    still reassemble exactly.
+    """
+    audio = b"\xff\xf1" * 16000  # two grid windows
+    titles = ["Sombr - back to friends", "Fool's Garden - Lemon Tree", "£ MINI COUNTRYMAN"]
+
+    async def chunks():
+        yield audio[:9000]
+        yield audio[9000:]
+
+    state = {"index": 0}
+
+    def next_title() -> str:
+        title = titles[state["index"] % len(titles)]
+        state["index"] += 1
+        return title
+
+    gen = _insert_icy_metadata(chunks(), ICY_METAINT, next_title)
+    out = bytearray()
+    async for piece in gen:
+        out.extend(piece)
+
+    # The audio is intact: removing the blocks restores it byte for byte.
+    rebuilt = bytearray()
+    pos = 0
+    while pos < len(out):
+        rebuilt += out[pos : pos + ICY_METAINT]
+        pos += ICY_METAINT
+        length = out[pos]
+        value, leftover = _radio_reads(bytes(out[pos : pos + 1 + length * 16]))
+        assert leftover == ";", f"block at {pos} is malformed: {leftover!r}"
+        assert value
+        pos += 1 + length * 16
+    assert bytes(rebuilt) == audio
 
 
 async def test_no_gap_appears_while_a_segment_plays_out():
@@ -352,6 +474,127 @@ async def test_no_gap_appears_while_a_segment_plays_out():
         "is the cutout a radio hears"
     )
     assert subscriber.dropped == 0, f"{subscriber.dropped} chunks dropped"
+
+
+# ------------------------------------- the restart splice, with real ffmpeg
+def _id3_tags(data: bytes) -> list[tuple[int, int]]:
+    """Every plausible ID3v2 tag in *data*, as (offset, size)."""
+    found = []
+    pos = 0
+    while True:
+        index = data.find(b"ID3", pos)
+        if index < 0:
+            break
+        if index + 10 <= len(data):
+            version = data[index + 3]
+            size = 0
+            for byte in data[index + 6 : index + 10]:
+                size = (size << 7) | (byte & 0x7F)
+            total = 10 + size
+            if data[index + 5] & 0x10:
+                total += 10
+            if version in (2, 3, 4) and total <= len(data) - index and size < 100000:
+                found.append((index, size))
+        pos = index + 1
+    return found
+
+
+def test_a_restarted_encoder_does_not_corrupt_the_mp3_a_radio_receives(
+    tmp_path_factory: pytest.TempPathFactory,
+):
+    """The splice a restart causes must not break the listener's stream.
+
+    This is the whole defect, measured the way it was found:
+
+    * The upstream fetch failed, so the pipeline started a **new** ffmpeg.
+    * The listener was given the tail of the old encode followed by the head of
+      the new one - one byte stream, two encodes.
+    * ffmpeg's MP3 muxer had written an ID3v2 tag (copied from the source's
+      own metadata) into the second encode, and with a pipe as the output that
+      tag cannot be written once at the start and fixed up afterwards. It landed
+      **in the middle** of the listener's stream.
+    * A radio's MP3 decoder cannot skip a tag in the middle of a stream: it
+      loses frame sync and the bit reservoir breaks. That is the reported
+      "garbled song name, then the audio cutting and making weird noises".
+
+    Measured on the real channel: a spliced stream decoded with "Header
+    missing" and "invalid new backstep -1"; the same splice with the tag
+    suppressed decoded with **zero** errors.
+    """
+    if not has_ffmpeg():
+        # ty mis-resolves pytest.skip (see tests/conftest.py).
+        pytest.skip("ffmpeg is not available")  # ty: ignore[too-many-positional-arguments]
+    binary = ffmpeg_binary()
+    # A source with ID3 metadata, like the station that showed the problem:
+    # ffmpeg copies the input's tag into the output, which is the whole point.
+    # The channel in question serves raw ADTS AAC behind an ID3v2 tag.
+    source = tmp_path_factory.mktemp("splice")
+    raw = source / "source.aac"
+    subprocess.run(
+        [
+            binary,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=6",
+            "-ac",
+            "2",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-f",
+            "adts",
+            str(raw),
+        ],
+        check=True,
+        timeout=120,
+        capture_output=True,
+    )
+    payload = raw.read_bytes()
+    assert payload, "the fixture produced no audio"
+
+    command = ffmpeg_mod.build_command(Settings(), "adts")
+
+    def encode(data: bytes) -> bytes:
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        out, _ = proc.communicate(data, timeout=120)
+        return out
+
+    def decode_errors(data: bytes) -> list[str]:
+        proc = subprocess.run(
+            [binary, "-v", "error", "-f", "mp3", "-i", "pipe:0", "-f", "null", "-"],
+            input=data,
+            capture_output=True,
+            timeout=120,
+        )
+        return [line for line in proc.stderr.decode("utf-8", "replace").splitlines() if line]
+
+    first = encode(payload)
+    second = encode(payload)
+    assert first, "ffmpeg produced no output at all"
+    assert not decode_errors(first), "a single encode must be clean"
+
+    # The splice: two encodes, one byte stream - what a restart hands the radio.
+    spliced = first + second
+    assert not decode_errors(spliced), (
+        f"the spliced stream is corrupt: {decode_errors(spliced)} - a radio's "
+        "decoder loses frame sync here and the audio breaks up"
+    )
+    # And there is no tag anywhere in it, so nothing non-audio can appear in
+    # the middle of the stream.
+    assert not _id3_tags(spliced), (
+        f"ID3 tags at {[o for o, _ in _id3_tags(spliced)]} - a tag in the middle "
+        "of an MP3 stream is what a radio cannot skip"
+    )
 
 
 # ---------------------------------------------- the measured output rate

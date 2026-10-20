@@ -3,10 +3,12 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [2.2.0] - 2026-10-20
 
-The tooltips stay put on a phone, and a commit that CI would reject cannot be
-made in the first place.
+Playback-continuity release: a radio no longer gets a corrupt MP3 stream when
+the pipeline restarts, and a song title with an apostrophe in it arrives
+whole. The tooltips stay put on a phone, and a commit that CI would reject
+cannot be made in the first place.
 
 ### Added
 
@@ -47,6 +49,82 @@ made in the first place.
 
 ### Fixed
 
+- **A radio no longer gets a corrupt MP3 stream when the pipeline restarts.**
+  This is the glitch that was reported as "garbled characters as the song
+  name, and then the audio cutting and glitching and doing weird noises" after
+  a couple of hours of playing.
+
+  ffmpeg's MP3 muxer copies the *input's* ID3v2 metadata into the output. On a
+  station whose segments carry per-song ID3 (RTL 102.5, a tag chain of about
+  1.5 KB ahead of every segment's audio) that became a blob of non-audio
+  inside an MP3 stream, which a radio cannot skip. The output is a pipe, so
+  ffmpeg cannot write the tag once at the start and fix it up afterwards - and
+  when the pipeline restarted after a transient upstream fetch failure, the old
+  encode's tail and the new encode's head were concatenated for the listener,
+  which put the second encode's tag *in the middle* of the stream.
+
+  One misaligned frame is enough: an MP3 frame may reference the previous
+  frame's bits (the bit reservoir), so the damage is not local - it runs to the
+  end of the stream. Decoding the spliced stream says so plainly:
+  `Header missing` and `invalid new backstep -1`.
+
+  The MP3 output now carries no ID3 tag at all (`-id3v2_version 0`). Measured
+  over 15 kill-and-restart splices of a real station's segments: **15 of 15
+  corrupt with the tag, 0 of 15 without it.** The title still reaches the
+  radio, through the standard ICY metadata channel, which is what a radio
+  actually uses for the song name.
+
+  Only stations carrying per-song in-band ID3 are affected, which is why this
+  only ever happened on one channel. A reconnect fixes it because it gets a
+  fresh, unspliced stream on a fresh grid.
+- **A song title with an apostrophe in it no longer arrives truncated.**
+  `Fool's Garden - Lemon Tree` was sent as
+  `StreamTitle='Fool's Garden - Lemon Tree';`, and the radio showed `Fool`
+  followed by `s Garden - Lemon Tree';`. A radio ends the value at the *first*
+  quote, exactly as a header parser would, and the rest of the title was
+  parsed as further key=value pairs and rendered as junk. The quote is now
+  replaced with U+00B4, the Latin-1 ACUTE ACCENT: a look-alike, one byte,
+  renders on every radio, and does not terminate the value.
+- **A song title is now Latin-1, so a radio can render it.** The metadata is a
+  byte string and the heritage convention is ISO-8859-1, but the titles were
+  being sent as UTF-8, so `£ MINI COUNTRYMAN` arrived as
+  `Â£ MINI COUNTRYMAN`. Characters that *are* in Latin-1 (`£`, `È`, `€`) are
+  now kept exactly; the typographic punctuation that is not in Latin-1
+  (the curly quotes, the en and em dashes, the ellipsis) is transliterated to
+  an equivalent that is; anything else becomes `?`.
+- **A title too long for the block is now cut on a character boundary.** The
+  240-byte payload limit could previously land in the middle of a multi-byte
+  character and leave the radio decoding half of one.
+- **The service no longer leaves a broken pipe behind when ffmpeg dies.** At
+  the end of a test run - and, in production, at the end of a station that
+  drops the connection - asyncio printed:
+
+      Future exception was never retrieved
+      future: <Future finished exception=BrokenPipeError(32, 'Broken pipe')>
+
+  It was not a crash, but it read like one, and it was in every run.
+
+  The cause was a long way from the symptom. asyncio's subprocess stdin is a
+  `StreamWriter` whose protocol holds a `_stdin_closed` future; when the pipe
+  breaks, asyncio puts the `BrokenPipeError` on that future. The only thing
+  that ever retrieves it is `StreamWriter.close()`, which awaits the future
+  through `_get_close_waiter()`. The pipeline closed ffmpeg's input on the
+  happy path, but *not* on the error path - the one where the pipe had
+  actually broken - so the exception sat on that future until it was garbage
+  collected, and asyncio then complained about it.
+
+  The input pipe is now closed on every path, and the close waiter is awaited
+  so the exception is retrieved rather than merely stored. The service's own
+  logs are unchanged; what is gone is the noise in someone else's.
+- **A log line can no longer turn into "--- Logging error ---".** The
+  handler installed by `setup_logging` bound `sys.stderr` once, when it was
+  created. If `sys.stderr` was replaced afterwards - which is what a test
+  harness does when it captures output - the handler kept writing to the old
+  object; if that object was then closed, the write raised
+  `ValueError: I/O operation on closed file` inside the logging module, and
+  Python printed *that* instead of the message that was supposed to be
+  logged. The handler now looks the stream up on every write, so the log
+  follows `sys.stderr` wherever it goes.
 - **Holding a finger down on a figure to scroll past it no longer opens its
   description.** A tap and a scroll are the same gesture until the finger
   moves, so the page could not tell them apart on the way *down* - it opened
@@ -98,6 +176,34 @@ made in the first place.
 
 ### Testing
 
+- **The splice that corrupted the radio's stream is now covered by a test
+  that runs the real ffmpeg.** `test_a_restarted_encoder_does_not_corrupt_the
+  _mp3_a_radio_receives` encodes a real AAC fixture twice, splices the two
+  encodes the way a pipeline restart does, and asserts that the result decodes
+  with *zero* errors and carries no ID3 tag. A single clean encode is also
+  asserted, so the test says which of the two halves broke if it ever fails.
+  The guards were mutation-checked: removing the `-id3v2_version 0` makes this
+  test fail, so it is a real guard and not a tautology.
+- **The ICY title handling is covered on the cases that were seen breaking
+  in the wild**: an apostrophe (the value must not truncate, and the radio's
+  view of the block must end at the value), a Latin-1 character (`£` and `È`
+  survive exactly), a character that is not in Latin-1 (it degrades to `?` and
+  the block still parses), a title longer than the block (it is cut, the
+  payload stays within 240 bytes, and the block still ends in `';`), and a
+  title that changes between blocks (every block stays well-formed and the
+  audio reassembles byte-for-byte).
+- **The MP3 output is asserted to carry no ID3 tag**, and the ADTS output is
+  asserted *not* to be affected by the suppression, so the flag cannot creep
+  onto a container that should keep its metadata.
+- **The teardown is asserted to be silent.** Two guards, one for each defect
+  above, and both are checked against the *real* mechanism rather than a
+  stand-in:
+  - the pipe guard breaks a real pipe (a child that closes its stdin) and
+    asserts that asyncio's close waiter is left with a *retrieved* exception,
+    which is the exact flag `Future.__del__` checks before it complains;
+  - the logging guard replaces `sys.stderr` - including replacing it with a
+    closed stream - and asserts that the message still arrives.
+  Both were mutation-checked: reverting either fix makes them fail.
 - The rules that decide when a description shows are now one pure function
   (`tipAction`), and the suite drives it through every case - a tap, a lifted
   finger, a mouse over, a mouse leaving, focus arriving, focus leaving, and
@@ -356,6 +462,7 @@ for the FFmpeg-free pass-through path, per-listener pacing with drop
 isolation, a dashboard with health metrics, and a systemd installer for the
 Raspberry Pi.
 
+[2.2.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.2.0
 [2.1.2]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.1.2
 [2.1.1]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.1.1
 [2.1.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.1.0
