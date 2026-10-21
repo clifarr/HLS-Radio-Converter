@@ -664,6 +664,7 @@ for the FFmpeg-free pass-through path, per-listener pacing with drop
 isolation, a dashboard with health metrics, and a systemd installer for the
 Raspberry Pi.
 
+[2.2.2]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.2.2
 [2.2.1]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.2.1
 [2.2.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.2.0
 [2.1.2]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.1.2
