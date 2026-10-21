@@ -376,11 +376,12 @@ class StreamPipeline:
                 kind,
             )
         else:
-            target = (
-                "ADTS (copy, no re-encode)"
-                if self.settings.output_codec == "adts"
-                else (f"MP3 {self.settings.bitrate // 1000} kbit/s")
-            )
+            if self.settings.output_codec == "adts":
+                target = (
+                    "ADTS (copy, no re-encode)" if kind == "adts" else "ADTS (re-encoded to AAC)"
+                )
+            else:
+                target = f"MP3 {self.settings.bitrate // 1000} kbit/s"
             log.info(
                 "ffmpeg engine: converting to %s (input %s, source kind=%s)",
                 target,
@@ -391,7 +392,7 @@ class StreamPipeline:
         if mode == MODE_PASSTHROUGH:
             iterator = self._run_passthrough(tracker, pending)
         else:
-            iterator = self._run_transcode(tracker, input_format, pending, init_segments)
+            iterator = self._run_transcode(tracker, input_format, pending, init_segments, kind)
 
         async for chunk in iterator:
             self.stats.bytes_out += len(chunk)
@@ -504,10 +505,15 @@ class StreamPipeline:
         input_format: str,
         pending: List[WorkItem],
         init_segments: Sequence[Segment],
+        source_kind: Optional[str] = None,
     ) -> AsyncGenerator[bytes, None]:
-        copy_audio = self.settings.output_codec == "adts"
+        # ``copy_audio`` is only true when the source really is the codec
+        # we are outputting. An MP3 source going to an ADTS output has to be
+        # *encoded*, not copied: ffmpeg accepts ``-acodec copy -f adts`` for
+        # MP3 input and then produces nothing a radio can decode.
+        copy_audio = self.settings.output_codec == "adts" and source_kind == "adts"
         command = ffmpeg_mod.build_command(self.settings, input_format, copy_audio=copy_audio)
-        self.stats.detected_codec = "aac" if copy_audio else "mp3"
+        self.stats.detected_codec = "aac" if self.settings.output_codec == "adts" else "mp3"
 
         async def feeder(queue: asyncio.Queue) -> None:
             proc = await self._spawn(command)

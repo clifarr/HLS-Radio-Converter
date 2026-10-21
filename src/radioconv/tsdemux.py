@@ -325,9 +325,23 @@ def mp3_frame_size(data: bytes, offset: int = 0) -> Optional[int]:
     is a byte offset from its *audio decoder* (the Shoutcast/ICY grid) loses
     both at once when the two disagree.
 
-    The frame length is ``144 * bitrate / sample_rate`` for Layer III and
-    Layer II (with a padding byte for MPEG-1 at 32/48 kHz), and
-    ``12 * bitrate / sample_rate`` samples of 4 bytes for Layer I.
+    The frame length depends on the **layer**, not just the version:
+
+    ===== ============== ====================================
+    Layer Samples/frame  Applies to
+    ===== ============== ====================================
+    I     12 (x 4 bytes) MPEG-1, MPEG-2, MPEG-2.5
+    II    144            MPEG-1, MPEG-2, MPEG-2.5
+    III   144            MPEG-1
+    III   72             MPEG-2, MPEG-2.5
+    ===== ============== ====================================
+
+    The 72-sample shortcut belongs to Layer III only. Layer II keeps 144
+    samples in every version - so MPEG-2 Layer II at 64 kbit/s and 24 kHz is
+    ``144 * 64000 / 24000`` = 384 bytes, not 192. Using 72 for it halves every
+    Layer II frame, which makes the whole frame grid wrong.
+
+    A padding byte is added to the frame when the header says so.
     """
     if offset + 4 > len(data):
         return None
@@ -351,9 +365,9 @@ def mp3_frame_size(data: bytes, offset: int = 0) -> Optional[int]:
     padding = (data[offset + 2] >> 1) & 0x01
     if layer == 3:  # Layer I: 12 samples per frame, 4 bytes per sample
         return (12 * bitrate // rate + padding) * 4
-    # Layer II and III: one frame is 144 (MPEG-1) or 72 (MPEG-2/2.5)
-    # samples of the bitstream.
-    samples = 144 if version == 3 else 72
+    # Layer II is 144 samples in every version; Layer III is 144 in MPEG-1
+    # and 72 in MPEG-2/2.5.
+    samples = 72 if layer == 1 and version != 3 else 144
     return samples * bitrate // rate + padding
 
 
@@ -537,38 +551,150 @@ def packet_has_payload_start(packet: bytes) -> bool:
     return bool(packet[1] & 0x40)
 
 
+def packet_discontinuity(packet: bytes) -> bool:
+    """True if the packet carries the MPEG-TS ``discontinuity_indicator``.
+
+    The indicator lives in the **adaptation field**, not in the packet
+    header. Its position depends on the adaptation field's own length:
+
+    * ``packet[3] >> 4 & 0x03`` is the ``adaptation_field_control``. Bit 1
+      set means an adaptation field is present.
+    * ``packet[4]`` is the adaptation field **length** in bytes, counting
+      the flags byte itself.
+    * ``packet[5]`` is the adaptation field's **flags** byte, and bit 7 of it
+      is the ``discontinuity_indicator``.
+
+    So the flag is at ``packet[5] & 0x80``, and it only exists at all when
+    there is an adaptation field of at least one byte.
+
+    Reading the header's ``adaptation_field_control`` instead - which is
+    what this code used to do - is a category error: that nibble says
+    *whether* an adaptation field is present, never whether there is a
+    discontinuity. A stream that was cut and rejoined would then be counted
+    as a *silent* gap, and the demuxer would keep the half-old PES packet
+    and splice it onto the new one.
+    """
+    if len(packet) < 6:
+        return False
+    adaptation_control = (packet[3] >> 4) & 0x03
+    if not adaptation_control & 0x02:
+        return False
+    adaptation_length = packet[4]
+    if adaptation_length < 1:
+        return False
+    return bool(packet[5] & 0x80)
+
+
 # ------------------------------------------------------------------ PSI tables
+#: The largest PSI section this assembler will accept, in bytes. The spec
+#: allows 1021 for a section and 4096 for a section *plus* its private
+#: data, so 4096 is the true maximum; anything longer is a bug or a
+#: corrupt stream, and accepting it would let a corrupt stream allocate
+#: without bound.
+MAX_SECTION_BYTES = 4096
+
+#: The most bytes the assembler will hold for a section that has not
+#: completed yet. A section cannot exceed `MAX_SECTION_BYTES`, so holding
+#: more than that means the stream is not what it claims to be - the bytes
+#: are dropped rather than kept forever.
+MAX_PENDING_BYTES = MAX_SECTION_BYTES
+
+
 class _SectionAssembler:
-    """Reassembles PSI sections which may split across TS packets."""
+    """Reassembles PSI sections which may split across TS packets.
+
+    PSI packets carry a **pointer field**: when the payload starts with a
+    section, the first byte says how many bytes to skip before the section
+    starts, and the section may be followed by stuffing bytes (0xFF) or by
+    the start of the next section.
+
+    Two things make the naive implementation wrong, and both were found by
+    measurement on a real stream:
+
+    1. **The pointer field only exists when the payload unit start
+       indicator (PUSI) is set.** Reading the first byte as a pointer on a
+       *continuation* packet treats a section's own first byte - the
+       ``table_id`` - as a skip count, and throws the section away.
+    2. **Stuffing bytes must be discarded.** A PAT packet is padded with
+       0xFF up to the end of the packet. Keeping them in the buffer means
+       the next packet's continuation is glued to a run of 0xFF, the
+       section never completes, and the buffer grows by the whole packet
+       size on every packet - unbounded.
+
+    So the assembler is told whether the payload starts a new section, and
+    it keeps only what a section needs.
+    """
 
     __slots__ = ("_buf",)
 
     def __init__(self) -> None:
         self._buf = bytearray()
 
-    def feed(self, payload: bytes) -> List[bytes]:
+    def reset(self) -> None:
+        """Forget any partial section."""
+        self._buf.clear()
+
+    def feed(self, payload: bytes, payload_unit_start: bool = True) -> List[bytes]:
+        """Feed one packet's payload. Returns the sections that completed.
+
+        *payload_unit_start* is the packet's PUSI bit: true when this
+        payload begins with the pointer field, false when it continues the
+        previous packet's section.
+        """
         sections: List[bytes] = []
-        if self._buf:
-            buf = self._buf + payload
-        else:
-            if not payload:
-                return sections
+        if not payload:
+            return sections
+
+        if payload_unit_start:
+            # The first byte is the pointer field: the number of bytes to
+            # skip before the section starts. Those skipped bytes are the
+            # tail of the previous section (which was already handled) and
+            # possibly stuffing.
             pointer = payload[0]
             start = 1 + pointer
             if start >= len(payload):
-                # The section did not actually begin here; nothing to keep.
+                # Nothing but a pointer: no section in this packet. But the
+                # buffer we were holding is finished - the sender said the
+                # section ended in the *previous* packet.
+                self._buf.clear()
                 return sections
+            # Whatever was in the buffer has been completed by the skipped
+            # bytes, and we could not parse it (it was a fragment), so drop
+            # it and start clean.
+            self._buf.clear()
             buf = bytearray(payload[start:])
+        else:
+            if not self._buf:
+                # A continuation with nothing to continue. The sender's
+                # section was lost; start over from this payload.
+                return sections
+            buf = self._buf + payload
 
         position = 0
         while len(buf) - position >= 3:
+            if buf[position] == 0xFF:
+                # Stuffing byte: the sender is padding to the end of the
+                # packet. Skip it and everything after it.
+                position = len(buf)
+                break
             needed = 3 + (((buf[position + 1] & 0x0F) << 8) | buf[position + 2])
-            if needed < 3 or needed > 4096 or len(buf) - position < needed:
+            if needed < 3 or needed > MAX_SECTION_BYTES:
+                # Not a section header we can make sense of. Skip this byte
+                # and resynchronise, rather than waiting forever.
+                position += 1
+                continue
+            if len(buf) - position < needed:
+                # The section is not complete yet: keep it for the next
+                # packet.
                 break
             sections.append(bytes(buf[position : position + needed]))
             position += needed
 
         self._buf = bytearray(buf[position:])
+        if len(self._buf) > MAX_PENDING_BYTES:
+            # More than a whole section's worth of an incomplete section.
+            # This is not a section: drop it and resynchronise.
+            self._buf.clear()
         return sections
 
 
@@ -630,15 +756,16 @@ def scan_tables(data: bytes, max_packets: int = 4000) -> Dict[str, Any]:
         payload = _packet_payload(packet)
         if not payload:
             continue
+        has_start = packet_has_payload_start(packet)
         if pid == 0x00:
-            for section in pat.feed(payload):
+            for section in pat.feed(payload, has_start):
                 found = parse_pat(section)
                 for program, pmt_pid in found.items():
                     programs[program] = pmt_pid
                     pmt_pids.setdefault(pmt_pid, pmt_pid)
                     pmts.setdefault(pmt_pid, _SectionAssembler())
         elif pid in pmt_pids:
-            for section in pmts[pid].feed(payload):
+            for section in pmts[pid].feed(payload, has_start):
                 found = parse_pmt(section)
                 if not found:
                     continue
@@ -791,7 +918,7 @@ class TSDemuxer:
         has_start = packet_has_payload_start(packet)
 
         if pid == 0x00:
-            for section in self._pat.feed(payload):
+            for section in self._pat.feed(payload, has_start):
                 for program, pmt_pid in parse_pat(section).items():
                     self._pmt_pids.setdefault(pmt_pid, None)
                     self._pmt_sections.setdefault(pmt_pid, _SectionAssembler())
@@ -800,7 +927,7 @@ class TSDemuxer:
 
         if pid in self._pmt_pids:
             assembler = self._pmt_sections[pid]
-            for section in assembler.feed(payload):
+            for section in assembler.feed(payload, has_start):
                 self._consider_streams(parse_pmt(section))
             return
 
@@ -814,18 +941,49 @@ class TSDemuxer:
             self._handle_pes(payload, has_start, out)
 
     def _check_continuity(self, packet: bytes, pid: int) -> None:
+        """Notice a gap in the continuity counters, and react to it.
+
+        The continuity counter increments once per packet. A jump means a
+        packet was lost, so the elementary stream has a hole in it and the
+        half-assembled PES packet must be dropped rather than spliced onto
+        the next one.
+
+        Two things must not be mistaken for a gap:
+
+        * **A duplicate packet.** Some encoders repeat a packet after a
+          retransmission, so the counter goes *backwards* by one. The
+          payload is identical and the stream is intact; this is not a
+          discontinuity and must not tear down the PES packet.
+        * **A declared discontinuity.** The MPEG-TS ``discontinuity_indicator``
+          says the encoder is starting a new sequence and the counter may
+          jump on purpose. That is a *reset*, not damage: the PES packet
+          before it was deliberately abandoned, and the demuxer should
+          start fresh rather than treat the new counter as damage.
+        """
         counter = packet[3] & 0x0F
         previous = self._last_cc.get(pid)
-        # ``not (x & 0x02)`` reads as "no adaptation-field discontinuity flag".
-        if (
-            previous is not None
-            and (previous + 1) & 0x0F != counter
-            and not (packet[3] >> 4) & 0x02
-        ):
+
+        if packet_discontinuity(packet):
+            # The encoder says "a new sequence starts here". The counter may
+            # jump, and the PES packet in flight was abandoned on purpose.
             self.discontinuities += 1
-            # Drop the incomplete PES: keeping it would splice garbage.
             self._pes.clear()
             self._header_done = False
+            self._skipping = False
+            self._last_cc[pid] = counter
+            return
+
+        if previous is not None:
+            expected = (previous + 1) & 0x0F
+            if counter == previous:
+                # A duplicate packet: the same payload again, no data lost.
+                return
+            if counter != expected:
+                # A real gap: something was lost.
+                self.discontinuities += 1
+                # Drop the incomplete PES: keeping it would splice garbage.
+                self._pes.clear()
+                self._header_done = False
         self._last_cc[pid] = counter
 
     def _consider_streams(self, streams: List[Tuple[int, int]]) -> None:

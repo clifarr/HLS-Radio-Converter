@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 import m3u8
 import pytest
 
@@ -132,6 +133,88 @@ def test_pkcs7_stripping():
     assert hls._strip_pkcs7(b"short") == b"short"
     unpadded = bytes(range(16, 32))
     assert hls._strip_pkcs7(unpadded) == unpadded
+
+
+# --------------------------------------------------------- byte-range requests
+def _range_response(status: int, body: bytes, content_range: str = "") -> httpx.Response:
+    headers = {}
+    if content_range:
+        headers["Content-Range"] = content_range
+    return httpx.Response(status, content=body, headers=headers)
+
+
+def test_a_byte_range_request_must_be_answered_with_206():
+    """A 200 for a Range request is the whole file, not the range.
+
+    Accepting it would splice the *beginning* of the file into the middle of
+    the stream: the segment would start with a PES header that belongs
+    somewhere else, and the demuxer would either resynchronise after a
+    garbage frame or decode a spliced stream.
+    """
+    url = "https://cdn/seg.ts"
+    with pytest.raises(hls.HLSError, match="expected 206"):
+        hls.HLSClient._check_range_response(_range_response(200, b"x" * 10), url)
+    # 416 means the segment changed under us; retrying the same range fails
+    # the same way, so it is a hard error too.
+    with pytest.raises(hls.HLSError, match="416"):
+        hls.HLSClient._check_range_response(_range_response(416, b""), url)
+    # A 206 with no Content-Range is not usable either.
+    with pytest.raises(hls.HLSError, match="Content-Range"):
+        hls.HLSClient._check_range_response(_range_response(206, b"x" * 10), url)
+    # The good case.
+    hls.HLSClient._check_range_response(_range_response(206, b"x" * 10, "bytes 0-9/100"), url)
+
+
+def test_a_truncated_segment_is_refused():
+    """A short body is a corrupt segment, not a segment.
+
+    Without this check the demuxer would be handed a partial TS packet and
+    would resynchronise on the next one, losing the audio in between.
+    """
+    url = "https://cdn/seg.ts"
+    response = _range_response(206, b"x" * 5, "bytes 0-9/100")
+    with pytest.raises(hls.HLSError, match="short segment"):
+        hls.HLSClient._check_range_length(response, b"x" * 5, url)
+    # The good case.
+    hls.HLSClient._check_range_length(response, b"x" * 10, url)
+    # An unparseable Content-Range is an error, not a silent pass.
+    with pytest.raises(hls.HLSError, match="Content-Range"):
+        hls.HLSClient._check_range_length(
+            _range_response(206, b"x" * 10, "bytes nonsense/100"), b"x" * 10, url
+        )
+
+
+async def test_a_server_that_ignores_the_range_is_refused():
+    """End to end through the client: a 200 answer to a Range request fails.
+
+    This is the shape a CDN takes when it does not support byte ranges at
+    all, and it is exactly the case that used to be accepted silently.
+    """
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=b"the whole file"))
+    client = hls.HLSClient(Settings(segment_retries=1))
+    client._client = httpx.AsyncClient(transport=transport)
+    try:
+        with pytest.raises(hls.HLSError, match="expected 206"):
+            await client._get("https://cdn/seg.ts", byte_range=(100, 50))
+    finally:
+        await client.aclose()
+
+
+async def test_a_correct_range_response_is_accepted():
+    """The good path still works: 206, a Content-Range, and the exact bytes."""
+    body = b"0123456789"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Range"] == "bytes=100-109"
+        return httpx.Response(206, content=body, headers={"Content-Range": "bytes 100-109/1000"})
+
+    client = hls.HLSClient(Settings(segment_retries=1))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        got = await client._get("https://cdn/seg.ts", byte_range=(100, 10))
+        assert got == body
+    finally:
+        await client.aclose()
 
 
 def test_aes_128_decrypt_round_trip():

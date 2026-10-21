@@ -354,6 +354,64 @@ def test_icy_title_with_an_apostrophe_does_not_truncate_the_value():
     assert leftover == ";", "the block must end cleanly after the value"
 
 
+def test_icy_title_with_a_typographic_apostrophe_does_not_truncate_it():
+    """A curly apostrophe must not become an ASCII one.
+
+    The sanitiser maps typographic punctuation to ASCII equivalents, and the
+    ASCII apostrophe is the delimiter of the ``StreamTitle='...'`` value. If
+    U+2019 is translated to U+0027, the value ends early - exactly the bug
+    the ASCII apostrophe rule exists to prevent.
+
+    This is a real title shape: ``It's a Sin`` (Soft Cell) and
+    ``Rock 'n' Roll`` (Hall & Oates) both use the curly apostrophe, and
+    plenty of stations send them that way.
+    """
+    for title in (
+        "It’s a Sin",
+        "Rock ’n’ Roll",
+        "‘Quoted’",
+        "don’t stop",
+    ):
+        block = icy_metadata_block(title)
+        value, leftover = _radio_reads(block)
+        assert leftover == ";", f"the value ended early for {title!r}"
+        assert "'" not in value, f"an ASCII quote survived in {value!r}"
+        # The title is still there, just with the acute accent in place of
+        # the curly apostrophe.
+        assert value.count("´") == title.count("’") + title.count("‘")
+
+
+def test_no_title_sanitiser_output_can_contain_the_delimiter():
+    """The invariant, over a spread of awkward titles.
+
+    Every ASCII quote and every control character must be gone. This is the
+    property the radio depends on, and it is cheap to state as a property
+    rather than as one example.
+    """
+    from radioconv.api import sanitize_icy_title
+
+    titles = [
+        "Fool's Garden",
+        "It’s a Sin",
+        "Rock ’n’ Roll",
+        "‘Quoted’",
+        "She said “hi”",
+        "a – b — c",
+        "wait…",
+        " nbsp",
+        "€100",
+        "mixed ' and ’ and “",
+        "",
+    ]
+    for title in titles:
+        text = sanitize_icy_title(title)
+        assert "'" not in text, f"ASCII quote survived in {text!r} (from {title!r})"
+        assert "\x00" not in text
+        assert all(ch >= " " or ch == "\t" for ch in text), text
+        # And it must be encodable as Latin-1 without loss.
+        text.encode("latin-1")
+
+
 def test_icy_title_is_latin1_so_a_radio_can_render_it():
     """The metadata is a byte string; the heritage convention is ISO-8859-1.
 
@@ -680,6 +738,27 @@ def _mp3_frames(count: int) -> bytes:
     return (MP3_FRAME_HEADER + b"\x00" * (MP3_FRAME_SIZE - 4)) * count
 
 
+#: A 44.1 kHz MPEG-1 Layer III frame header at 192 kbit/s, without the
+#: padding bit. The frame is 626 bytes.
+MP3_44K_HEADER = bytes([0xFF, 0xFB, 0xB0, 0x00])
+#: The same frame with the padding bit set: 627 bytes. 44.1 kHz does not
+#: divide evenly into 1152 samples, so real encoders alternate between the
+#: two sizes - which is exactly why a frame length cannot be a constant.
+MP3_44K_HEADER_PADDED = bytes([0xFF, 0xFB, 0xB2, 0x00])
+
+
+def _mp3_44k_frames(count: int) -> bytes:
+    """*count* alternating 417/418-byte MPEG-1 Layer III frames at 44.1 kHz."""
+    out = bytearray()
+    for index in range(count):
+        header = MP3_44K_HEADER_PADDED if index % 2 else MP3_44K_HEADER
+        size = mp3_frame_size(header)
+        assert size is not None, f"{header!r} is not a frame header"
+        out += header
+        out += b"\x00" * (size - 4)
+    return bytes(out)
+
+
 def _frame_offset(data: bytes) -> int:
     """Offset of the first MPEG audio frame in *data*, or -1.
 
@@ -789,6 +868,62 @@ async def test_alignment_does_not_lose_the_audio():
         assert whole_frames >= frames - 1, (
             f"only {whole_frames} whole frames survived out of {frames}: the "
             "alignment is throwing away audio"
+        )
+    finally:
+        await session.close("test")
+
+
+async def test_the_tail_of_the_stream_is_not_trimmed_to_a_frame_multiple():
+    """Closing the stream must not delete valid audio.
+
+    The tail used to be trimmed to a multiple of the *first* frame's length.
+    That is wrong for two reasons: MP3 frames alternate between two sizes
+    when the sample rate needs a padding byte, and ADTS frames are
+    variable-length by definition. For two 44.1 kHz frames of 626 and 627
+    bytes, ``1253 % 626`` is 1, so one perfectly valid byte was deleted from
+    the end of every stream.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="mp3"))
+    session, _ = await subscribe(manager)
+    try:
+        # Two whole frames of 626 and 627 bytes: 1253 bytes in total, which
+        # is not a multiple of 626.
+        payload = _mp3_44k_frames(2)
+        assert len(payload) == 1253
+        assert len(payload) % 626 == 1, "the tail must not be a frame multiple"
+
+        session._fan_out(payload)
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        handed_over = b"".join(pieces)
+        assert handed_over == payload, (
+            f"expected {len(payload)} bytes, got {len(handed_over)}: "
+            f"{len(payload) - len(handed_over)} bytes were lost at the end"
+        )
+    finally:
+        await session.close("test")
+
+
+async def test_a_partial_frame_at_the_end_is_dropped_but_the_whole_frames_are_not():
+    """The tail of an *incomplete* frame is dropped; the frames before it are not.
+
+    A partial frame is not decodable, so it is dropped - the radio would
+    discard it anyway. But the whole frames that came before it must all
+    arrive: the trim used to take them with it.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="mp3"))
+    session, _ = await subscribe(manager)
+    try:
+        whole = _mp3_44k_frames(3)  # 626 + 627 + 626 = 1879 bytes
+        partial = bytes([0xFF, 0xFB, 0xB2, 0x00]) + b"\x11" * 10
+        session._fan_out(whole + partial)
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        handed_over = b"".join(pieces)
+        assert handed_over == whole, (
+            f"expected the {len(whole)} whole bytes, got {len(handed_over)}"
         )
     finally:
         await session.close("test")
@@ -911,9 +1046,174 @@ def _adts_frames(count: int, length: int = 256) -> bytes:
     return bytes(out)
 
 
+async def test_a_large_adts_stream_is_still_aligned():
+    """The search budget must fit the format it is searching for.
+
+    The old budget was ``4 * FRAME_HINT`` = 2304 bytes, a number taken from
+    the *MP3* frame size and applied to every format. An ADTS frame can be
+    up to 8191 bytes, so two of them do not fit in 2304 bytes - and the
+    search was given up on before a frame *pair* could ever be found. A
+    high-bitrate AAC stream could therefore never be aligned at all.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="adts"))
+    session, _ = await subscribe(manager)
+    try:
+        session.pipeline.stats.detected_codec = "aac"
+        # Two frames of 4000 bytes: the pair alone is 8000 bytes, which is
+        # more than the old 2304-byte budget.
+        audio = _adts_frames(12, length=4000)
+        for offset in range(0, len(audio), MEASURED_PIPE_READ):
+            session._fan_out(audio[offset : offset + MEASURED_PIPE_READ])
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        assert pieces, "the listener was given nothing"
+        for index, piece in enumerate(pieces):
+            offset = adts_align_offset(piece)
+            assert offset == 0, (
+                f"piece {index} starts {offset} bytes into an ADTS frame "
+                f"({len(piece)} bytes) - a large ADTS stream is not aligned"
+            )
+    finally:
+        await session.close("test")
+
+
+async def test_a_stream_that_opens_with_a_preamble_is_still_aligned():
+    """A stream that starts with something else is not "not MP3" for ever.
+
+    The "is there any sync byte at all" test used to look only at the
+    first 4096 bytes, and the "this is not this format" decision was made
+    on the *first* chunk. A station that opens with a few hundred bytes of
+    preamble would then be declared "not MP3" before its first frame
+    arrived, and the alignment would never happen - even though the stream
+    is MP3.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="mp3"))
+    session, _ = await subscribe(manager)
+    try:
+        session.pipeline.stats.detected_codec = "mp3"
+        # 600 bytes of preamble - enough to fill the first chunk, not enough
+        # to contain a frame.
+        preamble = b"\x11" * 600
+        audio = preamble + _mp3_frames(60)
+        for offset in range(0, len(audio), MEASURED_PIPE_READ):
+            session._fan_out(audio[offset : offset + MEASURED_PIPE_READ])
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        assert pieces, "the listener was given nothing"
+        for index, piece in enumerate(pieces):
+            offset = _frame_offset(piece)
+            assert offset == 0, (
+                f"piece {index} starts {offset} bytes into an MP3 frame "
+                f"({len(piece)} bytes) - a stream with a preamble is not aligned"
+            )
+    finally:
+        await session.close("test")
+
+
+async def test_a_stream_that_is_really_not_mp3_is_still_handed_over():
+    """The other half: the search must still give up eventually.
+
+    A stream that is not MP3 must not be buffered for ever waiting for a
+    frame that will never come.
+    """
+    manager = SessionManager(settings(chunk_size=8192, output_codec="mp3"))
+    session, _ = await subscribe(manager)
+    try:
+        session.pipeline.stats.detected_codec = "mp3"
+        # 64 KB of noise: no sync word anywhere, and certainly no frame pair.
+        audio = bytes((i * 37) & 0xFF for i in range(65536))
+        for offset in range(0, len(audio), MEASURED_PIPE_READ):
+            session._fan_out(audio[offset : offset + MEASURED_PIPE_READ])
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        handed_over = b"".join(pieces)
+        assert handed_over, "the listener was given nothing"
+        # The audio must not have been thrown away: the whole point of
+        # giving up is to hand it over untouched.
+        assert len(handed_over) >= len(audio) - 1024
+    finally:
+        await session.close("test")
+
+
+async def test_a_codec_change_under_the_session_does_not_silence_it():
+    """A pipeline restart can change the codec, and the grid must follow.
+
+    When the station fails over, the new pipeline may be sending a different
+    codec. Everything the session knew about the frame grid - the frame
+    size, the grid, and the bytes held back for a frame that will never
+    complete - belongs to the *old* format.
+
+    With a stale grid the session delivered **zero** bytes: the radio went
+    silent and stayed silent. The pieces were cut on the old format's
+    boundaries and the alignment search was looking for MP3 frames in an
+    ADTS stream.
+    """
+    manager = SessionManager(settings(chunk_size=1024, output_codec="auto"))
+    session, _ = await subscribe(manager)
+    try:
+        # An MP3 stream first: the grid is found and the format recorded.
+        session.pipeline.stats.detected_codec = "mp3"
+        session._fan_out(_mp3_frames(3))
+        assert session._grid_format == "mp3"
+        # Take the MP3 pieces out of the queue: they are legitimately
+        # delivered, and this test is about what comes *after* the change.
+        await _drain(session)
+
+        # The pipeline restarts and the station is now sending ADTS.
+        session.pipeline.stats.detected_codec = "aac"
+        session._fan_out(_adts_frames(20, length=300))
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        assert pieces, "the session went silent after the codec changed"
+        assert session._grid_format == "adts", "the grid must follow the codec"
+        for index, piece in enumerate(pieces):
+            offset = adts_align_offset(piece)
+            assert offset == 0, (
+                f"piece {index} starts {offset} bytes into an ADTS frame "
+                f"({len(piece)} bytes) after the codec changed"
+            )
+    finally:
+        await session.close("test")
+
+
+async def test_a_codec_change_drops_the_bytes_of_the_old_format():
+    """The held-back bytes of the old format must not be handed over.
+
+    They are the tail of a frame in the *old* format. A radio decoding the
+    new format would find garbage in front of its first frame.
+    """
+    manager = SessionManager(settings(chunk_size=1024, output_codec="auto"))
+    session, _ = await subscribe(manager)
+    try:
+        session.pipeline.stats.detected_codec = "mp3"
+        # A partial MP3 frame at the end leaves bytes in the hold-back.
+        session._fan_out(_mp3_frames(2) + MP3_FRAME_HEADER + b"\x11" * 10)
+        assert session._align_pending, "the test needs held-back bytes"
+        await _drain(session)
+
+        session.pipeline.stats.detected_codec = "aac"
+        session._fan_out(_adts_frames(20, length=300))
+        session._flush_pending()
+
+        pieces = await _drain(session)
+        handed_over = b"".join(pieces)
+        # The old format's bytes must not be in there.
+        assert not handed_over.startswith(MP3_FRAME_HEADER), (
+            "the old format's held-back bytes were handed to the listener"
+        )
+        for index, piece in enumerate(pieces):
+            offset = adts_align_offset(piece)
+            assert offset == 0, f"piece {index} starts {offset} bytes into an ADTS frame"
+    finally:
+        await session.close("test")
+
+
 async def test_an_adts_stream_is_also_aligned_to_its_own_frames():
     """ADTS has its own frame grid, and a radio resynchronises on it too.
-
     The alignment used to be keyed off the *setting* (`output_codec !=
     "mp3"`), which left every ADTS output unaligned - and ADTS is what a
     station with `output_codec = "adts"` sends to the radio. The grid has to

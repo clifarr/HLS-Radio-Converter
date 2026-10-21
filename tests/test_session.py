@@ -125,6 +125,47 @@ async def test_different_stations_get_different_sessions():
         await manager.aclose()
 
 
+async def test_share_sessions_false_gives_every_radio_its_own_pipeline():
+    """The setting must do what it says.
+
+    ``share_sessions`` was a dead setting: it was declared, configurable
+    and never read, so a station that asked for unshared streams got
+    shared ones anyway - two radios on the same station, one upstream
+    fetch, and a second radio's quality decided by the first one's
+    connection.
+    """
+    settings = fast_settings()
+    settings.share_sessions = False
+    manager = SessionManager(settings)
+    await manager.start()
+    try:
+        first, sub_a = await manager.subscribe("http://x/one.m3u8", ["http://x/one.m3u8"])
+        second, sub_b = await manager.subscribe("http://x/one.m3u8", ["http://x/one.m3u8"])
+        assert first is not second, "the two radios shared a pipeline"
+        assert first.listener_count == 1
+        assert second.listener_count == 1
+        assert len(manager.sessions) == 2
+
+        # And each one delivers its own audio.
+        assert await drain(sub_a, 1) == [b"a" * FakePipeline.PIECE]
+        assert await drain(sub_b, 1) == [b"a" * FakePipeline.PIECE]
+    finally:
+        await manager.aclose()
+
+
+async def test_share_sessions_true_still_shares():
+    """The default is unchanged: one pipeline for every radio on a station."""
+    manager = SessionManager(fast_settings())
+    await manager.start()
+    try:
+        first, _ = await manager.subscribe("http://x/one.m3u8", ["http://x/one.m3u8"])
+        second, _ = await manager.subscribe("http://x/one.m3u8", ["http://x/one.m3u8"])
+        assert first is second
+        assert len(manager.sessions) == 1
+    finally:
+        await manager.aclose()
+
+
 async def test_every_pipeline_reports_into_the_managers_byte_counters():
     """One set of counters for the whole service, not one per session.
 

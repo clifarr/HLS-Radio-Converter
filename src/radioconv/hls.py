@@ -362,7 +362,9 @@ class HLSClient:
         for attempt in range(1, self.settings.segment_retries + 1):
             try:
                 async with self._client.stream("GET", url, headers=headers) as response:
-                    if response.status_code >= 400:
+                    if byte_range is not None:
+                        self._check_range_response(response, url)
+                    elif response.status_code >= 400:
                         raise HLSError(f"HTTP {response.status_code} for {url}")
                     cap = limit or self.settings.max_segment_bytes
                     chunks: List[bytes] = []
@@ -372,12 +374,60 @@ class HLSClient:
                         if total > cap:
                             raise HLSError(f"response exceeded {cap} bytes for {url}")
                         chunks.append(chunk)
-                    return b"".join(chunks)
+                    body = b"".join(chunks)
+                    if byte_range is not None:
+                        self._check_range_length(response, body, url)
+                    return body
             except (httpx.HTTPError, HLSError, asyncio.TimeoutError) as exc:
                 last_error = exc
                 if attempt < self.settings.segment_retries:
                     await asyncio.sleep(min(0.5 * attempt, 2.0))
         raise HLSError(f"failed to fetch {url}: {last_error}")
+
+    @staticmethod
+    def _check_range_response(response: httpx.Response, url: str) -> None:
+        """Require a 206 with a ``Content-Range`` for a byte-range request.
+
+        A server that answers a ``Range`` request with ``200 OK`` and the
+        *whole* resource is not answering the question. Accepting that
+        response would splice the beginning of the file into the middle of
+        the stream - the segment would then start with a PES header that
+        belongs somewhere else, and the demuxer would either resynchronise
+        after a garbage frame or, worse, decode a spliced stream.
+
+        ``416 Range Not Satisfiable`` is also a hard error: the segment
+        changed under us (a live playlist that rotated while we were
+        fetching), and retrying with the same range would fail the same way.
+        """
+        if response.status_code == 416:
+            raise HLSError(f"HTTP 416 (range not satisfiable) for {url}")
+        if response.status_code != 206:
+            raise HLSError(f"HTTP {response.status_code} (expected 206 for a byte range) for {url}")
+        if not response.headers.get("content-range"):
+            raise HLSError(f"HTTP 206 without Content-Range for {url}")
+
+    @staticmethod
+    def _check_range_length(response: httpx.Response, body: bytes, url: str) -> None:
+        """Check the body length against the ``Content-Range`` we asked for.
+
+        A truncated segment is a corrupt segment. Without this check the
+        demuxer would be handed a partial TS packet and would resynchronise
+        on the next one, losing the audio in between.
+        """
+        content_range = response.headers.get("content-range", "")
+        # Content-Range: bytes <start>-<end>/<total>
+        spec = content_range.split(" ", 1)[-1].split("/", 1)[0].strip()
+        start_text, _, end_text = spec.partition("-")
+        try:
+            start = int(start_text)
+            end = int(end_text)
+        except ValueError as exc:
+            raise HLSError(f"unparseable Content-Range {content_range!r} for {url}") from exc
+        expected = end - start + 1
+        if expected < 0:
+            raise HLSError(f"invalid Content-Range {content_range!r} for {url}")
+        if len(body) != expected:
+            raise HLSError(f"short segment for {url}: asked for {expected} bytes, got {len(body)}")
 
     async def fetch_playlist(self, url: str) -> m3u8.M3U8:
         """Fetch and parse a playlist (master or media)."""

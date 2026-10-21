@@ -726,25 +726,34 @@ def sanitize_icy_title(title: str) -> str:
     * **Characters outside Latin-1** cannot be encoded at all, because the
       metadata is a byte string and the heritage convention is ISO-8859-1.
       The common ones are transliterated; the rest become ``?``. Characters
-      that *are* in Latin-1 - ``£``, ``È``, ``€`` - are kept exactly, because
-      a radio can render them.
+      that *are* in Latin-1 - ``£``, ``È`` - are kept exactly, because a
+      radio can render them. (The Euro sign is *not* in ISO-8859-1: it
+      arrives as U+20AC and becomes ``?``, which is correct for the format.)
     * **A title longer than the block** is cut, and the cut must never land in
       the middle of a multi-byte character.
+
+    The apostrophe rule applies to the **typographic** apostrophes too. A
+    title that uses ``’`` (U+2019) is just as likely to be a possessive or a
+    contraction - ``It’s a Sin``, ``Rock ’n’ Roll`` - and it must not be
+    turned back into an ASCII quote, because an ASCII quote is exactly the
+    delimiter this function exists to remove. The typographic quotes are
+    mapped to the acute accent directly, and the ASCII-quote replacement is
+    applied **after** every other substitution, so no substitution can
+    reintroduce it.
 
     The result is Latin-1 by construction, which is what the metadata format
     is, and every radio firmware can display it.
     """
     if not title:
         return ""
-    # 1. A quote would end the value. U+00B4 is one byte, looks like an
-    #    apostrophe, and does not terminate the quoted value.
-    text = title.replace(ICY_QUOTE, "´")
-    # 2. The typographic punctuation that is *not* in Latin-1, mapped to
-    #    equivalents that are. Everything else outside Latin-1 is replaced
-    #    with "?" by the encode below.
+    # 1. The typographic punctuation that is *not* in Latin-1, mapped to
+    #    equivalents that are. The curly single quotes become the acute
+    #    accent, NOT an ASCII quote: an ASCII quote terminates the value.
+    #    Everything else outside Latin-1 is replaced with "?" by the encode
+    #    below.
     text = (
-        text.replace("‘", "'")
-        .replace("’", "'")
+        title.replace("‘", "´")
+        .replace("’", "´")
         .replace("“", '"')
         .replace("”", '"')
         .replace("–", "-")
@@ -752,6 +761,7 @@ def sanitize_icy_title(title: str) -> str:
         .replace("…", "...")
         .replace(" ", " ")
     )
+    text = text.replace(ICY_QUOTE, "´")
     text = text.encode("latin-1", "replace").decode("latin-1")
     # 3. Control characters would confuse a parser that expects a line.
     return "".join(ch for ch in text if ch >= " " or ch == "\t")

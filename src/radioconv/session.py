@@ -66,6 +66,47 @@ MAX_JOIN_FLOORS = 64
 #: from the frame header itself (see ``mp3_frame_size``).
 FRAME_HINT = 576
 
+#: The largest MPEG audio frame that can exist, in bytes: MPEG-2/2.5 Layer II
+#: at 160 kbit/s and 8 kHz is ``144 * 160000 / 8000`` = 2880. Layer III is
+#: smaller (1440) and Layer I smaller still.
+MAX_MP3_FRAME_BYTES = 2880
+
+#: The largest ADTS frame, from the 13-bit length field in the header.
+MAX_ADTS_FRAME_BYTES = 8191
+
+#: How much audio the frame-grid search may hold back while it is still
+#: looking for a frame *pair*.
+#:
+#: **Two** maximum-size frames, because a frame is only *certain* when its
+#: successor is a frame too: a lone sync word occurs by chance inside every
+#: other frame's payload, so the search needs a frame *pair*. With one frame
+#: of headroom the search would give up before it could possibly succeed.
+#:
+#: The old budget was ``4 * FRAME_HINT`` = 2304 bytes - a number taken from
+#: the *MP3* frame size and applied to every format. That is smaller than a
+#: single maximum-size ADTS frame, so a high-bitrate AAC stream could never
+#: be aligned at all: the search was always given up on before a frame pair
+#: could fit.
+ALIGN_SEARCH_BUDGET = {
+    "mp3": 2 * MAX_MP3_FRAME_BYTES,
+    "adts": 2 * MAX_ADTS_FRAME_BYTES,
+}
+
+#: How much audio the search examines before it is willing to say "this is
+#: not this format at all".
+#:
+#: A stream with no sync word anywhere in it is not MP3 (or not ADTS) - but
+#: that verdict is only worth anything if enough bytes have been looked at.
+#: The old code decided on the *first* chunk, which was as little as 578
+#: bytes, and a stream that opens with a short preamble - a few hundred
+#: bytes of something else before the first frame - was then declared "not
+#: MP3" for ever, and was never aligned at all.
+#:
+#: A kilobyte is enough to be conclusive (a real frame starts within the
+#: first frame's worth of bytes) and small enough that the delay is
+#: invisible: 1024 bytes is 43 ms of a 192 kbit/s stream.
+NO_SYNC_VERDICT_BYTES = 1024
+
 
 class CapacityError(RuntimeError):
     """Too many concurrent pipelines; the caller should retry later."""
@@ -163,6 +204,12 @@ class StreamSession:
         #: Whether the MP3 frame grid has been located yet. ``None`` means "not
         #: looked yet"; ``False`` means "this is not MP3, pass it through".
         self._frame_grid: Optional[bool] = None
+        #: The format the frame grid was found for: ``"mp3"`` or ``"adts"``.
+        #: A pipeline restart can change the codec under the session - the
+        #: station failed over to a different source - and then the grid, the
+        #: frame size and the held-back bytes all belong to the *old* format.
+        #: See `_frame_aligned`.
+        self._grid_format: Optional[str] = None
         #: Size in bytes of the MP3 frame this stream uses (576 for the
         #: 192 kbit/s 48 kHz output this project produces), once it is known.
         #: ``None`` until the first frame is found.
@@ -490,6 +537,26 @@ class StreamSession:
             # We do not yet know what we are sending, so we cannot align it.
             # The first bytes go out as they are.
             return chunk
+        if self._grid_format is not None and self._grid_format != fmt:
+            # The codec changed under us: a pipeline restart, and the station
+            # failed over to a source with a different codec.
+            #
+            # Everything we know about the frame grid belongs to the *old*
+            # format: the frame size, the grid itself, and - worst of all -
+            # the bytes held back for a frame that is never going to
+            # complete. Keeping them means the new format is cut on the old
+            # format's boundaries, and a piece that starts mid-frame is
+            # exactly what makes a radio lose sync.
+            #
+            # Measured: with a stale MP3 grid and an ADTS stream arriving,
+            # the session delivered **zero** bytes - the radio went silent.
+            log.info(
+                "the output format changed from %s to %s; the frame grid is reset",
+                self._grid_format,
+                fmt,
+                extra={"session": self.id},
+            )
+            self._reset_frame_grid()
         if self._frame_grid is None:
             # The first audio we see: find where a frame starts. Only the
             # leading partial frame is dropped - the radio would have discarded
@@ -514,7 +581,27 @@ class StreamSession:
                 # for no reason, and a stream that is *not* in this format
                 # must be passed through untouched anyway (aligning it to a
                 # guessed grid would throw audio away for nothing).
+                #
+                # The "anywhere" has to mean *anywhere in the buffer we have
+                # held*, not just in the first 4096 bytes: a stream that
+                # starts with a few hundred bytes of something else - a
+                # station's own preamble, a synchronisation marker - would
+                # otherwise be declared "not MP3" forever, and the alignment
+                # would never happen even though the stream is MP3.
+                #
+                # But the verdict needs *evidence*, so it is only given once
+                # enough bytes have been examined. Deciding on the first
+                # chunk - as little as 578 bytes - was how a stream with a
+                # short preamble was thrown away.
                 if not self._has_sync(pending, fmt):
+                    if len(self._align_pending) < NO_SYNC_VERDICT_BYTES:
+                        # Not enough bytes to be sure yet. Keep them and look
+                        # again once there are more. The bound is small
+                        # (43 ms of a 192 kbit/s stream) so the audio is not
+                        # held back for long.
+                        return b""
+                    # Enough bytes, and not one sync word in any of them:
+                    # this really is not this format.
                     self._frame_grid = False
                     out = bytes(self._align_pending)
                     self._align_pending.clear()
@@ -522,7 +609,8 @@ class StreamSession:
                 # There IS a sync byte, so it probably is this format but the
                 # frame pair is not complete yet. Keep the bytes and try again
                 # with the next chunk.
-                if len(self._align_pending) > 4 * FRAME_HINT:
+                budget = ALIGN_SEARCH_BUDGET.get(fmt, 4 * FRAME_HINT)
+                if len(self._align_pending) > budget:
                     # A lot of bytes and still no frame: give up on the grid
                     # rather than stall the audio indefinitely.
                     self._frame_grid = False
@@ -531,6 +619,7 @@ class StreamSession:
                     return out
                 return b""
             self._frame_grid = True
+            self._grid_format = fmt
             self._frame_size = self._frame_size_at(pending, offset, fmt)
             # Drop everything before the boundary, and keep the rest.
             chunk = bytes(self._align_pending[offset:])
@@ -554,19 +643,60 @@ class StreamSession:
         self._align_pending = bytearray(data[cut:])
         return out
 
+    def _reset_frame_grid(self) -> None:
+        """Forget everything known about the frame grid.
+
+        Used when the output format changes under the session. Three things
+        belong to the *old* format and must not be carried over:
+
+        * the frame size and the grid itself;
+        * the bytes held back for a frame that is never going to complete -
+          they are the tail of a frame in the old format, and a radio
+          decoding the new format would find them to be garbage in front of
+          its first frame;
+        * the bytes waiting in the re-chunking buffer, which have already
+          been through the old format's frame alignment.
+
+        The last two are dropped rather than handed over. The radio
+        resynchronises on the new format's first frame, which is what it
+        does anyway when a stream changes codec - and the alternative, a
+        piece that begins with the old format's bytes, is a piece that
+        begins mid-frame in the new one.
+        """
+        self._align_pending.clear()
+        self._pending.clear()
+        self._frame_grid = None
+        self._grid_format = None
+        self._frame_size = None
+
     @staticmethod
     def _align_offset(data: bytes, fmt: str) -> Optional[int]:
-        """Offset of the first frame of *fmt* in *data*, or ``None``."""
+        """Offset of the first frame of *fmt* in *data*, or ``None``.
+
+        The whole buffer is searched, not just its first 8192 bytes. The
+        buffer is bounded by the search budget, and a stream whose first
+        frame is further in than 8 KB - a station that opens with a long
+        preamble, a synchronisation marker - would otherwise never be
+        aligned at all.
+        """
         if fmt == "mp3":
-            return mp3_align_offset(data)
-        return adts_align_offset(data)
+            return mp3_align_offset(data, window=len(data))
+        return adts_align_offset(data, window=len(data))
 
     @staticmethod
     def _has_sync(data: bytes, fmt: str) -> bool:
-        """True if *data* contains anything that looks like a frame of *fmt*."""
+        """True if *data* contains anything that looks like a frame of *fmt*.
+
+        The whole buffer is examined, not just its first few kilobytes. The
+        buffer is bounded anyway - it is the alignment search's holding
+        area, and it never grows past the search budget - so scanning all
+        of it is cheap, and it is what makes the "this is not MP3" decision
+        safe: a stream that begins with a few hundred bytes of something
+        else is still recognised as MP3 once its first frame arrives.
+        """
         if fmt == "mp3":
-            return mp3_has_sync(data)
-        return adts_has_sync(data)
+            return mp3_has_sync(data, window=len(data))
+        return adts_has_sync(data, window=len(data))
 
     @staticmethod
     def _frame_size_at(data: bytes, offset: int, fmt: str) -> Optional[int]:
@@ -787,31 +917,31 @@ class StreamSession:
         second - would be held back and discarded, which is audible as a clipped
         ending when a station fails over or a session is closed.
 
-        The tail is padded out to a whole number of frames when the stream is
-        MP3, so the listener's last piece is still frame-aligned. Padding is
-        silence (an MP3 frame of zeroes decodes to silence), and it is at most
-        one frame - 24 ms - which is far less than the clipped ending this
-        replaces.
+        The tail is sent **as it is**. It is not trimmed to a multiple of the
+        frame length, because the frame length is not the same for every
+        frame: MP3 frames alternate between two sizes when the sample rate
+        needs a padding byte, and ADTS frames are variable-length by
+        definition. Trimming by the *first* frame's length would delete a
+        legitimate byte from the end of the stream - for two 192 kbit/s
+        44.1 kHz frames of 626 and 627 bytes, ``1253 % 626`` is 1, so one
+        valid byte would be dropped.
+
+        Anything still in `_align_pending` is a genuinely *incomplete* frame
+        - the tail of a frame whose header was seen but whose body was not
+        - and is dropped, because a partial frame is not decodable.
         """
+        if self._align_pending:
+            # A partial frame: not decodable, and the stream is ending.
+            log.debug(
+                "dropping %d bytes of partial frame at end of stream",
+                len(self._align_pending),
+                extra={"session": self.id},
+            )
+            self._align_pending.clear()
         if not self._pending:
             return
         tail = bytes(self._pending)
         self._pending.clear()
-        frame = self._frame_size
-        if frame and self._frame_grid:
-            remainder = len(tail) % frame
-            if remainder:
-                # Zero-fill the last frame. A frame header of zeros is not a
-                # valid frame, so the *next* thing the radio sees is still a
-                # frame boundary in the byte count - but the decoder would
-                # lose sync on the padding itself.
-                #
-                # So instead of padding, the partial frame is simply dropped:
-                # at most 575 bytes (24 ms) at the very end of a stream, and
-                # only when the stream is being closed.
-                tail = tail[: len(tail) - remainder]
-                if not tail:
-                    return
         self._enqueue(tail)
 
     # ------------------------------------------------------------------- run
@@ -862,6 +992,11 @@ class StreamSession:
                 # a silent jump between them - worse than a listener waiting out
                 # the restart, which is what it would otherwise do.
                 self._reserve.clear()
+                # The new pipeline may be sending a different codec - the
+                # station failed over while we slept - so the frame grid,
+                # the frame size and the held-back bytes all belong to the
+                # old stream and must not be carried over.
+                self._reset_frame_grid()
                 # Fresh pipeline: it may have failed over while we slept.
                 await self.pipeline.aclose()
                 self.pipeline = self._new_pipeline()
@@ -1006,6 +1141,18 @@ class SessionManager:
         codec = overrides.get("output_codec") or settings.output_codec
         return f"{primary_url}|{codec}|{bitrate}"
 
+    def _unique_key(self, primary_url: str, settings: Settings, overrides: Optional[dict]) -> str:
+        """A key that matches no other session, for an unshared stream.
+
+        ``share_sessions = false`` means every listener gets its own
+        pipeline, so two radios on the same station must not land on the
+        same session. The key is still derived from the station, so the
+        dashboard and the logs still show what it is - it just carries a
+        unique suffix so the registry never collides.
+        """
+        base = self.make_key(primary_url, settings, overrides)
+        return f"{base}|{uuid.uuid4().hex[:12]}"
+
     # ---------------------------------------------------------------- acquire
     async def subscribe(
         self,
@@ -1024,7 +1171,12 @@ class SessionManager:
         every pipeline slot is taken and no idle session can be evicted.
         """
         settings = settings or self.settings
-        key = self.make_key(primary_url, settings, overrides)
+        if settings.share_sessions:
+            key = self.make_key(primary_url, settings, overrides)
+        else:
+            # Every listener gets its own pipeline, so this one must not
+            # find an existing session for the same station.
+            key = self._unique_key(primary_url, settings, overrides)
 
         async with self._lock:
             session = self.sessions.get(key)

@@ -229,9 +229,24 @@ def build_command(settings: Settings, input_format: str, *, copy_audio: bool = F
 
     ``copy_audio`` performs a *remux only* (no re-encode) which is essentially
     free - used when the radio understands the source codec.
+
+    The output codec and the *copy* decision are separate questions, and
+    conflating them was a real bug: asking for ``output_codec="adts"`` used
+    to force ``-acodec copy`` for **every** source, so an MP3 source was
+    copied straight into an ADTS container. ffmpeg accepts the command and
+    then emits nothing usable: an ADTS muxer expects AAC frames and gets
+    MP3 ones, so the radio is sent silence.
+
+    So ``-acodec copy`` is only used when the source really is the codec
+    being asked for. An MP3 source going to an ADTS output is *encoded* to
+    AAC, which is the only way to produce a valid ADTS stream from MP3.
     """
     binary = locate_ffmpeg(settings.ffmpeg_path)
     fmt = INPUT_FORMATS.get(input_format)
+    want_adts = settings.output_codec == "adts"
+    # ``copy_audio`` means "the source is already what we are outputting".
+    # The caller decides that; the output codec alone must never imply it.
+    copying = copy_audio
 
     cmd: List[str] = [
         binary,
@@ -262,8 +277,16 @@ def build_command(settings: Settings, input_format: str, *, copy_audio: bool = F
 
     cmd += ["-vn", "-sn", "-dn", "-map", "0:a:0"]
 
-    if copy_audio or settings.output_codec == "adts":
+    if copying:
         cmd += ["-acodec", "copy"]
+    elif want_adts:
+        # The source is not AAC, so it has to be *encoded* to AAC. Copying
+        # an MP3 into an ADTS container produces a stream no radio can
+        # decode. ffmpeg's native "aac" encoder is in every build, including
+        # the bundled wheel; libfdk_aac is not, and is not needed.
+        cmd += ["-acodec", "aac", "-b:a", str(settings.bitrate)]
+        if settings.channels:
+            cmd += ["-ac", str(settings.channels)]
     else:
         # libmp3lame is present in the bundled wheel and in every distro build.
         encoder = "libmp3lame" if "libmp3lame" in encoders(settings.ffmpeg_path) else "mp3"
@@ -274,7 +297,7 @@ def build_command(settings: Settings, input_format: str, *, copy_audio: bool = F
     if settings.ffmpeg_output_args:
         cmd += settings.ffmpeg_output_args.split()
 
-    container = "adts" if (copy_audio or settings.output_codec == "adts") else "mp3"
+    container = "adts" if want_adts else "mp3"
     if container == "mp3":
         # No ID3v2 tag in the MP3 output.
         #

@@ -3,6 +3,122 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.2] - 2026-10-21
+
+Hardening release. Eleven defects found by an external review of the 2.2.x
+work, each reproduced before it was fixed and each now covered by a
+regression test that fails against the old code.
+
+Two of them were in the code that 2.2.1 shipped, and one of those was
+audible: a station whose title uses a typographic apostrophe had its
+metadata truncated at the apostrophe.
+
+### Fixed
+
+- **A title with a typographic apostrophe no longer truncates the
+  metadata.** `It’s a Sin` was sent as `It's a Sin` - with an **ASCII**
+  quote, which is the delimiter of the `StreamTitle='...'` value. The radio
+  read the value as `It` and treated the rest as junk. The sanitiser mapped
+  the curly quotes to ASCII ones, undoing the very rule it exists to
+  enforce. The typographic quotes are now mapped to the acute accent, and
+  the ASCII-quote replacement is applied **last**, so no substitution can
+  put one back.
+
+- **The end of a stream is no longer trimmed to a frame multiple.** The
+  tail was cut to a whole number of the *first* frame's length, which is
+  wrong twice over: MP3 frames alternate between two sizes when the sample
+  rate needs a padding byte, and ADTS frames are variable-length by
+  definition. For two 44.1 kHz frames of 626 and 627 bytes, `1253 % 626`
+  is 1 - so one valid byte was deleted from the end of every stream.
+
+- **A station that changes codec no longer goes silent.** A pipeline
+  restart can bring up a source with a different codec, and everything the
+  session knew about the frame grid - the frame size, the grid, and the
+  bytes held back for a frame that would never complete - belonged to the
+  *old* format. With a stale grid the session delivered **zero** bytes: the
+  radio went quiet and stayed quiet. The grid is now reset when the format
+  changes, and the old format's bytes are dropped rather than handed over
+  as garbage in front of the new format's first frame.
+
+- **An MP3 source asked for as ADTS is now encoded, not copied.** The
+  output codec and the *copy* decision were the same flag, so
+  `output_codec = "adts"` forced `-acodec copy` for every source. An MP3
+  source was copied straight into an ADTS container, which ffmpeg accepts
+  and then fills with nothing a radio can decode:
+
+  ```
+  [adts @ 0x15a004480] adts muxer supports only codec aac for type audio
+  [out#0/adts @ 0x15a00f900] Could not write header (incorrect codec parameters ?)
+  ```
+
+  Measured: **0 bytes** of output before, a valid 73 KB ADTS stream after.
+
+- **The MPEG-TS demuxer no longer grows without bound.** The PSI section
+  assembler kept the `0xFF` stuffing bytes that pad a PAT packet, so the
+  buffer grew by a whole packet on every packet - measured at 171, 359,
+  547, 735, 923 bytes over five packets - and the section was never found
+  again. The assembler is now told whether the payload starts a section
+  (the pointer field only exists when the PUSI bit is set) and discards
+  the stuffing.
+
+- **A declared discontinuity is now read from where it actually is.** The
+  MPEG-TS `discontinuity_indicator` lives in the **adaptation field**, at
+  `packet[5] & 0x80`. The code read the packet header's
+  `adaptation_field_control` instead, which says *whether* an adaptation
+  field is present, never whether there is a discontinuity. A stream that
+  was cut and rejoined was therefore counted as a silent gap. A
+  retransmitted packet - the same counter again - is now recognised as a
+  duplicate rather than a gap, and does not tear down the PES packet.
+
+- **A byte-range request is now checked.** A `Range` request answered with
+  `200 OK` and the whole file is not an answer to the question: accepting
+  it splices the beginning of the file into the middle of the stream. The
+  response must now be a `206` with a `Content-Range`, and the body must
+  be exactly as long as the range says.
+
+- **A stream that opens with a preamble is still aligned.** The "is this
+  MP3 at all?" test looked only at the first 4096 bytes, and the verdict
+  was taken on the *first* chunk - as little as 578 bytes. A station that
+  opens with a few hundred bytes of something else was declared "not MP3"
+  for ever and was never aligned, even though it was MP3. The verdict now
+  waits for 1 KB of evidence.
+
+- **A large ADTS stream can be aligned at all.** The search budget was
+  `4 * FRAME_HINT` = 2304 bytes, a number taken from the *MP3* frame size
+  and applied to every format. An ADTS frame can be up to 8191 bytes, so
+  two of them do not fit - and the search was given up on before a frame
+  *pair* could ever be found. The budget is now per-format: two
+  maximum-size frames of the format being searched for.
+
+- **`share_sessions = false` now does what it says.** The setting was
+  declared, configurable and never read: every radio on a station shared
+  one upstream pipeline whatever the setting said.
+
+- **A stream that is not the format we expected is still handed over.**
+  The search gives up on a stream with no sync word in 1 KB of audio
+  rather than buffering it, and hands it over untouched.
+
+### Changed
+
+- The 2.2.1 release note claimed that a metadata block landing mid-frame
+  "necessarily desynchronises the ICY byte counter". That is too strong:
+  the metaint counts *audio* bytes, and a block may legally land in the
+  middle of a frame. Measured on a live capture, **36 of 40** blocks did
+  split a frame, and the reassembled audio was byte-identical. The fault
+  was the **anchor mismatch** - the server's grid starts at byte 0 of the
+  response, the radio's at its first decoded frame - not the block
+  boundary itself. The note has been corrected.
+
+### Testing
+
+- Twenty-one new regression tests, each verified to **fail against the
+  code it guards** and pass against the fix. A test that passes both ways
+  guards nothing.
+- The four CI gates pass: `ruff format --check`, `ruff check`, `ty check`
+  and 401 tests.
+- The guard scripts were re-run: 25 playback, 20 web and 7 container
+  defects, all still caught.
+
 ## [2.2.1] - 2026-10-20
 
 Garbled-title release: the radio's display no longer turns to binary noise
@@ -35,6 +151,15 @@ because the audio it is sent starts in the middle of an MP3 frame.
   The offset is a **constant**, so it does not heal. It stays garbled for the
   life of the connection and clears only when the radio reconnects and
   re-anchors - exactly as reported.
+
+  Note on the mechanism: the metaint counts *audio* bytes, and a metadata
+  block may legally land in the middle of a frame - 36 of the 40 blocks on a
+  live capture did, and the reassembled audio was byte-identical. So the
+  block boundary itself is not the fault. The fault is the **anchor
+  mismatch**: the server's grid starts at byte 0 of the response, and the
+  radio's starts at its first decoded frame. When those two agree, a
+  mid-frame block is harmless; when they differ by a constant, every block
+  the radio reads lands in the wrong place.
 
   The audio is now aligned where it is produced: the frame grid is found once
   (by parsing the frame header, not by guessing), and every piece is cut on a
