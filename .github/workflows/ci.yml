@@ -62,30 +62,40 @@ jobs:
           # looked like it covered four versions and covered one.
           python-version: ${{ matrix.python }}
       - name: Install ffmpeg
-        # Every network call is bounded. Plain `apt-get update && apt-get
-        # install` can wait forever on a stalled mirror or on the dpkg lock that
-        # the runner's unattended-upgrades service holds, and an unbounded step
-        # wedges the whole job: runs 39802019682 and 39804942257 were both
-        # killed that way, in both cases *only* the matrix entries that were
-        # still on this step (3.9/3.11/3.13 and 3.9/3.13 respectively) - the
-        # ones that had got past it all passed. `timeout-minutes` turns a stall
-        # into a red step in 10 minutes instead of a 20-minute hang, so the
-        # answer is "re-run the job" rather than "the release cannot be
-        # verified".
-        timeout-minutes: 10
+        # Unbounded apt hangs. On run 39808595539 all four matrix jobs fetched
+        # the same 62.8 MB of archives and then sat on one 9 MB file
+        # (`libcodec2-1.2`) for the rest of the step without a single byte
+        # arriving - azure.archive.ubuntu.com stalls mid-transfer and apt never
+        # times out, so the whole job wedges. Two earlier runs were cancelled
+        # the same way (39802019682 and 39804942257), and in every case the
+        # matrix entries that had already got past this step passed, so the red
+        # light was never about the code.
+        #
+        # `Acquire::http::Timeout` alone does not help, because apt's retries
+        # restart the same stalled transfer. What does work is bounding the
+        # whole install and re-running it: apt keeps fetched archives in
+        # /var/cache/apt/archives, so each attempt resumes instead of starting
+        # over and the set of remaining packages shrinks. SIGINT, not SIGKILL,
+        # so apt releases the dpkg lock on the way out.
+        timeout-minutes: 20
         run: |
           set -euo pipefail
-          # Stop the service that grabs the dpkg lock on these images. `|| true`
-          # because it is absent on some runner revisions.
+          # Grab the dpkg lock first on images where unattended-upgrades holds
+          # it mid-transaction. `|| true` because it is absent on some runner
+          # revisions.
           sudo systemctl stop unattended-upgrades.service 2>/dev/null || true
-          sudo apt-get update \
-            -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=30 \
-            -o Acquire::https::Timeout=30
-          sudo apt-get install -y --no-install-recommends \
-            -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=30 \
-            ffmpeg
+          opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          sudo apt-get update "${opts[@]}"
+          for attempt in 1 2 3 4 5; do
+            if sudo timeout --signal=INT 240 \
+                apt-get install -y --no-install-recommends "${opts[@]}" ffmpeg; then
+              ffmpeg -version | head -1
+              exit 0
+            fi
+            echo "::warning::apt-get install attempt ${attempt} stalled or failed; retrying"
+          done
+          echo "::error::could not install ffmpeg after 5 attempts"
+          exit 1
       - name: Install
         run: uv sync --locked
       - name: Test
