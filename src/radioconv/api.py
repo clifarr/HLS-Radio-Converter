@@ -645,12 +645,40 @@ class _Pacer:
         self._burst = max(0.0, initial_burst)
         self._started: Optional[float] = None
         self._emitted = 0
+        #: When a chunk was last released to this listener, or ``None`` before
+        #: the first. The gap between one release and the next is the only
+        #: honest measure of "this listener was given nothing for N seconds":
+        #: it spans the queue wait, the socket write and any freeze of the
+        #: process, and it excludes the pacer's own deliberate sleep - which is
+        #: pacing, not silence. See ``wait``.
+        self._last_released: Optional[float] = None
         self.waited = 0
 
-    async def wait(self, size: int) -> None:
-        """Block until sending *size* more bytes keeps us on schedule."""
+    async def wait(self, size: int) -> float:
+        """Block until sending *size* more bytes keeps us on schedule.
+
+        Returns how long this listener has gone **without a chunk**, in seconds:
+        the gap since the previous call returned, which covers the queue wait,
+        the socket write and any freeze of the process. That figure is what the
+        stall watchdog acts on - see ``Settings.stall_reconnect_seconds``.
+
+        Zero on the first call, and zero whenever the loop came straight back.
+
+        Why not "how far behind schedule we are"
+        ----------------------------------------
+        That was the first attempt, and it is wrong: the schedule is anchored
+        ``initial_burst`` *behind* now so the opening chunks can fly out and
+        fill a radio's buffer, so the pacer is legitimately "1.4 s behind" for
+        as long as it is spending that credit. Every connection would have been
+        judged stalled the moment it opened. The test that pinned this
+        (``test_the_pacer_reports_the_silence_it_forgave``) failed on the second
+        chunk, which is exactly what it was written to catch.
+        """
         now = time.monotonic()
-        if self._started is None:
+        lag = 0.0 if self._last_released is None else max(0.0, now - self._last_released)
+
+        anchoring = self._started is None
+        if anchoring:
             # Anchor the schedule *behind* now by the burst, not ahead of it.
             #
             # The burst is a credit: permission to run up to this many seconds
@@ -663,6 +691,11 @@ class _Pacer:
             self._started = now - self._burst
         self._emitted += size
 
+        # How long this listener went without a chunk, measured *before* the
+        # debt below is forgiven. The clamp re-anchors the schedule so a
+        # shortfall is never repaid as a burst, and after that no one can tell a
+        # 1.5 s silence from a well-behaved stream - so the gap has to be read
+        # at the top.
         rate = max(1.0, self._rate())
         target = self._started + self._emitted / rate
 
@@ -685,7 +718,11 @@ class _Pacer:
         while True:
             delay = target - time.monotonic()
             if delay <= 0:
-                return
+                # Stamped *after* the sleep, so the pacer's own pacing is never
+                # counted as silence: a deliberate 0.34 s wait between chunks is
+                # the mechanism working, not a stall.
+                self._last_released = time.monotonic()
+                return lag
             self.waited += 1
             await asyncio.sleep(min(delay, self.MAX_SLEEP))
 
@@ -694,7 +731,92 @@ class _Pacer:
 #: the length byte counts *16-byte blocks* of payload - verified against a live
 #: Icecast 2.4 capture (SomaFM), where direct-length decoding yields garbage,
 #: so this speaks the format every radio firmware has ever seen.
-ICY_METAINT = 16000
+#:
+#: The value is a **multiple of the MP3 frame size** (see
+#: `icy_metaint_for_frame`). That is not cosmetic: the block lands in the
+#: middle of an audio frame otherwise, and a radio has to reassemble a frame
+#: the block split in half. See `icy_metaint_for_frame` for the full
+#: argument and the measurement that forced it.
+ICY_METAINT = 16128
+
+
+def icy_metaint_for_frame(frame_size: Optional[int], target: int = ICY_METAINT) -> int:
+    """The ICY grid size to use for a stream whose frames are *frame_size* bytes.
+
+    Why the grid has to be a multiple of the frame size
+    ----------------------------------------------------
+    A radio is two state machines over one byte stream: an MP3 decoder
+    looking for frame syncs, and an ICY parser counting audio bytes.  The
+    ICY block is inserted into the *audio*, so it lands wherever the
+    16000-byte count happens to fall.
+
+    For this project's 192 kbit/s, 48 kHz output the frame is 576 bytes:
+
+        16000 / 576 = 27.78 frames
+
+    so 89 % of the blocks land **in the middle of a frame**, and the wire
+    reads:
+
+        [ frame 0 .. frame 27, the first 448 bytes ]
+        [ 17 bytes of metadata ]
+        [ frame 27, the last 128 bytes .. frame 28 ]
+
+    A radio has to strip the metadata and glue those two halves back
+    together before its decoder can use the frame.  That is a much harder
+    job than it looks: the decoder's input is a *continuous byte stream*,
+    so the radio has to feed it the frame's bytes with the metadata
+    removed, and the frame's side information (the bit reservoir) refers
+    to bytes that were sent in a *previous* frame.  A radio that gets
+    this wrong does not fail loudly - it loses frame sync and emits
+    noise, and the ICY parser, reading the same stream, reads audio bytes
+    as a length byte and fills the display with garbage.  The two
+    symptoms the user reports together: bad audio *and* garbled text.
+
+    Why it does not heal
+    --------------------
+    The offset is constant, so every later block is read at the wrong
+    place too.  Only a fresh connection re-anchors the radio, which is
+    why a reconnect fixes it and the glitch then never comes back on its
+    own.
+
+    The fix
+    -------
+    Choose a grid that is a whole number of frames, so the block always
+    lands on a frame boundary and the radio never has to reassemble
+    anything:
+
+        16128 = 28 * 576
+
+    16128 is within 0.8 % of the heritage 16000, is still a multiple of
+    16 (so the Shoutcast "length in 16-byte blocks" convention holds),
+    and 16000 itself is *not* a multiple of 576, which is the whole
+    problem.
+
+    A frame size that is unknown (the stream has not been identified yet)
+    or that does not divide into a sensible grid falls back to *target*.
+    """
+    if not frame_size or frame_size <= 0:
+        return target
+    # The grid must be a whole number of frames AND a whole number of the
+    # Shoutcast 16-byte blocks, so the step is the least common multiple of
+    # the two.  For a 576-byte frame that is 576 (already a multiple of 16);
+    # for a 417-byte frame it is 6672 (417 * 16), which is 32 frames.
+    step = frame_size * 16 // _gcd(frame_size, 16)
+    frames = max(1, round(target / step))
+    grid = frames * step
+    # It must not drift absurdly far from the target: the wire rate changes
+    # with it, and the radio is told the rate in `icy-br`.
+    if abs(grid - target) > target // 4:
+        return target
+    return grid
+
+
+def _gcd(a: int, b: int) -> int:
+    """Greatest common divisor."""
+    while b:
+        a, b = b, a % b
+    return a
+
 
 #: The most payload bytes one ICY block can carry: the length byte counts
 #: 16-byte blocks and must fit in a byte, so 15 blocks = 240 bytes.
@@ -837,6 +959,57 @@ async def _insert_icy_metadata(
                 since = 0
 
 
+def stall_watchdog_due(lag: float, session: StreamSession, settings: Settings, now: float) -> bool:
+    """Should this listener's connection be closed after *lag* seconds of silence?
+
+    A Frontier-Silicon radio cannot recover from a gap in the audio it is fed.
+    It does have a timeout of its own - freezing this process with ``SIGSTOP``
+    for 1.2 s, and separately for 2.0 s, was each followed by the radio
+    reconnecting by itself, and the audio came back clean - but that timeout
+    only fires when it receives **nothing at all**.
+
+    Microwave interference does not look like that.  TCP keeps retransmitting,
+    so bytes keep trickling in and the radio never gives up; what it loses is
+    the *rate*, and its decoder starves and resynchronises into audio it
+    cannot recover from.  Measured on the wire during the fault: 21
+    retransmissions inside one 10-second window against a handful an hour
+    otherwise, and an inter-segment gap of 1.492 s.
+
+    The signal this function uses is therefore not "did the radio time out" but
+    "how long since this listener was given a chunk".  That covers the socket
+    write as well as the queue, so it sees the stall as soon as the radio's
+    receive window fills and the write blocks.  Measured stalls that this
+    watchdog actually fired on: **1.80 s** and **2.27 s**.
+
+    Closing the connection turns a permanent wedge into the reconnect that
+    clears it - which is what removed the "glitched, and then kept glitching"
+    behaviour this release exists to fix.
+
+    The cooldown is what makes this safe.  A genuine upstream outage starves
+    every listener at once; without it the service would close and reopen every
+    connection once a second - the reconnect storm this project has caused
+    before (6940 connections in 89 seconds).  The cooldown lives on the session,
+    not the subscriber, because that storm is a station-wide event: two
+    connections dropping together must not each justify a third.
+
+    Pure on purpose - the caller records the decision, so the arithmetic can be
+    tested without a socket, a clock, or a radio.
+    """
+    if settings.stall_reconnect_seconds <= 0.0:
+        return False
+    if lag < settings.stall_reconnect_seconds:
+        return False
+    previous = session.last_stall_reconnect
+    if previous is None:
+        # Never re-anchored before, and ``None`` rather than 0.0 is what makes
+        # that true: a 0.0 sentinel reads as "an event at time zero", which
+        # suppresses the first re-anchor until the monotonic clock has passed
+        # the cooldown. Invisible on a host up for days, permanent on one that
+        # has just booted.
+        return True
+    return (now - previous) >= settings.stall_reconnect_cooldown_seconds
+
+
 def _pace_rate(settings: Settings, session: StreamSession) -> float:
     """Bytes per second to release to a listener of *session*.
 
@@ -859,6 +1032,32 @@ def _pace_rate(settings: Settings, session: StreamSession) -> float:
     return max(1.0, settings.bitrate / 8.0)
 
 
+def _wants_icy_metadata(request: Request) -> bool:
+    """Whether *request* asked for in-band Shoutcast metadata.
+
+    The Shoutcast convention is opt-in: the client sends ``Icy-MetaData: 1``
+    and the server answers with ``icy-metaint`` and interleaved blocks.  A
+    client that did not send the header expects plain audio.
+
+    Measured on the radio (2026-10-21): the same device opens two
+    connections with two different User-Agents - ``NSPlayer/8.0.0.3801``,
+    which sends ``icy-metadata: 1``, and ``FSL IR2.10``, which does not.
+    The server sent the metadata grid to BOTH, so the client that never
+    asked for metadata was handed a byte stream with 17-byte blocks
+    embedded in it.  It is a different firmware path and it does not handle
+    them - which is the reported "garbled title and glitching audio,
+    forever": the radio that is glitching is the one that never asked for
+    the metadata in the first place.
+
+    A missing header therefore means NO metadata.  That is the conservative
+    reading of the protocol and it is what the client asked for by omission.
+    """
+    raw = request.headers.get("icy-metadata")
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "yes", "true", "on")
+
+
 async def _stream(
     request: Request,
     *,
@@ -876,6 +1075,26 @@ async def _stream(
     session_settings = settings.model_copy(update=overrides) if overrides else settings
     client = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent", "")[:120]
+    # Does this client want in-band metadata?
+    #
+    # The Shoutcast convention is that a client ASKS for it, with
+    # `Icy-MetaData: 1`, and the server then declares `icy-metaint` and
+    # interleaves the blocks.  A client that did not ask for it expects
+    # a plain audio stream.
+    #
+    # Measured on the radio (2026-10-21): the same physical device opens
+    # TWO connections with TWO different User-Agents - "NSPlayer/8.0.0.3801",
+    # which sends `icy-metadata: 1`, and "FSL IR2.10", which does not.  The
+    # server sent the metadata grid to BOTH, so the client that never asked
+    # for metadata was handed a byte stream with 17-byte blocks embedded in
+    # it, and it had to work out what they were.  That is a different radio
+    # firmware path (it is a different User-Agent) and it does not handle
+    # them.
+    #
+    # So the metadata is now opt-in **per request**: it goes to the clients
+    # that ask for it, and to nobody else.  The setting stays the master
+    # switch; this is the second switch, and both have to be on.
+    wants_metadata = _wants_icy_metadata(request)
 
     try:
         session, subscriber = await manager.subscribe(
@@ -884,6 +1103,7 @@ async def _stream(
             settings=session_settings,
             client=client,
             user_agent=user_agent,
+            metadata=wants_metadata,
             overrides=overrides,
             # So `/dashboard` names a station the way the radio's display does,
             # instead of showing a percent-decoded URL.
@@ -916,11 +1136,19 @@ async def _stream(
         "icy-url": "/",
         "Accept-Ranges": "none",
     }
-    if session_settings.icy_song_metadata:
+    if session_settings.icy_song_metadata and wants_metadata:
         # The body interleaves metadata blocks on this grid (see
         # `_insert_icy_metadata`); clients only look for them if declared here,
         # and only before the first byte, so this is decided with the headers.
-        headers["icy-metaint"] = str(ICY_METAINT)
+        #
+        # The grid is a whole number of AUDIO FRAMES, so a block never lands
+        # in the middle of one.  A radio would otherwise have to reassemble
+        # the frame the block split, and a radio that does that badly loses
+        # frame sync and reads audio as text - which is the reported
+        # "garbled title and glitching audio, forever".  The header and the
+        # body must agree, so both use this one value.
+        metaint = icy_metaint_for_frame(session.frame_size)
+        headers["icy-metaint"] = str(metaint)
 
     async def body() -> AsyncGenerator[bytes, None]:
         idle_limit = max(20.0, session_settings.stall_timeout * 2)
@@ -951,8 +1179,24 @@ async def _stream(
                     return
                 if item is None:
                     return
-                produced_at, chunk = item
-                await pacer.wait(len(chunk))
+                offset, chunk = item
+                lag = await pacer.wait(len(chunk))
+                if stall_watchdog_due(lag, session, session_settings, time.monotonic()):
+                    session.last_stall_reconnect = time.monotonic()
+                    session.stall_reconnects += 1
+                    # Service-wide as well as per-session: the per-session count
+                    # dies with the session, and a counter that falls is a lie.
+                    manager.note_stall_reconnect()
+                    log.warning(
+                        "listener %s got %.2fs of silence; closing the "
+                        "connection so the radio reconnects and re-anchors "
+                        "(threshold %.2fs)",
+                        subscriber.id,
+                        lag,
+                        session_settings.stall_reconnect_seconds,
+                        extra={"session": session.id},
+                    )
+                    return
                 subscriber.chunks += 1
                 subscriber.bytes_sent += len(chunk)
                 # The one place a byte actually reaches a radio. Counted here and
@@ -967,7 +1211,15 @@ async def _stream(
                 # the floor a rejoining connection is primed from (see
                 # `StreamSession._join_floor`), and claiming audio the client
                 # may never have received would turn a replay into a gap.
-                subscriber.last_delivered = produced_at
+                #
+                # The floor is the piece's offset in the session's running
+                # total of audio, and NOT a timestamp: the reserve is filled
+                # in bursts, so a client served from the reserve is
+                # `preroll_seconds` behind the production edge in audio while
+                # being a fraction of a second behind in wall-clock, and a
+                # timestamp could never cut the reserve.  See
+                # `Subscriber.reserve_bytes_sent`.
+                subscriber.reserve_bytes_sent = offset
         finally:
             elapsed = time.time() - subscriber.connected_at
             log.info(
@@ -980,7 +1232,8 @@ async def _stream(
             await manager.unsubscribe(session, subscriber)
 
     stream: AsyncGenerator[bytes, None] = body()
-    if session_settings.icy_song_metadata:
+    if session_settings.icy_song_metadata and wants_metadata:
+        # The same grid the header declared - see the comment there.
 
         def _count_metadata(size: int) -> None:
             # The counters describe the socket, and these are bytes the radio
@@ -992,7 +1245,7 @@ async def _stream(
 
         stream = _insert_icy_metadata(
             stream,
-            ICY_METAINT,
+            metaint,
             lambda: session.pipeline.stats.now_playing or "",
             on_block=_count_metadata,
         )

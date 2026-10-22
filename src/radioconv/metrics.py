@@ -66,6 +66,13 @@ COUNTERS: Dict[str, str] = {
     "pipeline_failures_total": "Upstream fetch failures.",
     "pipeline_restarts_total": "Pipeline restarts, whether by failure or by watchdog.",
     "dropped_chunks_total": "Chunks discarded for a listener that fell behind.",
+    "stall_reconnects_total": (
+        "Listener connections closed by the stall watchdog so the radio reconnects."
+    ),
+    "retransmit_reconnects_total": (
+        "Listener connections closed after the OS reported a TCP retransmission "
+        "burst (Wi-Fi interference)."
+    ),
     "capacity_rejections_total": "Requests refused with 503 because the service was full.",
 }
 
@@ -131,6 +138,13 @@ def snapshot(manager: SessionManager, monitor: ResourceMonitor) -> Dict[str, Any
             "dropped_chunks_total": sum(
                 sub["dropped"] for d in details for sub in d["subscribers"]
             ),
+            # From the service-wide counter, NOT a sum over live sessions: a
+            # session is released once its listeners have been gone for
+            # `linger_seconds`, and summing made this figure fall from 1 back to
+            # 0 on the Pi when the station it belonged to went away. A counter
+            # that decreases breaks `rate()`.
+            "stall_reconnects_total": streams["stall_reconnects"],
+            "retransmit_reconnects_total": streams["retransmit_reconnects"],
             "capacity_rejections_total": streams["capacity_rejections"],
         },
         # The rolling window in full (totals, window length, how many samples it

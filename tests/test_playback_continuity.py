@@ -34,10 +34,17 @@ import pytest
 from conftest import ffmpeg_binary, has_ffmpeg
 
 from radioconv import ffmpeg as ffmpeg_mod
-from radioconv.api import ICY_METAINT, _insert_icy_metadata, _Pacer, icy_metadata_block
+from radioconv.api import (
+    ICY_METAINT,
+    _insert_icy_metadata,
+    _Pacer,
+    icy_metadata_block,
+    icy_metaint_for_frame,
+    stall_watchdog_due,
+)
 from radioconv.config import Settings
 from radioconv.pipeline import PipelineStats, StreamPipeline
-from radioconv.session import SessionManager
+from radioconv.session import SessionManager, StreamSession
 from radioconv.tsdemux import adts_align_offset, mp3_align_offset, mp3_frame_size
 
 #: A deliberately high rate so the pacing arithmetic is real but the tests run in
@@ -271,6 +278,147 @@ async def test_a_delay_beyond_the_sleep_cap_still_waits_for_its_deadline():
     )
 
 
+# --------------------------------------------------- the stall watchdog
+async def test_the_pacer_reports_the_silence_it_forgave():
+    """The watchdog needs the gap the pacer hides.
+
+    ``wait`` forgives a starvation debt so it is never repaid as a burst - which
+    is right - but that also erases the evidence that anything went wrong. It
+    returns the lag it measured *before* forgiving it, because that number is
+    the only record that the listener heard nothing for that long.
+
+    The anchoring call must return zero. Its schedule is deliberately placed
+    ``initial_burst`` behind now, so reporting a lag there would invent a stall
+    of exactly the burst length and close every connection as it opened.
+    """
+    pacer = _Pacer(lambda: FAST_RATE, initial_burst=1.5)
+    assert await pacer.wait(8192) == 0.0, (
+        "the anchoring call reported a stall: the initial-burst credit is being "
+        "read as a gap, which would close every connection the moment it opens"
+    )
+    for _ in range(5):
+        assert await pacer.wait(8192) < 0.05, "a pacer that is on time reported a lag"
+
+    await asyncio.sleep(0.4)
+    lag = await pacer.wait(8192)
+    assert 0.3 < lag < 2.0, (
+        f"a 0.4s silence was reported as {lag:.3f}s: the watchdog would not see a real stall"
+    )
+
+
+def _bare_session(**overrides) -> StreamSession:
+    """A session object with no pipeline, for the watchdog arithmetic only."""
+    s = settings(**overrides)
+    return StreamSession(s, "http://x/one.m3u8", ["http://x/one.m3u8"])
+
+
+def test_the_watchdog_fires_only_past_the_threshold():
+    """1.0 s is chosen to sit under the stalls actually measured.
+
+    The two stalls this watchdog fired on in the field were **1.80 s** and
+    **2.27 s** (journal, during microwave interference). A gap under a second
+    has to be tolerated, or ordinary jitter would close connections; anything
+    at or above a second has to fire, or the radio is left to wedge.
+    """
+    session = _bare_session()
+    s = settings()
+
+    assert not stall_watchdog_due(0.0, session, s, now=100.0), "fired with no gap"
+    assert not stall_watchdog_due(0.99, session, s, now=100.0), (
+        "fired below the threshold: ordinary jitter would close connections"
+    )
+    assert stall_watchdog_due(1.0, session, s, now=100.0), "did not fire at the threshold"
+    assert stall_watchdog_due(1.80, session, s, now=100.0), (
+        "did not fire on the smaller of the two stalls measured in the field "
+        "(1.80 s), which is the whole point of the threshold"
+    )
+    assert stall_watchdog_due(2.27, session, s, now=100.0), (
+        "did not fire on the larger measured stall (2.27 s)"
+    )
+
+
+def test_the_watchdog_can_be_turned_off():
+    session = _bare_session()
+    s = settings(stall_reconnect_seconds=0.0)
+    assert not stall_watchdog_due(60.0, session, s, now=100.0), (
+        "the watchdog fired with stall_reconnect_seconds = 0"
+    )
+
+
+def test_the_watchdog_respects_its_cooldown():
+    """A station-wide outage must not become a reconnect storm.
+
+    Without the cooldown, a starved station closes and reopens every connection
+    once a second, forever. This project has produced exactly that: 6940
+    connections in 89 seconds, from a different bug but the same shape.
+    """
+    session = _bare_session()
+    s = settings()
+    assert s.stall_reconnect_cooldown_seconds > 0.0, "a zero cooldown allows a storm"
+
+    session.last_stall_reconnect = 100.0
+    assert not stall_watchdog_due(5.0, session, s, now=100.5), (
+        "fired again half a second after closing a connection"
+    )
+    assert not stall_watchdog_due(
+        5.0, session, s, now=100.0 + s.stall_reconnect_cooldown_seconds - 0.1
+    ), "fired inside the cooldown window"
+    assert stall_watchdog_due(5.0, session, s, now=100.0 + s.stall_reconnect_cooldown_seconds), (
+        "never fired again after the cooldown expired"
+    )
+
+
+def test_the_watchdog_is_counted_and_reported():
+    """The event has to be visible, or nobody can tell it happened."""
+    session = _bare_session()
+    session.stall_reconnects = 3
+    assert session.as_dict()["session"]["stall_reconnects"] == 3, (
+        "the watchdog fired but the session does not report it"
+    )
+
+
+async def test_the_watchdog_total_never_falls():
+    """A Prometheus counter must be monotonic - observed going 1 then 0.
+
+    The first version summed the per-session counts over the live sessions. A
+    session is reaped once its radios have been gone for ``linger_seconds``, so
+    when the station the watchdog had acted on went away its contribution
+    vanished and the total dropped from 1 back to 0. Seen on the Pi during the
+    microwave test. A counter that decreases breaks ``rate()``, and it is also
+    simply untrue: the event did happen.
+    """
+    from radioconv.metrics import snapshot
+    from radioconv.monitor import ResourceMonitor
+
+    manager = SessionManager(settings())
+    await manager.start()
+    try:
+        monitor = ResourceMonitor(settings())
+        session, sub = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="NSPlayer/8.0.0.3801",
+        )
+
+        manager.note_stall_reconnect()
+        first = snapshot(manager, monitor)["counters"]["stall_reconnects_total"]
+        assert first == 1, "the watchdog count did not reach the metrics"
+
+        # The station goes away entirely, exactly as it does after a rejoin.
+        await manager.unsubscribe(session, sub)
+        manager.sessions.clear()
+
+        after = snapshot(manager, monitor)["counters"]["stall_reconnects_total"]
+        assert after >= first, (
+            f"stall_reconnects_total fell from {first} to {after} after the "
+            "session was reaped: it is being summed over live sessions instead "
+            "of kept as a service-wide counter"
+        )
+    finally:
+        await manager.aclose()
+
+
 # ------------------------------------------------------- ICY song metadata
 async def test_icy_metadata_blocks_land_on_the_audio_grid():
     """A block every `metaint` audio bytes; removing blocks restores the stream.
@@ -278,7 +426,7 @@ async def test_icy_metadata_blocks_land_on_the_audio_grid():
     The heritage Shoutcast grid - the length byte counts 16-byte payload
     blocks - pinned against a live Icecast capture.
     """
-    audio = b"\xff\xf1" * 8000  # exactly ICY_METAINT bytes = one grid window
+    audio = b"\xff\xf1" * (ICY_METAINT // 2)  # exactly ICY_METAINT bytes = one grid window
 
     async def chunks():
         yield audio[:9000]
@@ -320,6 +468,131 @@ async def test_icy_empty_title_still_keeps_the_grid():
     payload = bytes(out[ICY_METAINT + 1 : ICY_METAINT + 1 + blocks * 16])
     assert blocks == 1
     assert payload.split(b"\x00", 1)[0] == b"StreamTitle='';"
+
+
+# ------------------------------------------- the grid must not split a frame
+def test_icy_grid_is_a_whole_number_of_audio_frames():
+    """The metadata block must never land in the middle of an audio frame.
+
+    This is the defect that made the radio glitch forever.  A radio is two
+    state machines over one byte stream: an MP3 decoder looking for frame
+    syncs, and an ICY parser counting audio bytes.  The block is inserted
+    into the audio, so it lands wherever the grid count falls.
+
+    For the 192 kbit/s, 48 kHz output the frame is 576 bytes, and
+    16000 / 576 = 27.78 - so with the heritage 16000-byte grid, 89 % of the
+    blocks split a frame in half.  The radio then has to reassemble a frame
+    the block cut in two; a radio that gets that wrong loses frame sync and
+    reads audio as text, permanently, because the offset never changes.
+
+    So the grid has to be a whole number of frames.
+    """
+    assert ICY_METAINT % 576 == 0, (
+        f"the ICY grid ({ICY_METAINT}) is not a multiple of the 576-byte MP3 "
+        "frame, so a metadata block lands inside a frame"
+    )
+
+
+def test_icy_grid_is_a_whole_number_of_shoutcast_blocks():
+    """The length byte counts 16-byte payload blocks, so the grid stays a
+    multiple of 16 - otherwise the Shoutcast convention is broken."""
+    assert ICY_METAINT % 16 == 0
+
+
+def test_icy_metaint_for_frame_picks_a_whole_number_of_frames():
+    """`icy_metaint_for_frame` returns a grid that is a multiple of the frame."""
+    for frame_size in (576, 417, 313, 1440, 2880):
+        grid = icy_metaint_for_frame(frame_size)
+        assert grid % frame_size == 0, (
+            f"grid {grid} is not a multiple of the {frame_size}-byte frame"
+        )
+        assert grid % 16 == 0, f"grid {grid} is not a multiple of 16"
+
+
+def test_icy_metaint_for_frame_falls_back_when_the_frame_is_unknown():
+    """No frame size yet (the stream has not been identified): use the
+    configured grid rather than dividing by zero."""
+    assert icy_metaint_for_frame(None) == ICY_METAINT
+    assert icy_metaint_for_frame(0) == ICY_METAINT
+    assert icy_metaint_for_frame(-1) == ICY_METAINT
+
+
+def test_icy_metaint_for_frame_stays_close_to_the_target():
+    """The grid must not drift far from the heritage 16000: the wire rate
+    changes with it, and a radio is told the rate in `icy-br`."""
+    for frame_size in (576, 417, 313, 1440, 2880):
+        grid = icy_metaint_for_frame(frame_size)
+        assert abs(grid - 16000) <= 16000 // 4, (
+            f"grid {grid} for a {frame_size}-byte frame is too far from 16000"
+        )
+
+
+async def test_the_block_lands_on_a_frame_boundary_in_a_real_stream():
+    """End to end: a real 576-byte-frame stream, with the blocks inserted, must
+    still be a continuous chain of frames once the blocks are removed - and
+    the block must fall exactly on a frame boundary in the raw wire."""
+    # MPEG-1 Layer III, 192 kbit/s, 48 kHz: a 576-byte frame.
+    frame = bytes.fromhex("fffb9864") + b"\x00" * 572
+    frames = frame * 64  # 64 frames = 36864 bytes
+    assert len(frames) % 576 == 0
+    assert mp3_frame_size(frames, 0) == 576, "the test frame is not 576 bytes"
+
+    async def chunks():
+        yield frames[:20000]
+        yield frames[20000:]
+
+    metaint = icy_metaint_for_frame(576)
+    gen = _insert_icy_metadata(chunks(), metaint, lambda: "A Title")
+    out = bytearray()
+    async for piece in gen:
+        out.extend(piece)
+
+    # --- the block sits on a frame boundary in the AUDIO.
+    #
+    # The wire is: `metaint` audio bytes, then the length byte, then the
+    # payload, then `metaint` more audio bytes, and so on.  The stride
+    # between blocks on the wire is therefore `metaint + 1 + length*16`,
+    # because the block itself occupies wire bytes.
+    #
+    # What matters is the offset in the AUDIO, because that is what the
+    # radio's decoder sees once it has stripped the block: the audio
+    # before each block must be a whole number of frames, so the radio
+    # never has to reassemble a frame the block cut in half.
+    block_at = []
+    pos = metaint
+    while pos < len(out):
+        length = out[pos]
+        assert 0 < length <= 15, f"bad length byte {length} at {pos}"
+        block_at.append(pos)
+        pos += 1 + length * 16 + metaint
+    assert block_at, "no metadata block was inserted"
+
+    audio = bytearray()
+    pos = 0
+    audio_offset_of = []
+    for at in block_at:
+        audio += out[pos:at]
+        audio_offset_of.append(len(audio))
+        length = out[at]
+        pos = at + 1 + length * 16
+    audio += out[pos:]
+
+    for off in audio_offset_of:
+        assert off % 576 == 0, (
+            f"a block follows {off} audio bytes, which is {off % 576} bytes "
+            "into an MP3 frame - the radio would have to reassemble it"
+        )
+
+    # --- and the audio is still a continuous frame chain
+    assert len(audio) % 576 == 0
+    off = 0
+    count = 0
+    while off < len(audio):
+        size = mp3_frame_size(bytes(audio), off)
+        assert size == 576, f"frame at {off} is {size} bytes"
+        count += 1
+        off += size
+    assert count == len(audio) // 576
 
 
 # ------------------------------------------------- ICY titles a radio can read
@@ -459,7 +732,7 @@ async def test_icy_title_survives_a_song_change_on_the_grid():
     change must produce a well-formed block on the grid, and the audio must
     still reassemble exactly.
     """
-    audio = b"\xff\xf1" * 16000  # two grid windows
+    audio = b"\xff\xf1" * ICY_METAINT  # two grid windows
     titles = ["Sombr - back to friends", "Fool's Garden - Lemon Tree", "£ MINI COUNTRYMAN"]
 
     async def chunks():

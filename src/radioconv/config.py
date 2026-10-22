@@ -200,6 +200,83 @@ class Settings(BaseSettings):
     #: Seconds of audio released without delay at the start of a connection, so a
     #: radio can fill its own buffer before the steady drip begins.
     initial_burst_seconds: float = 1.5
+    #: Close a listener's connection when it has received **no audio for this
+    #: long**, so the radio reconnects and re-anchors its decoder. 0 disables it.
+    #:
+    #: Why this exists, and why the value is 1.0
+    #: -----------------------------------------
+    #: The stream itself is not at fault, which is worth recording here so it is
+    #: not re-investigated: during the fault the wire was measured perfect over
+    #: 39 connections and 3.5 hours - no gaps in the TCP byte stream, every MP3
+    #: frame intact, the ICY grid on its declared offset, and the radio
+    #: acknowledging every byte. The defect is that the radio's decoder cannot
+    #: recover from a gap in the audio it is fed, and only a new connection
+    #: clears it.
+    #:
+    #: The radio does have a timeout of its own: freezing the server with
+    #: ``SIGSTOP`` for 1.2 s, and separately for 2.0 s, was each followed by the
+    #: radio reconnecting by itself with the audio clean. But that timeout only
+    #: fires when it receives **nothing at all**. Microwave interference is not
+    #: like that - TCP retransmits, so bytes keep trickling in and the radio
+    #: never gives up, while its decoder starves and resynchronises into noise
+    #: it cannot recover from. Measured on the wire: 21 retransmissions inside
+    #: one 10-second window against a handful an hour otherwise, and an
+    #: inter-segment gap of 1.492 s.
+    #:
+    #: So this watchdog watches something the radio does not: how long since
+    #: this listener was handed a chunk, which covers the socket write as well
+    #: as the queue and therefore sees the stall the moment the radio's receive
+    #: window fills. The stalls it actually fired on were **1.80 s** and
+    #: **2.27 s**. 1.0 s is below both and above ordinary scheduling jitter.
+    stall_reconnect_seconds: float = 1.0
+    #: Minimum gap between two forced reconnects of the same station.
+    #:
+    #: Without it a genuine upstream outage - where every listener is starved -
+    #: would close and reopen every connection once a second, forever. That is
+    #: the reconnect storm this project has already caused once: 6940
+    #: connections in 89 seconds. The cooldown makes the watchdog act on an
+    #: isolated stall while leaving a real outage to the pipeline's own recovery.
+    #:
+    #: It is also the ceiling on how long a radio can stay broken: the glitch
+    #: clears on the next re-anchor, so this plus one poll and the radio's own
+    #: reconnect is the worst case. 5 s keeps that under the 10 s that was asked
+    #: for, and 12 re-anchors a minute is nowhere near a storm.
+    stall_reconnect_cooldown_seconds: float = 5.0
+    #: Re-anchor the listeners when the operating system reports this many
+    #: retransmitted TCP segments within one poll. 0 disables it.
+    #:
+    #: Why the retransmission count and not a timer
+    #: --------------------------------------------
+    #: This is the signal that actually sees Wi-Fi interference. A radio's
+    #: decoder cannot recover from damaged audio, and the damage arrives as lost
+    #: packets that TCP resends - so what the radio receives is *late*, not
+    #: missing. That is invisible from inside this process: measured during a
+    #: microwave test, the kernel absorbed a **2.8 s** stall in its socket
+    #: buffers and the application never saw a blocked write, so a server-side
+    #: timing threshold never fired.
+    #:
+    #: The kernel counts what it had to send twice, and the numbers are far
+    #: apart. Measured on one real connection: **47 retransmissions in 776 s**
+    #: while healthy (0.06 per second), against **21 in a ten-second window**,
+    #: and 27 (36 KB) inside a single stall, during interference.
+    #:
+    #: A radio also cannot be asked: measured while garbled, it acknowledged
+    #: every byte at full rate for 776 s straight. It is reading the stream
+    #: perfectly and decoding noise. So nothing above TCP can tell a working
+    #: radio from a broken one, and the retransmission count is the only signal
+    #: left.
+    #:
+    #: Detecting it needs no privileges, and is available on all three platforms:
+    #: ``/proc/net/snmp`` on Linux, ``netstat -s`` on macOS, and the IP Helper
+    #: API (``GetTcpStatisticsEx``) on Windows - a struct field there, not text,
+    #: so it works whatever language the system is set to.
+    retransmit_reconnect_segments: int = 3
+    #: How often the retransmission count is sampled, in seconds.
+    #:
+    #: One second is one ``/proc/net/snmp`` read - on the order of 10 microseconds
+    #: on a Pi - and it bounds detection latency. Sampling less often would let a
+    #: whole stall pass between two reads.
+    retransmit_poll_seconds: float = 1.0
     #: Concurrent pipelines. Each one is either an ffmpeg process or a very
     #: cheap pure-python demuxer.
     max_sessions: int = 4
@@ -317,6 +394,51 @@ class Settings(BaseSettings):
         # into a multi-second replay.
         if not 0.0 <= v <= 10.0:
             raise ValueError("handoff_overlap_seconds must be between 0 and 10")
+        return v
+
+    @field_validator("stall_reconnect_seconds")
+    @classmethod
+    def _check_stall_reconnect(cls, v: float) -> float:
+        # Zero disables the watchdog. The upper bound is generous on purpose:
+        # the radio has a timeout of its own (a frozen server for 1.2 s was
+        # enough to make it reconnect), so a large value would rarely fire - but
+        # forbidding a diagnostic setting is not this validator's job. Below
+        # 0.25 s it would fire on ordinary scheduling jitter and turn the stream
+        # into a reconnect storm.
+        if v != 0.0 and not 0.25 <= v <= 10.0:
+            raise ValueError("stall_reconnect_seconds must be 0 (off) or between 0.25 and 10")
+        return v
+
+    @field_validator("stall_reconnect_cooldown_seconds")
+    @classmethod
+    def _check_stall_cooldown(cls, v: float) -> float:
+        # Zero is allowed for testing, but it is genuinely dangerous in
+        # production: an upstream outage would close and reopen every connection
+        # once a second. The ceiling only stops a typo from disabling the
+        # watchdog in practice.
+        if not 0.0 <= v <= 600.0:
+            raise ValueError("stall_reconnect_cooldown_seconds must be between 0 and 600")
+        return v
+
+    @field_validator("retransmit_reconnect_segments")
+    @classmethod
+    def _check_retransmit_segments(cls, v: int) -> int:
+        # Zero disables the watchdog, which is also what happens automatically on
+        # a platform that cannot report the count. A negative value has no
+        # meaning, and one is already the smallest count that is evidence of
+        # anything - the default of 3 exists only to ride out a stray blip.
+        if v < 0:
+            raise ValueError("retransmit_reconnect_segments must be 0 or more")
+        return v
+
+    @field_validator("retransmit_poll_seconds")
+    @classmethod
+    def _check_retransmit_poll(cls, v: float) -> float:
+        # Below a quarter second the poll costs more than it can tell you; above
+        # ten seconds a whole interference burst can pass between two reads, and
+        # the count would be attributed to the wrong moment.
+        if not 0.25 <= v <= 10.0:
+            raise ValueError("retransmit_poll_seconds must be between 0.25 and 10")
         return v
 
     @field_validator("max_sessions", "max_listeners_per_session")

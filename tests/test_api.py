@@ -145,6 +145,59 @@ def test_query_stream_round_trip(live_server, hls_server):
     assert received >= 60_000, "the radio would have got almost nothing"
 
 
+def test_metadata_is_only_sent_to_clients_that_ask_for_it(live_server, hls_server):
+    """A client that did not send `Icy-MetaData: 1` must not get metadata.
+
+    Measured on the radio (2026-10-21): the same device opens two
+    connections with two different User-Agents - `NSPlayer/8.0.0.3801`,
+    which sends `icy-metadata: 1`, and `FSL IR2.10`, which does not.  The
+    server sent the metadata grid to BOTH, so the client that never asked
+    for it was handed a byte stream with 17-byte blocks embedded in it -
+    a different firmware path that does not handle them.  That is the
+    reported "garbled title and glitching audio, forever".
+
+    So the metadata is opt-in per request.
+    """
+    aac_url, _ = hls_server
+
+    # A client that asks for it gets the grid.
+    with httpx.stream(
+        "GET",
+        live_server + "/stream",
+        params={"url": aac_url},
+        headers={"Icy-MetaData": "1"},
+        timeout=30,
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers.get("icy-metaint"), (
+            "a client that asked for metadata did not get an icy-metaint"
+        )
+        metaint = int(response.headers["icy-metaint"])
+        body = b""
+        for chunk in response.iter_bytes():
+            body += chunk
+            if len(body) > metaint * 3:
+                break
+        assert b"StreamTitle='" in body, "no metadata block was sent"
+
+    # A client that does NOT ask for it gets plain audio.
+    with httpx.stream(
+        "GET", live_server + "/stream", params={"url": aac_url}, timeout=30
+    ) as response:
+        assert response.status_code == 200
+        assert "icy-metaint" not in response.headers, (
+            "metadata was sent to a client that never asked for it"
+        )
+        body = b""
+        for chunk in response.iter_bytes():
+            body += chunk
+            if len(body) > 60_000:
+                break
+        assert b"StreamTitle='" not in body, (
+            "a metadata block was sent to a client that never asked for one"
+        )
+
+
 def test_compat_encoded_url_route_still_works(live_server, hls_server):
     """The original ``/<percent-encoded-url>`` interface must keep working."""
     aac_url, _ = hls_server

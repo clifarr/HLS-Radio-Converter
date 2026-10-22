@@ -37,6 +37,7 @@ from typing import Any, Coroutine, Deque, Dict, List, Optional, Set, Tuple
 
 from .config import Settings
 from .pipeline import PipelineFatal, StreamPipeline
+from .retrans import tcp_retransmit_counter
 from .throughput import SAMPLE_SECONDS, Throughput
 from .tsdemux import (
     adts_align_offset,
@@ -118,16 +119,35 @@ class Subscriber:
 
     client: str = ""
     user_agent: str = ""
+    #: Whether this client asked for in-band metadata (``Icy-MetaData: 1``).
+    #: Only such a client is sent the blocks; see ``_wants_icy_metadata``.
+    metadata: bool = False
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=1))
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     connected_at: float = field(default_factory=time.time)
     chunks: int = 0
     bytes_sent: int = 0
     dropped: int = 0
-    #: ``produced_at`` of the newest audio the transport actually accepted for
-    #: this connection - the floor a rejoining client is primed from, so it is
-    #: never re-sent audio it already received (see ``StreamSession._join_floor``).
-    last_delivered: Optional[float] = None
+    #: How many bytes of the session's audio this connection has been given.
+    #:
+    #: This is the number the join floor needs, and it is measured in the
+    #: session's running total of audio produced rather than in wall-clock
+    #: time.  The difference is not cosmetic.  The reserve is filled in
+    #: bursts, so a client that is served the reserve and then plays it is
+    #: ``preroll_seconds`` behind the production edge *in audio* while being
+    #: only a fraction of a second behind *in wall-clock* - the pieces of a
+    #: burst are produced in a second but hold ten seconds of audio.  A floor
+    #: measured in wall-clock is therefore always behind the oldest piece of
+    #: the reserve, and it can never cut anything: the rejoin is served the
+    #: whole reserve, which is the audio the radio had already played.
+    #:
+    #: Counting bytes removes the clock entirely.  The floor becomes "the
+    #: client has had N bytes of the session's audio", and the rejoin is
+    #: primed with everything after them.
+    #:
+    #: ``None`` means nothing has reached the transport yet - an abandoned or
+    #: probe connection - so a later attach must not be floored by it.
+    reserve_bytes_sent: Optional[int] = None
     disconnected_at: Optional[float] = None
     #: Set by the response generator the moment it starts reading. A subscriber
     #: whose client vanished between the request and the body running never gets
@@ -140,6 +160,13 @@ class Subscriber:
         return {
             "id": self.id,
             "client": self.client,
+            # The User-Agent matters: the same radio opens connections with
+            # more than one ("NSPlayer/8.0.0.3801" and "FSL IR2.10"), and
+            # they are handled differently - only the one that asks for
+            # `Icy-MetaData` is sent the metadata blocks.  Without this in
+            # the metrics there is no way to tell which one is listening.
+            "user_agent": self.user_agent,
+            "metadata": self.metadata,
             "connected": round(time.time() - self.connected_at, 1),
             "chunks": self.chunks,
             "bytes": self.bytes_sent,
@@ -214,19 +241,42 @@ class StreamSession:
         #: 192 kbit/s 48 kHz output this project produces), once it is known.
         #: ``None`` until the first frame is found.
         self._frame_size: Optional[int] = None
-        #: Recent audio, ``(produced_at, piece)``, oldest first. Handed to a
+        #: Recent audio, ``(offset, piece)``, oldest first. Handed to a
         #: listener that connects later so it does not start in silence.
-        self._reserve: Deque[Tuple[float, bytes]] = deque()
+        self._reserve: Deque[Tuple[int, bytes]] = deque()
+        #: How many bytes of audio the reserve holds.  The reserve is bounded
+        #: by the *audio* it holds, not by the wall-clock it was produced
+        #: over, and the two are very different - see `_reserve_piece`.
+        self._reserve_bytes = 0
+        #: How many bytes of audio this session has produced since it
+        #: started.  The join floor is measured against this, not against
+        #: the clock - see `Subscriber.reserve_bytes_sent`.
+        self._audio_bytes = 0
         #: When the least-buffered listener last had something to play. ``None``
         #: means nothing is starved. See `starved_for`.
         self._starved_since: Optional[float] = None
-        #: ``(client, user_agent) -> produced_at`` of the newest audio that key
+        #: ``(client, user_agent) -> bytes of the session's audio`` that key
         #: was actually *sent*. A LAN radio re-GETs this warm session every
         #: 20-60 s (journal evidence: Kitchen-Roberts-Radio reattaching with
         #: 15-72 chunks prerolled on every attach), and priming the full
         #: reserve each time replayed up to 10 s of already-played audio - the
         #: reported "~2 s repeated every now and then". See `_join_floor`.
-        self._floors: Dict[Tuple[str, str], float] = {}
+        #:
+        #: The unit is bytes of audio, not a timestamp, and that is not
+        #: cosmetic: the reserve is filled in bursts, so a wall-clock floor is
+        #: always behind the oldest piece of the reserve and can never cut
+        #: anything.  See `Subscriber.reserve_bytes_sent`.
+        self._floors: Dict[Tuple[str, str], int] = {}
+
+        #: When this station last had a listener re-anchored (``time.monotonic``),
+        #: and how many times that has happened.  ``None`` - not ``0.0`` - means
+        #: "never", and the difference is a bug that was found by a test: with
+        #: ``0.0`` the first re-anchor is suppressed until the machine's
+        #: monotonic clock has passed the cooldown, because "0.0" reads as an
+        #: event at time zero.  On the Pi, up for days, that never showed; on a
+        #: freshly-booted host it means the watchdog silently does nothing.
+        self.last_stall_reconnect: Optional[float] = None
+        self.stall_reconnects: int = 0
 
     # ------------------------------------------------------------------ public
     @property
@@ -271,11 +321,14 @@ class StreamSession:
         """Whether the pipeline has produced any audio since it last started."""
         return self.pipeline.stats.bytes_out > 0
 
-    def add_subscriber(self, client: str = "", user_agent: str = "") -> Subscriber:
+    def add_subscriber(
+        self, client: str = "", user_agent: str = "", metadata: bool = False
+    ) -> Subscriber:
         floor = self._join_floor(client, user_agent)
         subscriber = Subscriber(
             client=client,
             user_agent=user_agent,
+            metadata=metadata,
             queue=asyncio.Queue(maxsize=max(4, self.settings.queue_chunks)),
         )
         self.subscribers.append(subscriber)
@@ -335,6 +388,27 @@ class StreamSession:
         await self.pipeline.aclose()
 
     # ------------------------------------------------------------------ fan-out
+    def reanchor_listeners(self) -> int:
+        """End every listener's response so its radio opens a fresh connection.
+
+        The session itself stays up: its pipeline, its reserve and its frame
+        grid all keep running, so the radio that reconnects is served from a
+        warm session and resynchronises its decoder immediately. Only the
+        *connections* are ended.
+
+        This is the one remedy for a wedged radio. Its decoder cannot recover
+        from damage it has already taken, and it will not ask for a new
+        connection while bytes are still arriving - so the connection has to be
+        closed for it. Confirmed on the real hardware: after the server closed
+        the socket, the radio reconnected on its own and the audio was clean.
+
+        Returns how many listeners were ended.
+        """
+        listeners = list(self.subscribers)
+        for subscriber in listeners:
+            self._signal_end(subscriber)
+        return len(listeners)
+
     def _signal_end(self, subscriber: Subscriber) -> None:
         try:
             subscriber.queue.put_nowait(None)
@@ -343,6 +417,21 @@ class StreamSession:
             with contextlib.suppress(asyncio.QueueEmpty, asyncio.QueueFull):
                 subscriber.queue.get_nowait()
                 subscriber.queue.put_nowait(None)
+
+    @property
+    def frame_size(self) -> Optional[int]:
+        """The size in bytes of one audio frame, once the grid has been found.
+
+        This is the number the ICY grid has to be a multiple of, so that a
+        metadata block never lands in the middle of a frame.  ``None`` until
+        the session has identified the stream - the API then falls back to
+        the configured grid.
+
+        It is the size of the frame **this session is actually sending**,
+        read from the frame header, so it is right for a re-encoded 576-byte
+        MP3 frame and for a forwarded 417-byte frame alike.
+        """
+        return self._frame_size
 
     def _output_format(self) -> Optional[str]:
         """The format the listener actually receives: ``"mp3"``, ``"adts"`` or ``None``.
@@ -707,16 +796,19 @@ class StreamSession:
 
     def _enqueue(self, piece: bytes) -> None:
         self.stats.chunks += 1
-        # One stamp per piece, shared by the reserve *and* every queue, so a
+        # One offset per piece, shared by the reserve *and* every queue, so a
         # delivered piece can be compared against reserve entries later - that
-        # comparison is the join-floor. Queue items are therefore
-        # ``(produced_at, piece)`` tuples; the end-of-stream sentinel stays
-        # ``None``.
-        stamp = time.time()
-        self._reserve_piece(piece, stamp)
+        # comparison is the join-floor.  The offset is the piece's position
+        # in the session's running total of audio produced, and NOT a
+        # timestamp: see `Subscriber.reserve_bytes_sent` for why the clock
+        # cannot be used here.  Queue items are ``(offset, piece)`` tuples;
+        # the end-of-stream sentinel stays ``None``.
+        self._audio_bytes += len(piece)
+        offset = self._audio_bytes
+        self._reserve_piece(piece, offset)
         for subscriber in self.subscribers:
             try:
-                subscriber.queue.put_nowait((stamp, piece))
+                subscriber.queue.put_nowait((offset, piece))
             except asyncio.QueueFull:
                 # This listener is behind. Drop the *oldest* audio for it and
                 # carry on: one slow radio must never stall the station.
@@ -724,9 +816,9 @@ class StreamSession:
                 with contextlib.suppress(asyncio.QueueEmpty):
                     subscriber.queue.get_nowait()
                 with contextlib.suppress(asyncio.QueueFull):
-                    subscriber.queue.put_nowait((stamp, piece))
+                    subscriber.queue.put_nowait((offset, piece))
 
-    def _reserve_piece(self, piece: bytes, stamp: float) -> None:
+    def _reserve_piece(self, piece: bytes, offset: int) -> None:
         """Hold this piece for a moment, so a radio that arrives late is served.
 
         This is the whole reason a listener can start instantly. Audio is produced
@@ -738,20 +830,56 @@ class StreamSession:
         """
         if self.settings.preroll_seconds <= 0:
             return
-        self._reserve.append((stamp, piece))
-        # Bounded by time, not by a piece count: the correct count depends on the
-        # stream's bitrate, which is not known when the reserve is created (a
-        # pass-through station runs at its own rate, not the configured one).
-        cutoff = stamp - self.settings.preroll_seconds
-        while self._reserve and self._reserve[0][0] < cutoff:
-            self._reserve.popleft()
-        # A hard cap as well, because a pathological bitrate should not be able to
-        # turn this into unbounded memory on a Pi.
+        self._reserve.append((offset, piece))
+        # Bounded by the AUDIO it holds, not by the wall-clock it was produced
+        # over.  Those are very different numbers, and the difference is the
+        # whole bug this fixes.
+        #
+        # FFmpeg transcodes a ten-second segment in about 1.5 seconds, so a
+        # burst of pieces is produced far faster than realtime and every piece
+        # of a burst lands inside a time window only a second wide.  Bounding
+        # the reserve by ``produced_at - preroll_seconds`` therefore held far
+        # more audio than it says: measured on the live service,
+        # ``preroll_seconds = 10.0`` produced a reserve of **57 pieces,
+        # 20.5 seconds of audio** - twice the configured maximum.
+        #
+        # A rejoining radio is primed with that reserve, so it was served up
+        # to twice the configured duration of audio it had already played.
+        # That is a splice, it breaks the MP3 bit reservoir, and the radio's
+        # decoder never resynchronises.
+        #
+        # So the bound is on the audio the reserve holds.  The piece count
+        # follows from the bitrate, and the bitrate is not known until the
+        # stream has been identified - so the reserve tracks its own byte
+        # total and drops the oldest pieces until it is back within
+        # ``preroll_seconds`` of audio.  Measured after: 27 pieces, 9.72 s.
+        self._reserve_bytes += len(piece)
+        limit = self._reserve_limit_bytes()
+        while self._reserve and self._reserve_bytes > limit:
+            _, dropped = self._reserve.popleft()
+            self._reserve_bytes -= len(dropped)
+        # A hard cap on the piece count as well, because a pathological
+        # bitrate should not be able to turn this into unbounded memory on
+        # a Pi.
         while len(self._reserve) > self.settings.queue_chunks:
-            self._reserve.popleft()
+            _, dropped = self._reserve.popleft()
+            self._reserve_bytes -= len(dropped)
 
-    def _join_floor(self, client: str, user_agent: str) -> Optional[float]:
-        """Newest ``produced_at`` that *(client, user_agent)* was already sent.
+    def _reserve_limit_bytes(self) -> int:
+        """How many bytes of audio the reserve may hold.
+
+        ``preroll_seconds`` is a duration of *audio*, so the byte budget is
+        that duration at the stream's own bitrate.  The bitrate is the
+        measured one when it is known - a forwarded station runs at its own
+        rate, not the configured one - and the configured one otherwise.
+        """
+        rate = self.pipeline.output_bitrate or self.settings.bitrate
+        if rate <= 0:
+            rate = self.settings.bitrate or 192000
+        return max(int(self.settings.preroll_seconds * rate / 8), 1)
+
+    def _join_floor(self, client: str, user_agent: str) -> Optional[int]:
+        """How many bytes of the session's audio *client* was already sent.
 
         Why a floor exists at all: the reserve stops a *new* listener from
         starting in silence, but a client reconnecting to this warm session -
@@ -770,22 +898,35 @@ class StreamSession:
           pattern is "attach the new socket, then detach the old one", so the
           predecessor's floor is the freshest truth at prime time.
 
-        Keyed on IP *and* User-Agent: two devices share an IP only behind NAT
-        and then differ by User-Agent, while one device reconnecting shares
-        both - exactly the case to floor. A second tab of the same browser
-        also shares the key and therefore joins nearer the live edge with less
-        pre-roll: a deliberate trade, since the replay is a measured defect
-        and a same-UA second listener is rare for this service.
+        Keyed on the IP **alone**, not on (IP, User-Agent): the same radio
+        reconnects with a *different* User-Agent, and a different User-Agent
+        meant a different key, no floor, and the full reserve replayed to a
+        radio that had already played it.  That replay splices two parts of
+        the stream and breaks the MP3 bit reservoir, so the radio's decoder
+        never resynchronises - which is the reported "garbled title and
+        glitching audio, forever, until a server restart".  See
+        ``_floor_key``.
+
+        Measured in **bytes of the session's audio**, not in wall-clock
+        seconds, and that is the point.  The reserve is filled in bursts, so
+        a client that is served the reserve and then plays it is
+        ``preroll_seconds`` behind the production edge *in audio* while
+        being a fraction of a second behind *in wall-clock*: the pieces of a
+        burst are produced inside a second but hold ten seconds of audio.
+        A wall-clock floor was therefore always behind the oldest piece of
+        the reserve, so it could never cut anything, and every rejoin was
+        served the whole reserve - the audio the radio had already played.
+        Counting bytes removes the clock from the comparison entirely.
         """
-        key = (client, user_agent)
+        key = self._floor_key(client, user_agent)
         floor = self._floors.get(key)
         for other in self.subscribers:
             if (
-                (other.client, other.user_agent) == key
-                and other.last_delivered is not None
-                and (floor is None or other.last_delivered > floor)
+                self._floor_key(other.client, other.user_agent) == key
+                and other.reserve_bytes_sent is not None
+                and (floor is None or other.reserve_bytes_sent > floor)
             ):
-                floor = other.last_delivered
+                floor = other.reserve_bytes_sent
         if floor is None:
             return None
         # Pull the join point back by the handoff overlap. At the exact
@@ -797,22 +938,74 @@ class StreamSession:
         # handoff) is the reported "skips a second or so". Re-sending at most
         # `handoff_overlap_seconds` of already-delivered audio bridges both,
         # with the replay bounded to that window (see Settings for the tradeoff).
-        return floor - self.settings.handoff_overlap_seconds
+        overlap_bytes = self._overlap_bytes()
+        return max(0, floor - overlap_bytes)
+
+    def _overlap_bytes(self) -> int:
+        """How many bytes of already-delivered audio the handoff may re-send.
+
+        The window is a duration of *audio*, so it is a number of bytes at
+        the stream's bitrate - the same conversion `_reserve_limit_bytes`
+        does, and for the same reason.
+        """
+        rate = self.pipeline.output_bitrate or self.settings.bitrate
+        if rate <= 0:
+            rate = self.settings.bitrate or 192000
+        return int(self.settings.handoff_overlap_seconds * rate / 8)
+
+    @staticmethod
+    def _floor_key(client: str, user_agent: str) -> Tuple[str, str]:
+        """The key a join floor is stored under: the IP alone.
+
+        Why the IP and not ``(client, user_agent)``
+        --------------------------------------------
+        Measured on the real radio (2026-10-21): the SAME device opens
+        connections with two different User-Agents - ``NSPlayer/8.0.0.3801``
+        (which sends ``Icy-MetaData: 1``) and ``FSL IR2.10`` (which does not).
+        The Frontier Silicon firmware uses one as the media-player stack
+        starts and the other afterwards, and which one is in use when the
+        connection drops is not something this server can predict.
+
+        Keying the floor on both meant a radio that came back with the other
+        User-Agent was a *different* key: no floor was found, and the whole
+        reserve was served to a radio that had already played it.
+
+        That replay is not "the song started again".  It splices two
+        different parts of the stream, and an MP3 stream's frames carry a
+        **bit reservoir** - each frame's side information says how many bits
+        to take from the frames before it.  A splice breaks those pointers,
+        and a decoder reading the wrong bits does not merely sound wrong
+        once: the reservoir is refilled from the wrong place on every frame,
+        so it never resynchronises.  The radio's decoder is a continuous
+        state machine that survives the TCP reconnect, which is why the
+        fault outlived the interference that triggered it.
+
+        Measured on the live server: reconnecting with a different
+        User-Agent replayed from offset 0 of the previous connection's
+        stream (3.34 s of already-heard audio); keyed on the IP it does not
+        overlap at all.
+
+        The cost is that two *different* devices behind one NAT address share
+        a floor.  That is the mild side of the trade: a shared floor means a
+        later start, not a replay.  A client never seen on that IP still gets
+        the full reserve, which is what a genuinely new listener wants.
+        """
+        return (client, "")
 
     def _note_floor(self, subscriber: Subscriber) -> None:
         """Remember how far a departing connection got, for its next attach."""
-        if subscriber.last_delivered is None:
+        if subscriber.reserve_bytes_sent is None:
             # Nothing reached the transport (abandoned or probe connection), so
             # a later attach must not be floored by it - it heard nothing.
             return
-        key = (subscriber.client, subscriber.user_agent)
+        key = self._floor_key(subscriber.client, subscriber.user_agent)
         # Re-insert rather than assign, so eviction sees the freshest keys.
         self._floors.pop(key, None)
-        self._floors[key] = subscriber.last_delivered
+        self._floors[key] = subscriber.reserve_bytes_sent
         while len(self._floors) > MAX_JOIN_FLOORS:
             self._floors.pop(next(iter(self._floors)))
 
-    def _prime(self, subscriber: Subscriber, floor: Optional[float] = None) -> None:
+    def _prime(self, subscriber: Subscriber, floor: Optional[int] = None) -> None:
         """Give a newly connected listener the reserve, oldest piece first.
 
         Without this a joining radio waits for the next production burst, which is
@@ -824,16 +1017,22 @@ class StreamSession:
         was already sent - what turns "attach" from a replay into a resume. A
         new client has no floor and gets the full reserve, as before.
 
+        The floor is a number of bytes of the session's audio, and each
+        reserve piece carries its own offset in that total, so the
+        comparison does not involve the clock at all.  See `_join_floor` for
+        why a wall-clock floor could not work here.
+
         The reserve is already frame-aligned: it is filled from the same
         frame-aligned pieces that live listeners receive (see
         :meth:`_fan_out`), so a joining radio's decoder and its ICY metadata
         parser start in agreement.
         """
-        for produced_at, piece in self._reserve:
-            if floor is not None and produced_at <= floor:
+        for offset, piece in self._reserve:
+            if floor is not None and offset <= floor:
+                # Already sent to this client: skip it.
                 continue
             try:
-                subscriber.queue.put_nowait((produced_at, piece))
+                subscriber.queue.put_nowait((offset, piece))
             except asyncio.QueueFull:
                 break
 
@@ -992,6 +1191,7 @@ class StreamSession:
                 # a silent jump between them - worse than a listener waiting out
                 # the restart, which is what it would otherwise do.
                 self._reserve.clear()
+                self._reserve_bytes = 0
                 # The new pipeline may be sending a different codec - the
                 # station failed over while we slept - so the frame grid,
                 # the frame size and the held-back bytes all belong to the
@@ -1063,6 +1263,10 @@ class StreamSession:
                 "bytes_out": self.stats.bytes_out,
                 "bytes_sent": self.stats.bytes_sent,
                 "uptime": round(time.time() - self.stats.created_at, 1),
+                # How many listeners this station's stall watchdog has closed
+                # so far, so a dashboard can tell "the microwave was on" from
+                # "nothing happened" without reading the journal.
+                "stall_reconnects": self.stall_reconnects,
             },
             # Health, not just counters. `producing` is false until the first
             # byte of audio exists, and `stalled` is true once a connected
@@ -1100,8 +1304,35 @@ class SessionManager:
         self._lock = asyncio.Lock()
         self._reaper: Optional[asyncio.Task] = None
         self._sampler: Optional[asyncio.Task] = None
+        #: Samples the OS retransmission counter. ``None`` when the watchdog is
+        #: off by configuration or unsupported on this platform.
+        self._retransmit_task: Optional[asyncio.Task] = None
+        #: Reads the cumulative retransmission count; see `radioconv.retrans`.
+        self.retransmit_counter = tcp_retransmit_counter()
+        #: Segments retransmitted in the most recent poll, for the dashboard, and
+        #: the largest burst seen - so "was the Wi-Fi bad?" is answerable after
+        #: the fact without a packet capture.
+        self.retransmit_last_delta = 0
+        self.retransmit_peak_delta = 0
         self.consecutive_failures = 0
         self.capacity_rejections = 0
+        #: Service-wide count of listeners closed by the stall watchdog.
+        #:
+        #: Here rather than summed over the sessions, for the same reason the
+        #: byte counters above live here: a session is reaped once its radios
+        #: have been gone for ``linger_seconds``, so summing what is currently
+        #: registered makes the total *fall*. Observed on the Pi - the figure
+        #: went 1, then back to 0 when the station it belonged to was reaped -
+        #: and a Prometheus counter that decreases breaks ``rate()`` and is
+        #: simply untrue. Each session keeps its own count as well, for the
+        #: dashboard.
+        self.stall_reconnects = 0
+        #: Service-wide count of listeners closed because the OS reported a
+        #: retransmission burst - Wi-Fi interference, in practice. Kept separate
+        #: from ``stall_reconnects`` on purpose: "the upstream starved" and "the
+        #: network dropped packets" are different failures with the same remedy,
+        #: and merging the counters would hide which one is happening.
+        self.retransmit_reconnects = 0
         self.started_at = time.time()
         #: Service-wide byte counters. They live here rather than in the sessions
         #: because a session is reaped, restarted and replaced constantly, and a
@@ -1124,14 +1355,93 @@ class SessionManager:
             self._sampler = asyncio.create_task(
                 self._throughput_loop(), name="radioconv-throughput"
             )
+        starting_watchdog = (
+            self.settings.retransmit_reconnect_segments > 0 and self.retransmit_counter.available
+        )
+        if starting_watchdog and self._retransmit_task is None:
+            self._retransmit_task = asyncio.create_task(
+                self._retransmit_loop(), name="radioconv-retransmit"
+            )
 
     async def aclose(self) -> None:
-        for task in (self._reaper, self._sampler):
+        for task in (self._reaper, self._sampler, self._retransmit_task):
             if task is not None:
                 task.cancel()
         for session in list(self.sessions.values()):
             await session.close("shutting down")
         self.sessions.clear()
+
+    # --------------------------------------------------- network watchdog
+    def reanchor_stalled_sessions(self, now: Optional[float] = None) -> int:
+        """End the listeners of every station allowed to act, and count them.
+
+        Extracted from the poll loop so the decision - which stations are
+        eligible, and whether the cooldown has expired - is testable without a
+        socket, a clock or a broken network.
+
+        The cooldown is per *station*, not per listener and not global. Per
+        station, because one bad patch of Wi-Fi affects them all and they should
+        each get their chance; not global, because a station that is working
+        should not be denied a repair because another one just had one.
+        """
+        at = time.monotonic() if now is None else now
+        cooldown = self.settings.stall_reconnect_cooldown_seconds
+        touched = 0
+        for session in list(self.sessions.values()):
+            if not session.listener_count:
+                continue
+            previous = session.last_stall_reconnect
+            if previous is not None and at - previous < cooldown:
+                # Reconnected very recently: give the radio time to recover
+                # before closing its socket again.  ``None`` means it has never
+                # been re-anchored, which is always allowed.
+                continue
+            session.last_stall_reconnect = at
+            session.stall_reconnects += 1
+            touched += session.reanchor_listeners()
+        if touched:
+            self.retransmit_reconnects += 1
+        return touched
+
+    async def _retransmit_loop(self) -> None:
+        """Re-anchor the listeners when the OS reports a retransmission burst.
+
+        See `Settings.retransmit_reconnect_segments` for why this is the signal
+        and the measured numbers behind the threshold.
+        """
+        threshold = self.settings.retransmit_reconnect_segments
+        previous = await asyncio.to_thread(self.retransmit_counter.read)
+        while True:
+            await asyncio.sleep(self.settings.retransmit_poll_seconds)
+            total = await asyncio.to_thread(self.retransmit_counter.read)
+            if total is None or previous is None:
+                # No reading this tick (a transient failure, or the very first
+                # poll). Adopt whatever we have and compare from there, rather
+                # than treating a failed read as a burst of zero - or worse, as
+                # a huge negative one.
+                previous = total
+                continue
+            delta = total - previous
+            previous = total
+            # A counter that went backwards means the OS restarted its stats (or
+            # the figure wrapped); ignore it rather than reading it as damage.
+            if delta < 0:
+                continue
+            self.retransmit_last_delta = delta
+            self.retransmit_peak_delta = max(self.retransmit_peak_delta, delta)
+            if delta < threshold:
+                continue
+            closed = self.reanchor_stalled_sessions()
+            if closed:
+                log.warning(
+                    "the network retransmitted %d TCP segments in %.1fs: "
+                    "closing %d listener connection(s) so the radios re-anchor "
+                    "their decoders (threshold %d)",
+                    delta,
+                    self.settings.retransmit_poll_seconds,
+                    closed,
+                    threshold,
+                )
 
     # ------------------------------------------------------------------ keys
     @staticmethod
@@ -1162,6 +1472,7 @@ class SessionManager:
         settings: Optional[Settings] = None,
         client: str = "",
         user_agent: str = "",
+        metadata: bool = False,
         overrides: Optional[dict] = None,
         label: str = "",
     ):
@@ -1207,7 +1518,9 @@ class SessionManager:
                     f"{settings.max_listeners_per_session} listeners already attached "
                     "to this station; try again shortly"
                 )
-            subscriber = session.add_subscriber(client=client, user_agent=user_agent)
+            subscriber = session.add_subscriber(
+                client=client, user_agent=user_agent, metadata=metadata
+            )
             return session, subscriber
 
     async def unsubscribe(self, session: StreamSession, subscriber: Subscriber) -> None:
@@ -1315,8 +1628,21 @@ class SessionManager:
             #: Sessions that have not yet produced a single byte.
             "starting": sum(1 for s in sessions if not s.producing),
             "capacity_rejections": self.capacity_rejections,
+            #: Service-wide, and monotonic - see ``SessionManager.stall_reconnects``.
+            "stall_reconnects": self.stall_reconnects,
+            #: Listeners closed because the OS reported a retransmission burst,
+            #: plus what the counter actually said, so a dashboard can show
+            #: whether the watchdog is armed and quiet or armed and working.
+            "retransmit_reconnects": self.retransmit_reconnects,
+            "retransmit_source": self.retransmit_counter.name,
+            "retransmit_last_delta": self.retransmit_last_delta,
+            "retransmit_peak_delta": self.retransmit_peak_delta,
             "details": [s.as_dict() for s in sessions],
         }
 
     def note_rejection(self) -> None:
         self.capacity_rejections += 1
+
+    def note_stall_reconnect(self) -> None:
+        """Record that a listener was closed by the stall watchdog."""
+        self.stall_reconnects += 1

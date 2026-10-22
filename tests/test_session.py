@@ -73,6 +73,7 @@ def fast_settings(**overrides) -> Settings:
         # Matches FakePipeline.PIECE so a piece is never accumulated or split.
         chunk_size=overrides.get("chunk_size", 1024),
         max_sessions=overrides.get("max_sessions", 2),
+        handoff_overlap_seconds=overrides.get("handoff_overlap_seconds", 1.5),
         max_listeners_per_session=overrides.get("max_listeners_per_session", 2),
     )
 
@@ -610,7 +611,12 @@ async def test_close_signals_every_listener_and_stops_the_pipeline():
 
 async def _delivered(subscriber, count: int, timeout: float = 5.0):
     """Drain ``count`` chunks the way the response generator does, recording
-    the floor the transport would record for this connection."""
+    the floor the transport would record for this connection.
+
+    The queue carries ``(offset, piece)``, where the offset is the piece's
+    position in the session's running total of audio - the unit the join
+    floor is measured in.  See ``Subscriber.reserve_bytes_sent``.
+    """
     got = []
     deadline = time.time() + timeout
     while len(got) < count and time.time() < deadline:
@@ -620,9 +626,9 @@ async def _delivered(subscriber, count: int, timeout: float = 5.0):
             continue
         if item is None:
             break
-        stamp, piece = item
-        subscriber.last_delivered = stamp
-        got.append((stamp, piece))
+        offset, piece = item
+        subscriber.reserve_bytes_sent = offset
+        got.append((offset, piece))
     return got
 
 
@@ -663,15 +669,232 @@ async def test_a_rejoining_client_resumes_instead_of_replaying():
         assert rejoined is session, "the session is warm; only the connection is new"
         primed = _queued(second)
         assert primed, "the rejoining client got no audio at all"
-        stamps = [stamp for stamp, _ in primed]
-        window = session.settings.handoff_overlap_seconds
-        assert all(stamp > floor - window for stamp in stamps), (
+        offsets = [offset for offset, _ in primed]
+        overlap = session._overlap_bytes()
+        assert all(offset > floor - overlap for offset in offsets), (
             "the rejoin was primed from beyond the handoff overlap window: "
-            f"floor={floor}, primed={stamps}"
+            f"floor={floor}, overlap={overlap}, primed={offsets}"
         )
-        assert max(stamps) > floor, (
+        assert max(offsets) > floor, (
             "the rejoin must still resume forward of the old floor - the "
             "window extends backward only, it does not turn into a replay"
+        )
+    finally:
+        await manager.aclose()
+
+
+async def test_a_rejoining_client_that_changed_its_user_agent_does_not_replay(
+    monkeypatch,
+):
+    """The same radio, back with a DIFFERENT User-Agent, must not be replayed.
+
+    Measured on the real radio (2026-10-21): the same device opens
+    connections with two different User-Agents - `NSPlayer/8.0.0.3801`
+    (which sends `Icy-MetaData: 1`) and `FSL IR2.10` (which does not).  The
+    join floor was keyed on (IP, User-Agent), so the radio coming back with
+    the other one was a *different* key: no floor was found and the session's
+    reserve was served to it in full - up to ten seconds of audio it had
+    already played.
+
+    That is not "the song restarted".  It splices two parts of the stream,
+    and an MP3 frame's side information points back into the previous
+    frames (the bit reservoir), so the splice breaks the decoder and it
+    never resynchronises.  The radio's decoder survives the TCP reconnect,
+    so it keeps playing garbage until the *server* is restarted.
+
+    The assertion is on the AUDIO, not on a timestamp: the rejoining client
+    must not be primed with the very bytes the first connection delivered.
+    The fake pipeline below emits a different piece every time, so a replay
+    is visible in the bytes.
+    """
+
+    class CountingPipeline(FakePipeline):
+        """Like FakePipeline, but every piece is distinguishable."""
+
+        counter = 0
+
+        async def stream(self):
+            while not self.closed:
+                await asyncio.sleep(0.005)
+                if self.closed:
+                    return
+                self.stats.last_data_at = time.time()
+                self.stats.bytes_out += self.PIECE
+                type(self).counter += 1
+                # Four bytes of counter, padded to the piece size.
+                yield type(self).counter.to_bytes(4, "big") + b"z" * (self.PIECE - 4)
+
+    monkeypatch.setattr(session_mod, "StreamPipeline", CountingPipeline)
+
+    # The handoff overlap is switched OFF here on purpose.  It is a
+    # *deliberate*, bounded re-send of the last second and a half of
+    # already-delivered audio, and it is a different defect from the one
+    # under test: this test is about the FULL reserve being handed to a
+    # radio that already played it.  With the overlap at its 1.5 s default
+    # the floor is back-dated by 1.5 s, the fake pipeline emits a piece
+    # every 5 ms, and every piece the first connection delivered falls
+    # inside that window - so the deliberate overlap and the accidental
+    # full replay are indistinguishable.  Zero makes the two separable.
+    manager = SessionManager(fast_settings(queue_chunks=128, handoff_overlap_seconds=0.0))
+    await manager.start()
+    try:
+        session, first = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="NSPlayer/8.0.0.3801",
+        )
+        heard = await _delivered(first, 3)
+        assert len(heard) == 3, "the test needs audio that was actually delivered"
+        already_played = b"".join(piece for _, piece in heard)
+        await manager.unsubscribe(session, first)
+
+        # Production continues while the client is away.
+        await asyncio.sleep(0.05)
+
+        # The radio comes back - with the OTHER User-Agent.
+        rejoined, second = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="FSL IR2.10",
+        )
+        assert rejoined is session, "the session is warm; only the connection is new"
+        primed = _queued(second)
+        assert primed, "the rejoining client got no audio at all"
+        replayed = b"".join(piece for _, piece in primed)
+        assert already_played not in replayed, (
+            "the rejoin replayed audio the first connection had already "
+            "delivered - the radio is being handed a splice, which breaks "
+            "the MP3 bit reservoir and leaves its decoder unable to recover"
+        )
+    finally:
+        await manager.aclose()
+
+
+async def test_the_reserve_holds_only_preroll_seconds_of_AUDIO(monkeypatch):
+    """The reserve must be bounded by the audio it holds, not by wall-clock.
+
+    Measured on the real radio (2026-10-22): the reserve held **128 pieces
+    = 46 seconds of audio produced inside 0.795 seconds** - nearly five
+    times the ten seconds `preroll_seconds` asks for.
+
+    The reason is that the reserve used to be trimmed by *production time*::
+
+        cutoff = stamp - preroll_seconds
+
+    but FFmpeg transcodes a ten-second segment in about 1.5 seconds, so a
+    burst of pieces is produced far faster than realtime and every piece in
+    the burst carries a production stamp inside the same second.  A
+    ten-second time window therefore holds the whole burst, and the piece
+    count was the only bound left - and that one is 128 pieces, whatever
+    their size.
+
+    That is not a tidiness issue.  A rejoining radio is primed from the
+    reserve, so it was served up to 46 seconds of audio it had already
+    played.  That is a splice, it breaks the MP3 bit reservoir, and the
+    radio's decoder never resynchronises - the reported "garbled title and
+    crackling audio, forever, until the server is restarted".
+
+    The bound is on the audio the reserve holds.  The pieces here are
+    8 KiB, so the 128-piece count cap alone would let a megabyte - 43
+    seconds of audio - through, and only a bound on the audio stops it.
+    """
+
+    class BurstPipeline(FakePipeline):
+        """Produces pieces far faster than realtime, as FFmpeg does."""
+
+        async def stream(self):
+            while not self.closed:
+                await asyncio.sleep(0.001)
+                if self.closed:
+                    return
+                self.stats.last_data_at = time.time()
+                self.stats.bytes_out += 8192
+                yield b"a" * 8192
+
+    monkeypatch.setattr(session_mod, "StreamPipeline", BurstPipeline)
+
+    # `chunk_size` is what the session cuts the pieces at, so it is what
+    # sets the size of the reserve's entries.
+    settings = fast_settings(queue_chunks=128, chunk_size=8192)
+    manager = SessionManager(settings)
+    await manager.start()
+    try:
+        session, _first = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="Frontier/1",
+        )
+        # Let the burst fill the reserve.
+        await asyncio.sleep(1.0)
+
+        rate = settings.bitrate / 8.0
+        held_seconds = session._reserve_bytes / rate
+        assert held_seconds <= settings.preroll_seconds + 0.5, (
+            f"the reserve holds {held_seconds:.1f} s of audio in "
+            f"{len(session._reserve)} pieces, but preroll_seconds is "
+            f"{settings.preroll_seconds:.1f}: a rejoining radio would be "
+            "served audio it has already played, which splices the stream "
+            "and breaks the MP3 bit reservoir"
+        )
+    finally:
+        await manager.aclose()
+
+
+async def test_a_rejoin_is_never_primed_with_more_than_the_reserve_holds(
+    monkeypatch,
+):
+    """The audio a rejoin is primed with is the audio it was already sent.
+
+    This is the symptom the reserve bound fixes, measured end to end: the
+    radio is handed audio it has already played, and a splice in an MP3
+    stream breaks the bit reservoir, so the radio's decoder never recovers
+    - it plays garbage until the *server* is restarted.
+    """
+
+    class BurstPipeline(FakePipeline):
+        async def stream(self):
+            while not self.closed:
+                await asyncio.sleep(0.001)
+                if self.closed:
+                    return
+                self.stats.last_data_at = time.time()
+                self.stats.bytes_out += 8192
+                yield b"a" * 8192
+
+    monkeypatch.setattr(session_mod, "StreamPipeline", BurstPipeline)
+
+    settings = fast_settings(queue_chunks=128, chunk_size=8192)
+    manager = SessionManager(settings)
+    await manager.start()
+    try:
+        session, first = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="Frontier/1",
+        )
+        # Let the reserve fill, and let the client receive some of it.
+        await asyncio.sleep(0.5)
+        heard = await _delivered(first, 3)
+        assert heard, "the test needs audio that was actually delivered"
+        await manager.unsubscribe(session, first)
+
+        _, second = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="Frontier/1",
+        )
+        primed = _queued(second)
+        rate = settings.bitrate / 8.0
+        primed_seconds = sum(len(piece) for _, piece in primed) / rate
+        assert primed_seconds <= settings.preroll_seconds + 0.5, (
+            f"the rejoin was primed with {primed_seconds:.1f} s of audio, "
+            f"which is more than the {settings.preroll_seconds:.1f} s the "
+            "reserve is allowed to hold"
         )
     finally:
         await manager.aclose()
@@ -741,11 +964,12 @@ async def test_an_overlapping_connection_resumes_from_the_still_open_one():
             client="192.168.1.65",
             user_agent="Frontier/1",
         )
-        stamps = [stamp for stamp, _ in _queued(new)]
-        assert stamps, "the overlapping connection got no audio at all"
-        assert all(stamp > floor - settings.handoff_overlap_seconds for stamp in stamps), (
+        offsets = [offset for offset, _ in _queued(new)]
+        assert offsets, "the overlapping connection got no audio at all"
+        overlap = int(settings.handoff_overlap_seconds * settings.bitrate / 8)
+        assert all(offset > floor - overlap for offset in offsets), (
             "the overlapping connection was primed from beyond the handoff "
-            f"window: floor={floor}, primed={stamps}"
+            f"window: floor={floor}, overlap={overlap}, primed={offsets}"
         )
     finally:
         await manager.aclose()
@@ -754,12 +978,12 @@ async def test_an_overlapping_connection_resumes_from_the_still_open_one():
 def _edge_session(settings: Settings, session: session_mod.StreamSession):
     """Drive one connection right up to the production edge, then rejoin it."""
     sub = session.add_subscriber(client="radio", user_agent="Frontier/1")
-    stamps = []
+    offsets = []
     for _ in range(5):
         session._fan_out(b"a" * settings.chunk_size)
-        stamp, _piece = sub.queue.get_nowait()
-        stamps.append(stamp)
-    sub.last_delivered = max(stamps)
+        offset, _piece = sub.queue.get_nowait()
+        offsets.append(offset)
+    sub.reserve_bytes_sent = max(offsets)
     session.remove_subscriber(sub)  # records the floor at the production edge
     return session.add_subscriber(client="radio", user_agent="Frontier/1")
 
@@ -782,9 +1006,10 @@ async def test_a_rejoin_at_the_production_edge_is_never_primed_empty():
         "a rejoin at the production edge was primed with nothing and would "
         "wait up to a whole segment period for the next burst"
     )
-    stamps = [stamp for stamp, _ in primed]
-    assert min(stamps) > max(stamps) - settings.handoff_overlap_seconds - 1e-6, (
-        f"the cushion exceeds the configured window: {stamps}"
+    offsets = [offset for offset, _ in primed]
+    overlap = session._overlap_bytes()
+    assert min(offsets) > max(offsets) - overlap, (
+        f"the cushion exceeds the configured window: {offsets}"
     )
 
 

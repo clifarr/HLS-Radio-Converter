@@ -3,6 +3,182 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.3.0] - 2026-10-22
+
+A **minor** release rather than a patch, because the remedy is a new capability
+rather than a correction of one: the server can now **deliberately end a
+listener's connection** when it has evidence that the radio is decoding garbage,
+so that the radio reconnects and re-anchors its decoder. Both triggers are
+configurable, independently, and either can be switched off.
+
+It fixes the radio falling into a **permanent** garbled-audio-and-garbage-title
+state, and it is verified on the real hardware: with a microwave oven running at
+high power the audio now glitches only *while* the interference lasts, and clears
+immediately after. Before this release it stayed broken until the service was
+restarted - the reported "glitched, then kept glitching".
+
+The investigation is worth recording, because the answer was not where any of
+us looked first. During the fault the server's stream was measured and found
+**perfect**: no gaps in the TCP byte stream across 39 connections over 3.5
+hours, an unbroken chain of 32 355 MP3 frames, the ICY grid landing on its
+declared offset every time, and the radio acknowledging every byte at full
+rate. The defect was never the bytes - it was that the radio's own MP3 decoder
+gives up on damaged audio and never recovers on its own.
+
+There is also a lesson in this release about **which** signal works, because
+the first attempt at it did not. See "Re-anchoring the listeners" below.
+
+### Added
+
+- **Listeners are re-anchored when the operating system reports a TCP
+  retransmission burst** (`retransmit_reconnect_segments`, default `3`, polled
+  once a second; `0` disables it). This is the fix that actually works.
+
+  Why a burst of retransmissions, and not a stall: Wi-Fi interference damages
+  packets, TCP resends them, and what the radio receives is *late* rather than
+  absent. That makes it invisible from inside this process. Measured during a
+  microwave test: a **2.8 s** stall and **27 retransmissions (36 KB)** on the
+  wire, while the application saw nothing at all - the kernel's send buffer
+  (44.8 KB, about 1.9 s of audio) plus uvicorn's 64 KB transport buffer
+  absorbed the whole gap, so the pacer kept draining and never reported a lag.
+  A first version of this watchdog therefore watched *timing* and **never
+  fired** on the channel that was failing.
+
+  The kernel does know. The numbers are three orders of magnitude apart:
+  **47 retransmissions in 776 s** on a healthy connection (0.06 per second),
+  against **21 inside a single ten-second window** during interference.
+
+  Supported on Linux (`/proc/net/snmp`, field located by name so a kernel that
+  adds a counter cannot shift it), macOS (`netstat -s -p tcp`, singular and
+  plural spellings) and Windows (the IP Helper API's `GetTcpStatisticsEx`,
+  which returns a struct rather than text, so it is unaffected by the system
+  language). On any other platform the watchdog stays off and the service
+  behaves as it did before.
+
+  **Windows is untested on real hardware.** The Linux and macOS readers were
+  exercised against live systems; the Windows reader has never run on an actual
+  Windows machine, because none was available. Its struct layout and decoding
+  are unit-tested against a fake, and a failure there leaves the watchdog off
+  rather than misreading the counter - but that is reasoning, not evidence. If
+  you run this on Windows and the dashboard's `retransmit_source` reads
+  `windows` with a plausible, rising `retransmit_last_delta`, the path works;
+  if it reads `unavailable`, it does not, and the service behaves exactly as it
+  did before this release. Nothing else depends on it.
+
+  Closing the connection is the only remedy available: the radio's decoder
+  keeps no way to resynchronise once it has decoded damaged audio, and it will
+  not ask for a new connection while bytes keep arriving - measured while
+  garbled, it acknowledged every byte at full rate for 776 s. Only the
+  *listeners* are ended; the station's pipeline and reserve keep running, so a
+  reconnecting radio is served from a warm session and resynchronises at once.
+
+- **A stall watchdog, for the other failure: the upstream starving**
+  (`stall_reconnect_seconds`, default `1.0`). A listener that has been handed
+  no chunk for a second is reconnected too. This is what catches a starved
+  pipeline rather than a damaged network, and it did fire in the field - on a
+  **3.28 s** gap - so the two are kept side by side rather than one standing in
+  for the other.
+
+- `stall_reconnect_cooldown_seconds` (default `5`) bounds how often either
+  watchdog may act on one station, and therefore bounds how long a radio can
+  stay broken: cooldown plus one poll plus the radio's own reconnect. Without
+  a cooldown, an outage where every listener stalls at once would close and
+  reopen every connection every second - a shape of failure this project has
+  produced before: 6940 connections in 89 seconds.
+
+- `retransmit_reconnects_total` and `stall_reconnects_total` (Prometheus),
+  per-session counts, and `retransmit_source` / `retransmit_last_delta` /
+  `retransmit_peak_delta` in `/metrics.json`, so an operator can tell an armed
+  watchdog from a silently disabled one and set the threshold from the
+  machine's own numbers rather than from a guess.
+
+### Fixed
+
+- **The first re-anchor of a station is no longer suppressed.** The "last
+  re-anchored" timestamp was initialised to `0.0`, which reads as *an event at
+  time zero*, so on a freshly booted host the cooldown blocked the watchdog
+  until the monotonic clock had passed it. Invisible on a Pi that had been up
+  for days, permanent on one that had just started. Both watchdogs now use
+  `None` for "never"; the tests caught it.
+
+- **A reconnecting radio is no longer replayed audio it has already played.**
+  The join floor - the mechanism that stops a rejoin rewinding - was keyed on
+  `(IP, User-Agent)`. The same radio reconnects with **two different**
+  User-Agents (`FSL IR2.10` from the firmware, `NSPlayer/8.0.0.3801` from the
+  media stack), so coming back with the other one meant no floor was found
+  and the session's whole reserve was handed over - which in this case held
+  **20.5 s** of audio the radio had already played (see the reserve bound
+  below). Measured on the live server, before and after: the new
+  connection's first 4096 bytes were found at **offset 0** of the previous
+  connection's stream (3.34 s replayed); now the two do not overlap at all.
+
+- **The join floor is an audio position, not a timestamp.** The reserve is
+  filled in bursts - a whole segment is transcoded far faster than realtime -
+  so a wall-clock floor was always *behind* the oldest piece in the reserve
+  and could never cut anything. It is now the piece's offset in the station's
+  running total of audio.
+
+- **The reserve is bounded by audio duration, not by piece count.**
+  `preroll_seconds` (10 s) was enforced as `queue_chunks` (128 *pieces*), and
+  because pieces arrive in bursts that held **20.5 s** of audio - measured as
+  57 chunks of 8640 bytes in the live log. A rejoin could therefore be primed
+  with twice the configured maximum. Now bounded by bytes: 27 chunks, 9.72 s.
+
+- **ICY metadata blocks no longer split an MP3 frame.** `ICY_METAINT` was the
+  heritage 16000, and an MP3 frame for this project's 192 kbit/s, 48 kHz
+  output is 576 bytes: `16000 / 576 = 27.78`, so **89 %** of blocks landed
+  inside a frame and the radio had to reassemble a frame the block had cut in
+  half. The grid is now `16128 = 28 × 576`, computed per stream by the new
+  `icy_metaint_for_frame()`. Measured after: **0 of 39** blocks land inside a
+  frame (was 89 %).
+
+- **ICY metadata is opt-in per request.** The metadata grid was sent to every
+  client, including the radio's `FSL IR2.10` connection, which never sends
+  `Icy-MetaData` and so was being handed a byte stream with 17-byte blocks
+  embedded in it - a firmware path that does not handle them. The
+  `icy-metaint` header and the blocks now go only to a client that asked for
+  them.
+
+- **`stall_reconnects_total` no longer decreases.** It was summed over the
+  live sessions, so when the station a watchdog event belonged to was reaped
+  the total fell from 1 back to 0. A Prometheus counter that goes down breaks
+  `rate()`, and it was simply untrue. It is now a service-wide counter.
+
+### Verified on the hardware
+
+- Four independent packet captures, including one of 832 MB over 3.5 hours, on
+  the real radio's own traffic.
+- The radio's two connections behave as both fixes intend: `FSL IR2.10` gets
+  no `icy-metaint` and no blocks, `NSPlayer` gets both on a 16 128-byte grid.
+- The live stream on a channel carrying real song titles: 55 ICY blocks, **0
+  malformed**, an unbroken chain of **1540 frames**, **0 of 54** blocks landing
+  inside a frame, and a valid title in every block.
+- **The microwave test passes on both channels.** With the oven at full power
+  the audio glitches for as long as the interference lasts and is clean
+  immediately after, with no manual restart. The journal from that run:
+
+  ```
+  the network retransmitted 6 TCP segments in 1.0s: closing 1 listener
+  connection(s) so the radios re-anchor their decoders (threshold 3)
+  ... 4, 3, 5, 3 segments ...
+  listener c7f009ea got 3.28s of silence; closing the connection so the radio
+  reconnects and re-anchors (threshold 1.00s)
+  ```
+
+  Both watchdogs fired where they should: five retransmission bursts and one
+  genuine starvation, with `dropped_chunks_total: 0` and
+  `pipeline_restarts_total: 0` throughout.
+- **No false positives in steady state.** On two hours of ordinary network
+  after the microwave test, both counters stayed at **0** - not one re-anchor
+  was forced. The mechanism costs nothing when the network is healthy, which is
+  the difference between it and a blunt "reconnect every N minutes" rule.
+
+The channel mattered, and it is worth saying so: the timing-only watchdog did
+fire on one station and appeared to work, then did **not** fire on another that
+was failing the same way. That is what sent the investigation to the
+retransmission count. A single passing test on a single station was not
+evidence, and it was treated as if it were.
+
 ## [2.2.2] - 2026-10-21
 
 Hardening release. Eleven defects found by an external review of the 2.2.x
@@ -664,6 +840,7 @@ for the FFmpeg-free pass-through path, per-listener pacing with drop
 isolation, a dashboard with health metrics, and a systemd installer for the
 Raspberry Pi.
 
+[2.3.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.3.0
 [2.2.2]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.2.2
 [2.2.1]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.2.1
 [2.2.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.2.0

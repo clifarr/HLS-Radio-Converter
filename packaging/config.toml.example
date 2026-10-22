@@ -108,6 +108,59 @@ handoff_overlap_seconds = 1.5
 # ID3 tags when it carries any - this is what puts the song name on an internet
 # radio's display. Off = no metadata blocks in the response at all.
 icy_song_metadata = true
+# ===================== keeping a radio's decoder in sync =====================
+#
+# A Frontier Silicon radio cannot recover from damaged audio: once its MP3
+# decoder has read a broken stream it does not resynchronise, and it will not
+# ask for a new connection while bytes keep arriving. Measured while garbled, it
+# acknowledged every byte at full rate for 776 seconds - it was reading the
+# stream perfectly and decoding noise. So the server has to end the connection,
+# and the radio reconnects on its own and is immediately clean.
+#
+# There are two ways to notice that it is time, and they catch different faults.
+# Both are on by default; either can be disabled with 0.
+
+# --- the network was damaged (Wi-Fi interference, e.g. a microwave oven) -----
+#
+# Lost packets are resent by TCP, so the radio receives audio *late* rather than
+# not at all. That is invisible from inside the server: measured during a
+# microwave test, the kernel's send buffer and the HTTP layer absorbed a 2.8s
+# stall and the application never saw anything wrong. The kernel does count what
+# it had to send twice, though, and the separation is enormous: 47
+# retransmissions in 776 seconds on a healthy connection (0.06/second), against
+# 21 inside a single ten-second window during interference.
+#
+# Re-anchor when this many segments are retransmitted within one poll.
+# Supported on Linux (/proc/net/snmp), macOS (netstat -s) and Windows (the IP
+# Helper API, GetTcpStatisticsEx - a struct field, so it is unaffected by the
+# system language). On any other platform the watchdog switches itself off and
+# the service behaves as it did before.
+# NOTE: the Windows reader has never been run on real Windows - only unit-tested
+# against a mock struct. If it cannot read the counter it reports unavailable and
+# this watchdog stays off; it will not misbehave. Check the dashboard's
+# retransmit_source field: "windows" means it is working, "unavailable" means it
+# is not, and everything else behaves as it did before this feature existed.
+retransmit_reconnect_segments = 3
+# How often the retransmission count is sampled, in seconds. One second bounds
+# how long a burst can go unnoticed; a whole interference burst can pass between
+# two reads if this is raised much above it.
+retransmit_poll_seconds = 1.0
+
+# --- the upstream starved (the station, not the network) ---------------------
+#
+# Close a listener's connection when it has been handed no audio for this long.
+# This is the fallback for a pipeline that has gone quiet for any other reason.
+# It fired in the field on a 3.28s gap.
+stall_reconnect_seconds = 1.0
+
+# Minimum gap between two forced reconnects of the same station, in seconds.
+# This is what bounds how long a radio can stay broken: cooldown + one poll +
+# the radio's own reconnect. Without it, an outage where every listener stalls
+# at once would close and reopen every connection every second - a failure this
+# project has produced before, 6940 connections in 89 seconds. Raise it if you
+# see repeated re-anchoring during an upstream problem; lower it to recover
+# faster from interference.
+stall_reconnect_cooldown_seconds = 5.0
 # No audio for this long => the pipeline is killed and restarted. Also the point
 # at which a session whose listeners have nothing buffered is counted as a
 # *silent* session and the service reports `degraded` on /health, /metrics and
