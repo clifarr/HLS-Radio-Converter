@@ -270,7 +270,100 @@ class Settings(BaseSettings):
     #: ``/proc/net/snmp`` on Linux, ``netstat -s`` on macOS, and the IP Helper
     #: API (``GetTcpStatisticsEx``) on Windows - a struct field there, not text,
     #: so it works whatever language the system is set to.
-    retransmit_reconnect_segments: int = 3
+    #:
+    #: Two thresholds, because one poll is the wrong unit
+    #: ------------------------------------------------
+    #: **A single poll cannot separate the two cases.** Measured on the Pi over
+    #: 420 consecutive one-second polls on a quiet network: 415 polls at zero
+    #: retransmissions, two at 1, and **three at 6** - so a healthy Wi-Fi link
+    #: produces bursts of 6 in one poll. During interference the measured
+    #: per-poll bursts were 3, 4, 5, 5, 5, 7 and 9.
+    #:
+    #: The two distributions **overlap** (healthy reaches 6, interference starts
+    #: at 3), so no per-poll threshold separates them: a threshold of 3 fires
+    #: on the healthy bursts, and a threshold of 7 or more misses the
+    #: interference polls of 3, 4 and 5.
+    #:
+    #: What separates them is the total over a few seconds, because the damage
+    #: from a microwave is spread across several polls rather than
+    #: concentrated in one. Measured, healthy against interference:
+    #:
+    #: ==================  ==========================  =========================
+    #: Window              Healthy (max observed)      Interference (observed)
+    #: ==================  ==========================  =========================
+    #: one poll            6                           9
+    #: 5 s                 6                           -
+    #: 10 s                **13**                      **21 - 29**
+    #: ==================  ==========================  =========================
+    #:
+    #: (The healthy column is 1920 consecutive one-second polls: 1890 at zero,
+    #: the rest 1-7 per poll, with a single ten-second total reaching 13. The
+    #: interference column is the microwave tests, where the service's own peak
+    #: window reached 29 and a packet capture showed 21.)
+    #:
+    #: So the watchdog sums the last ``retransmit_window_seconds`` of polls and
+    #: compares the total with ``retransmit_window_segments``, which sit between
+    #: the healthy maximum and the interference figure.
+    #:
+    #: The per-poll threshold stays high, at **10**: it is the "one enormous
+    #: poll" case, which the window would dilute, and 10 is above every
+    #: healthy poll ever measured. It is deliberately not the working trigger -
+    #: the interference never produced a poll above 9, so a per-poll threshold
+    #: of 10 would never fire at all. (It was the only trigger for one
+    #: release; the short-burst microwave test is what proved that wrong.)
+    retransmit_reconnect_segments: int = 10
+    #: The length of the trailing window the retransmissions are summed over.
+    #:
+    #: Ten seconds, because that is the window the measurements were taken in
+    #: and the one where the two distributions separate (healthy max 13,
+    #: interference 21-29).
+    retransmit_window_seconds: float = 10.0
+    #: The sum of retransmissions over that window which counts as damage.
+    #:
+    #: **14**: just above the highest healthy ten-second total measured (13) and
+    #: below every interference total (21-29). A shorter window would be
+    #: noisier; a longer one would delay the repair, and the repair is what the
+    #: radio is waiting for.
+    #:
+    #: The margin is one segment, which is thinner than it looks and has not
+    #: false-fired: both window fires in the passing hardware test landed at
+    #: exactly 14, on glitches the listener confirmed by ear. If spurious
+    #: re-anchors ever appear on a clean network, raise this to 16-18 rather
+    #: than lowering it - there is room up to 21.
+    retransmit_window_segments: int = 14
+    #: Re-anchor every listener of a station this often, whatever the network
+    #: looks like. 0 disables it. **This is the only trigger that cannot miss.**
+    #:
+    #: Why a blind timer is needed at all
+    #: ----------------------------------
+    #: Both other triggers key on *evidence* of damage, and there is a band of
+    #: interference that wedges the radio's decoder without producing enough
+    #: evidence to cross either threshold. Measured on the song-titles channel:
+    #: the radio went into the permanent garble with **neither trigger firing**
+    #: - the journal for the whole episode has no "retransmitted" and no
+    #: "silence" line - while the stream being delivered was verified perfect
+    #: (555 frames, 0 bad syncs, clean `ffmpeg -err_detect explode` decode).
+    #:
+    #: That is not a tuning problem. Once the interference stops, a wedged radio
+    #: is indistinguishable from a healthy one: measured while garbled, it
+    #: acknowledged every byte at full rate for 776 s. No threshold can separate
+    #: two identical observations, so *no* evidence-based trigger can bound how
+    #: long a radio stays broken. Only a timer can.
+    #:
+    #: Why 120 seconds
+    #: ---------------
+    #: The radio reconnects itself every 20-60 s anyway (measured in the journal
+    #: over hundreds of connections), so one forced reconnect per two minutes is
+    #: the same order as behaviour the hardware already exhibits and the decoder
+    #: already tolerates. It bounds "broken until someone restarts the service"
+    #: - the reported failure - to two minutes.
+    #:
+    #: The cost is real and should not be hidden: a brief audio gap every two
+    #: minutes, on every station, even on a perfect network. Set 0 if the
+    #: latency of the two evidence-based triggers is enough for you, and raise it
+    #: if two minutes of possible garble is acceptable in exchange for fewer
+    #: interruptions.
+    reanchor_interval_seconds: float = 120.0
     #: How often the retransmission count is sampled, in seconds.
     #:
     #: One second is one ``/proc/net/snmp`` read - on the order of 10 microseconds
@@ -429,6 +522,37 @@ class Settings(BaseSettings):
         # anything - the default of 3 exists only to ride out a stray blip.
         if v < 0:
             raise ValueError("retransmit_reconnect_segments must be 0 or more")
+        return v
+
+    @field_validator("retransmit_window_seconds")
+    @classmethod
+    def _check_retransmit_window(cls, v: float) -> float:
+        # The window has to be at least a few polls long, or it is just the
+        # per-poll threshold again with extra steps. The ceiling is because a
+        # longer window delays the repair, and the repair is the whole point:
+        # the radio is broken and waiting.
+        if not 1.0 <= v <= 60.0:
+            raise ValueError("retransmit_window_seconds must be between 1 and 60")
+        return v
+
+    @field_validator("retransmit_window_segments")
+    @classmethod
+    def _check_retransmit_window_segments(cls, v: int) -> int:
+        # Zero disables the windowed trigger, leaving the per-poll one.
+        # Negative has no meaning.
+        if v < 0:
+            raise ValueError("retransmit_window_segments must be 0 or more")
+        return v
+
+    @field_validator("reanchor_interval_seconds")
+    @classmethod
+    def _check_reanchor_interval(cls, v: float) -> float:
+        # Zero disables it. Below 30 s it would interrupt a working radio far
+        # more often than the radio reconnects by itself, which is pure cost for
+        # no benefit; the ceiling stops a typo from turning the safety net off
+        # without meaning to.
+        if v != 0.0 and not 30.0 <= v <= 3600.0:
+            raise ValueError("reanchor_interval_seconds must be 0 (off) or between 30 and 3600")
         return v
 
     @field_validator("retransmit_poll_seconds")

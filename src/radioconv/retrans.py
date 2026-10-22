@@ -55,7 +55,7 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol
 
 #: Where Linux exposes its TCP counters.
 PROC_NET_SNMP = "/proc/net/snmp"
@@ -148,6 +148,27 @@ def parse_netstat_tcp(text: str) -> Optional[int]:
         return int(match.group(1))
     except ValueError:  # pragma: no cover - the regex guarantees digits
         return None
+
+
+class RetransmitCounter(Protocol):
+    """What the watchdog needs from a counter, and all it is allowed to assume.
+
+    The manager accepts *any* object with these two attributes and a ``read``,
+    which is how a test drives the watchdog with a scripted series of readings
+    instead of the machine's real traffic. Declaring the attribute as this
+    protocol rather than as `TcpRetransmitCounter` says so in the type system
+    instead of only in the docstrings.
+    """
+
+    #: Short name for logs and metrics: ``linux``, ``darwin``, ``windows`` or
+    #: ``unavailable``.
+    name: str
+    #: False when this platform cannot report the figure at all.
+    available: bool
+
+    def read(self) -> Optional[int]:
+        """The cumulative count, or ``None`` when it cannot be read now."""
+        ...
 
 
 class TcpRetransmitCounter:

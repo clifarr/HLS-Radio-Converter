@@ -140,11 +140,50 @@ icy_song_metadata = true
 # this watchdog stays off; it will not misbehave. Check the dashboard's
 # retransmit_source field: "windows" means it is working, "unavailable" means it
 # is not, and everything else behaves as it did before this feature existed.
-retransmit_reconnect_segments = 3
+#
+# This is the EMERGENCY trigger - one enormous poll. It is 10 because that is
+# above every healthy poll ever measured, so it never fires on a clean network.
+# It is not the working trigger: interference never produced a poll above 9,
+# so this setting alone would never fire at all. The working trigger is the
+# windowed sum below.
+retransmit_reconnect_segments = 10
+# The working trigger: the total retransmissions over the last N seconds.
+#
+# One poll cannot tell interference from a healthy Wi-Fi link - the healthy
+# link reaches 6 in a single poll and interference starts at 3, so the two
+# distributions overlap. The totals do not: measured over 420 one-second
+# polls on a quiet network, the healthy link peaked at 7 over ten seconds,
+# while interference reached 21 in the same window. The damage from a
+# microwave is spread across several polls rather than concentrated in one.
+retransmit_window_seconds = 10.0
+# The windowed total which counts as damage. 14 is twice the healthy maximum
+# of 7 and comfortably below the interference figure of 21.
+retransmit_window_segments = 14
 # How often the retransmission count is sampled, in seconds. One second bounds
 # how long a burst can go unnoticed; a whole interference burst can pass between
 # two reads if this is raised much above it.
 retransmit_poll_seconds = 1.0
+
+# --- the safety net: re-anchor on a timer, whatever the network looks like ---
+#
+# This is the ONLY trigger that cannot miss, and it exists because both
+# triggers above key on evidence of damage - and there is a band of
+# interference that wedges the radio's decoder without producing any.
+#
+# Measured on the song-titles channel: the radio went into the permanent garble
+# with NEITHER trigger firing (the journal for the whole episode has no
+# "retransmitted" and no "silence" line), while the stream being delivered was
+# verified perfect - 555 frames, 0 bad syncs, a clean `ffmpeg -err_detect
+# explode` decode. There was nothing to detect. Once the interference stops, a
+# wedged radio acknowledges every byte at full rate, exactly like a healthy one,
+# so no threshold can separate two identical observations.
+#
+# The cost is real: one brief audio gap per interval, on every station, even on
+# a perfect network. 120 s is chosen to be the same order as the radio's own
+# reconnect cadence (20-60 s, measured over hundreds of connections), so the
+# decoder already tolerates it. It bounds "glitches until someone restarts the
+# service" to two minutes. Set 0 to disable it and rely on the triggers above.
+reanchor_interval_seconds = 120.0
 
 # --- the upstream starved (the station, not the network) ---------------------
 #

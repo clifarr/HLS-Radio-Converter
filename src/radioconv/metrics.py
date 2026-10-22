@@ -57,6 +57,18 @@ GAUGES: Dict[str, str] = {
     # the name would be a metric that lies.
     "bytes_in_last_hour": "Bytes downloaded from stations in the last hour.",
     "bytes_out_last_hour": "Audio bytes handed to radios in the last hour.",
+    # The retransmission watchdog's readings. The per-poll figure alone cannot
+    # tell interference from a healthy Wi-Fi link - the healthy link reaches 6
+    # in one poll and interference starts at 3 - so the windowed total is the
+    # one the threshold is compared against. Both are published so the
+    # threshold can be set from the running machine's own numbers.
+    "retransmit_last_delta": "TCP segments retransmitted in the most recent poll.",
+    "retransmit_peak_delta": "The largest single-poll retransmission count seen.",
+    "retransmit_window_delta": (
+        "TCP segments retransmitted over the trailing window, which is what the "
+        "watchdog compares against its threshold."
+    ),
+    "retransmit_peak_window": "The largest windowed retransmission total seen.",
 }
 
 #: Counter name -> HELP text. Counters only ever increase (until restart).
@@ -72,6 +84,11 @@ COUNTERS: Dict[str, str] = {
     "retransmit_reconnects_total": (
         "Listener connections closed after the OS reported a TCP retransmission "
         "burst (Wi-Fi interference)."
+    ),
+    "scheduled_reconnects_total": (
+        "Listener connections closed by the periodic safety net, which does not "
+        "depend on any evidence of damage. This is the only trigger that can "
+        "repair a radio that stopped decoding without producing evidence."
     ),
     "capacity_rejections_total": "Requests refused with 503 because the service was full.",
 }
@@ -123,6 +140,15 @@ def snapshot(manager: SessionManager, monitor: ResourceMonitor) -> Dict[str, Any
             "loop_lag_seconds": round(monitor.health.loop_lag, 3),
             "bytes_in_last_hour": throughput["bytes_in_last_hour"],
             "bytes_out_last_hour": throughput["bytes_out_last_hour"],
+            # The retransmission watchdog's two readings. The per-poll figure
+            # alone cannot tell interference from a healthy link, so the
+            # windowed total is the one the threshold is compared against -
+            # both are published so an operator can set the threshold from the
+            # running machine's own numbers rather than from a guess.
+            "retransmit_last_delta": streams["retransmit_last_delta"],
+            "retransmit_peak_delta": streams["retransmit_peak_delta"],
+            "retransmit_window_delta": streams["retransmit_window_delta"],
+            "retransmit_peak_window": streams["retransmit_peak_window"],
         },
         "counters": {
             # From the service-wide counters, not from a sum over the live
@@ -145,6 +171,7 @@ def snapshot(manager: SessionManager, monitor: ResourceMonitor) -> Dict[str, Any
             # that decreases breaks `rate()`.
             "stall_reconnects_total": streams["stall_reconnects"],
             "retransmit_reconnects_total": streams["retransmit_reconnects"],
+            "scheduled_reconnects_total": streams["scheduled_reconnects"],
             "capacity_rejections_total": streams["capacity_rejections"],
         },
         # The rolling window in full (totals, window length, how many samples it

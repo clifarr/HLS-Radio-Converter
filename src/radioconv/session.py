@@ -37,7 +37,7 @@ from typing import Any, Coroutine, Deque, Dict, List, Optional, Set, Tuple
 
 from .config import Settings
 from .pipeline import PipelineFatal, StreamPipeline
-from .retrans import tcp_retransmit_counter
+from .retrans import RetransmitCounter, tcp_retransmit_counter
 from .throughput import SAMPLE_SECONDS, Throughput
 from .tsdemux import (
     adts_align_offset,
@@ -252,6 +252,12 @@ class StreamSession:
         #: started.  The join floor is measured against this, not against
         #: the clock - see `Subscriber.reserve_bytes_sent`.
         self._audio_bytes = 0
+        #: When this station's listeners were last re-anchored by the *timer*.
+        #: ``None`` means never, which is always allowed - see
+        #: `SessionManager.reanchor_overdue_sessions`.
+        self.last_reanchor_at: Optional[float] = None
+        #: How many times the timer re-anchored this station.
+        self.scheduled_reconnects = 0
         #: When the least-buffered listener last had something to play. ``None``
         #: means nothing is starved. See `starved_for`.
         self._starved_since: Optional[float] = None
@@ -339,10 +345,18 @@ class StreamSession:
         # only the audio this key has *not* already been sent; see
         # `_join_floor` for why the distinction is audible.
         self._prime(subscriber, floor)
+        # The floor is logged because it is the difference between a rejoin that
+        # *resumes* and one that rewinds: `none` means the whole reserve was
+        # handed over, i.e. up to `preroll_seconds` of audio this radio has
+        # already played. A rewind is a splice in the stream, which is the one
+        # class of defect an MP3 decoder cannot recover from - so an attach log
+        # reading `floor=none, 27 chunks` on a *reconnect* is a defect, while
+        # `27 chunks` on a genuinely new listener is correct.
         log.info(
-            "listener attached (%d now listening, %d chunks prerolled)",
+            "listener attached (%d now listening, %d chunks prerolled, floor=%s)",
             len(self.subscribers),
             subscriber.queue.qsize(),
+            "none" if floor is None else floor,
             extra={"session": self.id},
         )
         return subscriber
@@ -410,6 +424,39 @@ class StreamSession:
         return len(listeners)
 
     def _signal_end(self, subscriber: Subscriber) -> None:
+        """Ask a subscriber's response generator to stop, *now*.
+
+        The sentinel used to be appended to the queue, and that made the
+        re-anchor take as long as the backlog it had to get through. The
+        response generator reads the queue in order and the pacer hands those
+        chunks out at the stream's realtime rate, so a listener holding the
+        27-chunk (9.2 s) reserve did not see the sentinel for 9.2 s - measured
+        on the live server as a 7-11 s delay between "closing 1 listener
+        connection" and the connection actually closing.
+
+        That delay defeated the whole point. The radio's decoder is already
+        broken at that moment; the re-anchor exists to cut it loose *so it can
+        resynchronise*, and every extra second of backlog is more damaged
+        audio handed to a decoder that cannot recover from it. It also
+        swallowed the cooldown: the watchdog fired again while the first
+        repair was still in flight, so the radio was hit twice and the repair
+        arrived later than the "within 10 s" promise.
+
+        So the queue is emptied and the sentinel goes in *first*: the radio is
+        disconnected immediately, and the audio still queued for it is audio
+        that was going to be discarded by the disconnect anyway.
+
+        The backlog is discarded rather than played out. It is not counted as
+        ``dropped``: that counter means "this listener could not keep up and
+        the station threw audio away", and a deliberate disconnect is the
+        opposite of a capacity problem. The audio never reached the socket, so
+        ``bytes_sent`` never counted it - nothing is misreported.
+        """
+        while True:
+            try:
+                subscriber.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         try:
             subscriber.queue.put_nowait(None)
         except asyncio.QueueFull:
@@ -1308,12 +1355,26 @@ class SessionManager:
         #: off by configuration or unsupported on this platform.
         self._retransmit_task: Optional[asyncio.Task] = None
         #: Reads the cumulative retransmission count; see `radioconv.retrans`.
-        self.retransmit_counter = tcp_retransmit_counter()
+        self.retransmit_counter: RetransmitCounter = tcp_retransmit_counter()
         #: Segments retransmitted in the most recent poll, for the dashboard, and
         #: the largest burst seen - so "was the Wi-Fi bad?" is answerable after
         #: the fact without a packet capture.
         self.retransmit_last_delta = 0
         self.retransmit_peak_delta = 0
+        #: The blind periodic re-anchor: the only trigger that cannot miss.
+        #: See `Settings.reanchor_interval_seconds`.
+        self._safety_task: Optional[asyncio.Task] = None
+        #: Service-wide count of re-anchors done by the timer rather than by
+        #: evidence. Kept apart from the two watchdog counters so an operator can
+        #: see which mechanism is actually repairing their radios.
+        self.scheduled_reconnects = 0
+        #: Segments retransmitted over the trailing window, and the largest
+        #: total seen. A single poll cannot separate interference from a
+        #: healthy link - the healthy link reaches 6 in one poll and
+        #: interference starts at 3 - but the totals over ten seconds do.
+        #: See `Settings.retransmit_window_segments`.
+        self.retransmit_window_delta = 0
+        self.retransmit_peak_window = 0
         self.consecutive_failures = 0
         self.capacity_rejections = 0
         #: Service-wide count of listeners closed by the stall watchdog.
@@ -1362,9 +1423,11 @@ class SessionManager:
             self._retransmit_task = asyncio.create_task(
                 self._retransmit_loop(), name="radioconv-retransmit"
             )
+        if self.settings.reanchor_interval_seconds > 0 and self._safety_task is None:
+            self._safety_task = asyncio.create_task(self._safety_loop(), name="radioconv-reanchor")
 
     async def aclose(self) -> None:
-        for task in (self._reaper, self._sampler, self._retransmit_task):
+        for task in (self._reaper, self._sampler, self._retransmit_task, self._safety_task):
             if task is not None:
                 task.cancel()
         for session in list(self.sessions.values()):
@@ -1403,16 +1466,114 @@ class SessionManager:
             self.retransmit_reconnects += 1
         return touched
 
+    # ------------------------------------------------- periodic safety net
+    def reanchor_overdue_sessions(self, now: Optional[float] = None) -> int:
+        """End the listeners of any station that has not been re-anchored lately.
+
+        The blind half of the repair, and the only half that cannot miss. Both
+        other triggers act on *evidence* of damage, and there is a band of
+        interference that wedges a radio's decoder without crossing either
+        threshold - measured on the song-titles channel, where the radio went
+        into the permanent garble with neither trigger firing while the stream
+        being sent was verified perfect.
+
+        Once the interference stops, a wedged radio is indistinguishable from a
+        healthy one (it acknowledges every byte at full rate), so no amount of
+        cleverness in the evidence-based triggers can bound how long it stays
+        broken. Only a timer can - this one.
+
+        Extracted from the loop so the decision is testable without a clock or
+        a socket, exactly as ``reanchor_stalled_sessions`` is.
+        """
+        interval = self.settings.reanchor_interval_seconds
+        if interval <= 0:
+            return 0
+        at = time.monotonic() if now is None else now
+        touched = 0
+        for session in list(self.sessions.values()):
+            if not session.listener_count:
+                continue
+            previous = session.last_reanchor_at
+            if previous is not None and at - previous < interval:
+                continue
+            session.last_reanchor_at = at
+            session.scheduled_reconnects += 1
+            touched += session.reanchor_listeners()
+        if touched:
+            self.scheduled_reconnects += 1
+            log.warning(
+                "re-anchoring %d listener connection(s) on a %.0fs timer, so a "
+                "radio that has stopped decoding cannot stay that way: the "
+                "evidence-based triggers key on damage, and a wedged radio "
+                "produces none",
+                touched,
+                interval,
+            )
+        return touched
+
+    async def _safety_loop(self) -> None:
+        """Run the periodic safety net until cancelled."""
+        interval = max(1.0, min(30.0, self.settings.reanchor_interval_seconds / 4.0))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                self.reanchor_overdue_sessions()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - a timer must never die
+                log.exception("periodic re-anchor failed; it will try again")
+
     async def _retransmit_loop(self) -> None:
         """Re-anchor the listeners when the OS reports a retransmission burst.
 
         See `Settings.retransmit_reconnect_segments` for why this is the signal
-        and the measured numbers behind the threshold.
+        and the measured numbers behind the thresholds.
+
+        Two triggers, because one poll is the wrong unit
+        ------------------------------------------------
+        A single poll cannot tell interference from a healthy link: the healthy
+        link reaches 6 retransmissions in one poll and interference starts at
+        3. What separates them is the total over a few seconds - healthy
+        peaked at 7 over ten seconds, interference at 21 - so the loop keeps a
+        trailing window of per-poll deltas and sums it.
+
+        The per-poll threshold is kept as well, for the "one sharp burst" case
+        that the window would dilute.
+
+        Why the window is emptied when it fires
+        ---------------------------------------
+        Measured, before that was done: a single interference event fired
+        **twice**. The per-poll trigger fired at 16:34:09 (16 segments in one
+        second), and the window still held that same damage - 24, 24, 24, 23,
+        23 - so the moment the cooldown expired at 16:34:14 the *window* trigger
+        fired again on evidence that had already been acted upon. The radio had
+        reconnected in that very second and was killed within it ("done after
+        1s"), reconnected again, and stayed glitching.
+
+        That is fatal rather than merely wasteful: a radio needs a few seconds
+        of unbroken stream to rebuild its decoder state, and a second re-anchor
+        taken on the same evidence guarantees it never gets them. The cooldown
+        (5 s) is deliberately shorter than the window (10 s), so without
+        emptying it, *any* window-triggered re-anchor can always be repeated
+        once.
+
+        Emptying the window keeps the trigger honest: damage that has been
+        acted upon is not evidence for acting again. New damage still re-arms
+        it, so sustained interference is caught at the same latency - it just
+        has to be genuinely new.
         """
         threshold = self.settings.retransmit_reconnect_segments
+        window_seconds = self.settings.retransmit_window_seconds
+        window_threshold = self.settings.retransmit_window_segments
+        poll_seconds = self.settings.retransmit_poll_seconds
+        #: The per-poll deltas still inside the trailing window, oldest first.
+        window: Deque[int] = deque()
+        #: How many polls the window holds: its length in seconds.
+        window_polls = max(1, round(window_seconds / max(poll_seconds, 0.01)))
+
         previous = await asyncio.to_thread(self.retransmit_counter.read)
         while True:
-            await asyncio.sleep(self.settings.retransmit_poll_seconds)
+            await asyncio.sleep(poll_seconds)
             total = await asyncio.to_thread(self.retransmit_counter.read)
             if total is None or previous is None:
                 # No reading this tick (a transient failure, or the very first
@@ -1429,16 +1590,47 @@ class SessionManager:
                 continue
             self.retransmit_last_delta = delta
             self.retransmit_peak_delta = max(self.retransmit_peak_delta, delta)
-            if delta < threshold:
+
+            window.append(delta)
+            while len(window) > window_polls:
+                window.popleft()
+            window_sum = sum(window)
+            self.retransmit_window_delta = window_sum
+            self.retransmit_peak_window = max(self.retransmit_peak_window, window_sum)
+
+            burst = delta >= threshold
+            sustained = window_threshold > 0 and window_sum >= window_threshold
+            if not burst and not sustained:
                 continue
+            # Consume the evidence as soon as it is acted upon - and if there
+            # is nobody to act upon, discard it anyway. A radio that attaches
+            # later is a *fresh connection with a clean stream*, and must not
+            # be killed for damage that arrived while it was not listening.
+            # (Measured shape of that bug: the window held 29 while the station
+            # was warm with no listeners, so the next radio to attach would
+            # have been disconnected on its first poll.)
+            window.clear()
+            self.retransmit_window_delta = 0
             closed = self.reanchor_stalled_sessions()
-            if closed:
+            if not closed:
+                continue
+            if sustained and not burst:
+                log.warning(
+                    "the network retransmitted %d TCP segments over %.1fs: "
+                    "closing %d listener connection(s) so the radios "
+                    "re-anchor their decoders (window threshold %d)",
+                    window_sum,
+                    window_seconds,
+                    closed,
+                    window_threshold,
+                )
+            else:
                 log.warning(
                     "the network retransmitted %d TCP segments in %.1fs: "
-                    "closing %d listener connection(s) so the radios re-anchor "
-                    "their decoders (threshold %d)",
+                    "closing %d listener connection(s) so the radios "
+                    "re-anchor their decoders (threshold %d)",
                     delta,
-                    self.settings.retransmit_poll_seconds,
+                    poll_seconds,
                     closed,
                     threshold,
                 )
@@ -1627,6 +1819,7 @@ class SessionManager:
             "silent": sum(1 for s in sessions if s.stalled),
             #: Sessions that have not yet produced a single byte.
             "starting": sum(1 for s in sessions if not s.producing),
+            "scheduled_reconnects": self.scheduled_reconnects,
             "capacity_rejections": self.capacity_rejections,
             #: Service-wide, and monotonic - see ``SessionManager.stall_reconnects``.
             "stall_reconnects": self.stall_reconnects,
@@ -1637,6 +1830,10 @@ class SessionManager:
             "retransmit_source": self.retransmit_counter.name,
             "retransmit_last_delta": self.retransmit_last_delta,
             "retransmit_peak_delta": self.retransmit_peak_delta,
+            "retransmit_window_delta": self.retransmit_window_delta,
+            "retransmit_peak_window": self.retransmit_peak_window,
+            "retransmit_window_seconds": self.settings.retransmit_window_seconds,
+            "retransmit_window_segments": self.settings.retransmit_window_segments,
             "details": [s.as_dict() for s in sessions],
         }
 

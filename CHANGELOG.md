@@ -3,6 +3,226 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.3.1] - 2026-10-22
+
+Makes the self-repair actually work, after measuring the previous release on the
+real radio rather than trusting it.
+
+Three things were wrong, and each was found by a hardware test that failed:
+
+1. a re-anchor took **7-11 s** to reach the radio, so the radio kept being fed
+   damaged audio while it waited;
+2. the retransmission trigger looked at **one second**, a unit in which healthy
+   Wi-Fi and interference cannot be told apart;
+3. there was a band of interference that wedged the decoder producing **no
+   evidence at all**, which no threshold can ever detect.
+
+Verified on the real hardware, three times, after the fixes: three induced
+glitches, three recoveries, "almost instantly" each time.
+
+### Fixed
+
+- **The re-anchor no longer waits for the queued audio to drain.** The
+  end-of-stream sentinel was *appended* to the listener's queue, and the
+  response generator reads that queue in order while the pacer hands those
+  chunks out at the stream's realtime rate. A listener holding the usual
+  27-chunk (9.2 s) reserve therefore did not see the sentinel for 9.2 s.
+  Measured on the live Pi: a **7-11 s** gap between "closing 1 listener
+  connection" and the connection actually closing, in 26 of 33 watchdog
+  fires.
+
+  That delay defeated the purpose of the whole feature. The radio's decoder is
+  already broken when the watchdog fires; the re-anchor exists to cut it loose
+  so it can resynchronise, and every extra second of backlog is more damaged
+  audio handed to a decoder that cannot recover from it. It also swallowed the
+  cooldown - the watchdog fired again while the first repair was still in
+  flight - so the radio was hit twice and the repair arrived later than the
+  "within 10 s" the cooldown was supposed to bound.
+
+  The backlog is now discarded and the sentinel is the next thing the
+  generator sees. That audio was going to be thrown away by the disconnect
+  anyway, and it is *not* counted as dropped chunks: that counter means "this
+  listener could not keep up", and a deliberate disconnect is the opposite of a
+  capacity problem.
+
+- **The retransmission trigger now sums a trailing window instead of reading a
+  single poll.** A single poll cannot separate interference from a healthy
+  Wi-Fi link, and the measurement says so plainly:
+
+  ==================  ===================  ======================
+  Window              Healthy (observed)   Interference (observed)
+  ==================  ===================  ======================
+  one poll            6                    9
+  5 s                 6                    -
+  10 s                **13**               **21 - 29**
+  ==================  ===================  ======================
+
+  The healthy figures come from **1920 consecutive one-second polls** on a
+  quiet Pi network (1890 at zero, the rest 1-7, with one ten-second total
+  reaching 13). The interference figures come from the microwave tests. The
+  per-poll distributions **overlap** - the healthy link reaches 6 and
+  interference starts at 3 - so no single-poll threshold can separate them.
+  The ten-second totals can.
+
+  The damage from a microwave is spread across several polls rather than
+  concentrated in one, which is exactly what a 20-second burst looks like.
+  The watchdog keeps the last `retransmit_window_seconds` (10) of per-poll
+  deltas and fires when the total passes `retransmit_window_segments` (14).
+
+  The per-poll threshold (`retransmit_reconnect_segments`, 10) is kept for the
+  "one enormous poll" case, which the window would dilute. It is deliberately
+  high, above every healthy poll ever measured, and it is *not* the working
+  trigger - the interference never produced a poll above 9, so a per-poll
+  threshold of 10 would never fire alone. An earlier build set it to 3, which
+  fired on healthy traffic; the test after that is what proved it.
+
+- **A finished interference burst re-anchors once, not once per cooldown.**
+  The windowed trigger kept the damage it had already acted upon, so the same
+  event fired again the moment the cooldown expired. Measured on the Pi:
+
+  ```
+  16:34:09  window=24  reconnects=1  <- per-poll trigger (16 segments in 1.0s)
+  16:34:14  window=23  reconnects=2  <- window trigger, SAME damage
+  16:34:14  listener done after 1s     <- killed in the second it connected
+  ```
+
+  The radio had reconnected in that very second and was disconnected within
+  it, reconnected again, and stayed glitching. That is fatal rather than
+  wasteful: a radio needs a few seconds of unbroken stream to rebuild its
+  decoder state, and a second re-anchor on the same evidence guarantees it
+  never gets them. The cooldown (5 s) is deliberately shorter than the window
+  (10 s), so without clearing the window *any* window-triggered re-anchor could
+  always be repeated once.
+
+  The window is now emptied when it fires. New damage still re-arms it, so
+  sustained interference is caught at the same latency - it just has to be
+  genuinely new.
+
+- **Damage that arrives while no radio is listening no longer kills the next
+  one.** The window accumulated while the station was warm with nobody
+  attached, so the next radio to connect was disconnected on its first poll -
+  for damage it never received, on a connection whose stream was clean. The
+  window is now discarded whether or not there was a listener to act on.
+
+- `SessionManager.retransmit_counter` is typed as a `RetransmitCounter`
+  protocol rather than the concrete class, which is what it actually accepts -
+  any object with `name`, `available` and `read()`.
+
+### Added
+
+- **A periodic safety net: `reanchor_interval_seconds` (default 120, `0`
+  disables it).** Every listener of a station is re-anchored on a timer,
+  whether or not anything looks wrong.
+
+  It exists because the evidence-based triggers **cannot** cover every case,
+  and the song-titles channel proved it. Measured there: the radio went into
+  the permanent garble with **neither trigger firing** - the journal for the
+  whole episode contains no `retransmitted` and no `silence` line - while the
+  stream being delivered was verified perfect:
+
+  ```
+  captured     320611 bytes, 19 ICY blocks
+  audio        319680 bytes = 555 frames, 0 trailing
+  bad syncs    0
+  titles       StreamTitle='Cesare Cremonini - Paparazzi';
+  ffmpeg -err_detect explode   ->  clean decode, zero errors
+  ```
+
+  That last check is the one that catches a bit-reservoir break, which a
+  frame-sync check cannot see. There was nothing wrong with the stream, and
+  nothing to detect.
+
+  This is not a tuning problem, so tuning cannot fix it. Once the interference
+  stops, a wedged radio acknowledges every byte at full rate - measured, for
+  776 s - which is exactly what a healthy radio does. No threshold can separate
+  two identical observations, so **no** evidence-based trigger can bound how
+  long a radio stays broken. Only a timer can.
+
+  The cost is honest: one brief audio gap per interval, on every station, even
+  on a perfect network. 120 s is the same order as the radio's own reconnect
+  cadence (20-60 s, measured over hundreds of connections in the journal), so
+  the decoder already tolerates it, and it bounds "glitches until someone
+  restarts the service" - the reported failure - to two minutes. Raise it if the
+  interruptions matter more to you than the worst case; set it to `0` to rely on
+  the evidence-based triggers alone.
+
+- **The three repair mechanisms are counted separately** -
+  `scheduled_reconnects_total` (timer), `retransmit_reconnects_total` (network
+  damage) and `stall_reconnects_total` (silence) - so an operator can see which
+  one is actually repairing their radios instead of having to guess. The window
+  figures are published too (`retransmit_window_delta`,
+  `retransmit_peak_window`), so the threshold can be read off a running service
+  rather than trusted from a changelog.
+
+- **The attach log now reports the join floor** (`floor=none` or a byte
+  offset), because that is the difference between a rejoin that *resumes* and
+  one that rewinds - and a rewind is a splice, the one class of defect an MP3
+  decoder cannot recover from.
+
+### Verified on the hardware
+
+Four microwave tests. Each of the first three found a bug, and the last one
+passed.
+
+**Test 1 - the re-anchor is immediate.** Oven on for about twenty seconds, off
+as soon as the glitch started; the radio recovered by itself:
+
+```
+14:34:16 WARNING listener 8440322f got 9.57s of silence; closing the
+         connection so the radio reconnects and re-anchors (threshold 1.00s)
+14:34:16 INFO    listener 8440322f done after 904s (21031 KiB)
+14:34:17 INFO    listener attached (1 now listening, 27 chunks prerolled)
+```
+
+Back **one second** after the watchdog fired, against 7-11 s in the previous
+release. That run also showed the retransmission trigger *not* firing at all,
+because its threshold was above any poll the interference produced - which is
+what led to the windowed redesign.
+
+**Test 2 - the windowed trigger works, and fires twice on one event.** The
+first hardware confirmation that ten seconds is the right unit: a window total
+of **29**, against a healthy maximum of 13. Also where the double fire was
+caught - the second fire disconnected a radio that had reconnected in that
+same second.
+
+**Test 3 - the wedge with no evidence.** On the song-titles channel the radio
+glitched permanently with neither trigger firing, while the stream was verified
+perfect. That is what the periodic safety net exists for.
+
+**Test 4 - passes.** Three induced glitches, three recoveries. All three
+mechanisms fired, each one repairing the radio:
+
+```
+16:56:29  TIMER     re-anchoring 1 listener on a 120s timer
+16:58:29  TIMER     (exactly 120s later)
+16:59:17  WINDOW    14 TCP segments over 10.0s  (threshold 14)
+16:59:42  WINDOW    14 TCP segments over 10.0s  (threshold 14)
+17:00:04  STALL     listener 96eeb7b6 got 1.31s of silence (threshold 1.00s)
+17:00:29  TIMER
+```
+
+Every recovery was "almost instantly", in the words of the person listening.
+The radio ended the run healthy: connected, `dropped_chunks: 0`, 6.8 s
+buffered, 0.0 s starved.
+
+### Known limits
+
+- **The window threshold has a thin margin.** Both window fires in the passing
+  test landed at exactly 14, its own threshold, while the highest healthy
+  ten-second total measured was 13. It has not false-fired, but the gap is one
+  segment. If spurious re-anchors ever appear on a clean network, raise
+  `retransmit_window_segments` to 16-18 - the interference figures measured 21-29,
+  so there is room - rather than lowering it.
+- **The detections are machine-wide.** The count is the whole kernel's, so the
+  service's own upstream downloads contribute to it. Per-socket numbers exist
+  (`/proc/net/tcp`'s `retrnsmt`, `ss -tni`) but are not portable to the same
+  three platforms, so they are not used.
+- **The Windows reader has never run on real Windows.** See 2.3.0.
+- **A re-anchor still replays a little audio.** `handoff_overlap_seconds`
+  (1.5 s) re-sends already-delivered audio to bridge the handoff. Measured on
+  a reconnect: 5 chunks, 1.71 s, of which 1.37 s had been sent before. That is
+  deliberate and bounded, but it is a deliberate discontinuity.
+
 ## [2.3.0] - 2026-10-22
 
 A **minor** release rather than a patch, because the remedy is a new capability
@@ -31,7 +251,7 @@ the first attempt at it did not. See "Re-anchoring the listeners" below.
 ### Added
 
 - **Listeners are re-anchored when the operating system reports a TCP
-  retransmission burst** (`retransmit_reconnect_segments`, default `3`, polled
+  retransmission burst** (`retransmit_reconnect_segments`, default `10`, polled
   once a second; `0` disables it). This is the fix that actually works.
 
   Why a burst of retransmissions, and not a stall: Wi-Fi interference damages
@@ -840,6 +1060,7 @@ for the FFmpeg-free pass-through path, per-listener pacing with drop
 isolation, a dashboard with health metrics, and a systemd installer for the
 Raspberry Pi.
 
+[2.3.1]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.3.1
 [2.3.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.3.0
 [2.2.2]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.2.2
 [2.2.1]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.2.1
