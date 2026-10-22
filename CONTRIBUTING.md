@@ -69,6 +69,58 @@ two concurrent runs will corrupt the tree - which is exactly what happened once.
 To run just the fast tests, skip the names that stream:
 `uv run pytest -q -k "not stream"`.
 
+## Anything that changes what the radio plays needs a listening test
+
+**A green test suite is not evidence that the stream sounds right.** Add a
+listening test, on a real radio, to any change that can affect the audio. No
+exception, and "the tests pass" is not a substitute.
+
+This rule exists because the tests have been green through every audio fault
+this project has shipped:
+
+- The bundled FFmpeg 7.0.2 segfaulted on every MPEG-TS segment. Every unit test
+  passed, because they ran against the system FFmpeg; the failure only appeared
+  once a second binary was on the machine.
+- A whole release could deliver a *verified perfect* stream - 555 frames, 0 bad
+  syncs, a clean `ffmpeg -err_detect explode` decode - that a radio rendered as
+  permanent garble, because the decoder could not resynchronise after damage.
+  The bytes were right and the sound was wrong, and no assertion was in a
+  position to notice.
+- A repair timer fired every 120 s and made the radio skip or repeat a few
+  seconds of audio. Every test passed, the metrics agreed, and the defect was
+  only ever audible.
+
+Automated checks cannot catch this class of bug, because they measure the bytes
+we *send*, while the defect lives in how the receiver *decodes* them. Only a
+person listening can tell the difference.
+
+What counts as a listening test:
+
+1. **Deploy to the real device and listen to a real station**, ideally for
+   several minutes - the 120 s bug above needed more than two minutes of
+   listening to appear at all. Say in the PR how long you listened.
+2. **Exercise the path your change touches.** Playback changes need a radio
+   that connects, drops and reconnects; metadata changes need a station that
+   actually sends titles; transcoding changes need a transcoded station *and* a
+   pass-through one.
+3. **Interfere with it, if it is there to handle damage.** Turn a microwave on.
+   Pull the network. If a change claims to repair something, prove it repairs
+   something - the standing test for the re-anchor work was "induce a glitch,
+   confirm the radio recovers, and confirm it is not hit twice".
+4. **Watch the counters, not just your ears.** `/health` distinguishes a repair
+   the operator asked for from one that happened on its own: a climbing
+   `scheduled_reconnects_total` means a blind timer is firing, which is audible
+   by definition, and a climbing `stall_reconnects_total` on a quiet network
+   means the thresholds are wrong. Neither shows up in a unit test.
+5. **Write the outcome down** in the pull request or the CHANGELOG. "Tested on
+   the hardware, three induced glitches, three recoveries" is evidence;
+   "should work" is not.
+
+If you cannot test on real hardware, say so explicitly in the pull request
+rather than implying the change was verified. The CHANGELOG has a "Known
+limits" convention for exactly this - for example the Windows retransmission
+counter is documented as never having run on real Windows hardware.
+
 ## The pre-commit hook
 
 **Install it once, after cloning:**

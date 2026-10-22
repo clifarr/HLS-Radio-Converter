@@ -62,39 +62,65 @@ jobs:
           # looked like it covered four versions and covered one.
           python-version: ${{ matrix.python }}
       - name: Install ffmpeg
-        # Unbounded apt hangs. On run 39808595539 all four matrix jobs fetched
-        # the same 62.8 MB of archives and then sat on one 9 MB file
-        # (`libcodec2-1.2`) for the rest of the step without a single byte
-        # arriving - azure.archive.ubuntu.com stalls mid-transfer and apt never
-        # times out, so the whole job wedges. Two earlier runs were cancelled
-        # the same way (39802019682 and 39804942257), and in every case the
-        # matrix entries that had already got past this step passed, so the red
-        # light was never about the code.
+        # The runner image points apt at azure.archive.ubuntu.com. That mirror
+        # stalled mid-transfer three times in a row: run 39808595539 fetched 8
+        # of the 87 archives and then sat on libcodec2-1.2 (9 MB) for the rest
+        # of the step with no bytes arriving at all, and runs 39802019682 and
+        # 39804942257 were cancelled the same way. Every job that got past this
+        # step passed, so none of it was ever about the code.
         #
-        # `Acquire::http::Timeout` alone does not help, because apt's retries
-        # restart the same stalled transfer. What does work is bounding the
-        # whole install and re-running it: apt keeps fetched archives in
-        # /var/cache/apt/archives, so each attempt resumes instead of starting
-        # over and the set of remaining packages shrinks. SIGINT, not SIGKILL,
-        # so apt releases the dpkg lock on the way out.
+        # Two things are needed, because there are two different failures:
+        #
+        #   1. A stalled transfer. `Acquire::http::Timeout` does NOT help - apt
+        #      retries the same stuck connection - so each attempt is bounded
+        #      with `timeout --signal=INT` (SIGINT, so apt releases the dpkg
+        #      lock) and retried. apt keeps fetched archives in
+        #      /var/cache/apt/archives, so a retry resumes instead of starting
+        #      over and the remaining set shrinks.
+        #   2. A bad mirror, where every attempt stalls. So the attempts rotate
+        #      through different Ubuntu mirrors, repointing the sources first.
+        #      The image's own mirror is tried first (it is the fastest when it
+        #      works), then the Ubuntu archive, then kernel.org's mirror.
         timeout-minutes: 20
         run: |
           set -euo pipefail
-          # Grab the dpkg lock first on images where unattended-upgrades holds
-          # it mid-transaction. `|| true` because it is absent on some runner
-          # revisions.
           sudo systemctl stop unattended-upgrades.service 2>/dev/null || true
-          opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
-          sudo apt-get update "${opts[@]}"
-          for attempt in 1 2 3 4 5; do
-            if sudo timeout --signal=INT 240 \
-                apt-get install -y --no-install-recommends "${opts[@]}" ffmpeg; then
-              ffmpeg -version | head -1
-              exit 0
-            fi
-            echo "::warning::apt-get install attempt ${attempt} stalled or failed; retrying"
+
+          # Repoint every Ubuntu apt source at mirror $1, leaving non-Ubuntu
+          # sources (packages.microsoft.com) alone. The hosts are matched, not
+          # the whole URI, so the suite paths survive and any of our own
+          # previous changes can be overwritten again on the next attempt.
+          repoint() {
+            sudo sed -i -E \
+              "s#(azure\.archive\.ubuntu\.com|archive\.ubuntu\.com|security\.ubuntu\.com|mirrors\.edge\.kernel\.org)#$1#g" \
+              /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          }
+
+          opts=(-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          # Empty string = the image's default mirror, i.e. leave the sources be.
+          mirrors=("" "archive.ubuntu.com" "mirrors.edge.kernel.org")
+          attempt=0
+          for round in 1 2; do
+            for mirror in "${mirrors[@]}"; do
+              attempt=$((attempt + 1))
+              label="${mirror:-the image default mirror}"
+              echo "::group::ffmpeg, attempt $attempt via $label"
+              if [ -n "$mirror" ]; then repoint "$mirror"; fi
+              # Both calls are bounded: `update` can hang on a mirror that
+              # accepts the connection and then says nothing, which is exactly
+              # what azure.archive.ubuntu.com did.
+              if sudo timeout --signal=INT 180 apt-get update "${opts[@]}" \
+                 && sudo timeout --signal=INT 180 \
+                      apt-get install -y --no-install-recommends "${opts[@]}" ffmpeg; then
+                echo "::endgroup::"
+                ffmpeg -version | head -1
+                exit 0
+              fi
+              echo "::endgroup::"
+              echo "::warning::ffmpeg install failed on attempt $attempt via $label; trying another mirror"
+            done
           done
-          echo "::error::could not install ffmpeg after 5 attempts"
+          echo "::error::could not install ffmpeg after $attempt attempts across 3 mirrors"
           exit 1
       - name: Install
         run: uv sync --locked

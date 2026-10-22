@@ -332,38 +332,44 @@ class Settings(BaseSettings):
     #: than lowering it - there is room up to 21.
     retransmit_window_segments: int = 14
     #: Re-anchor every listener of a station this often, whatever the network
-    #: looks like. 0 disables it. **This is the only trigger that cannot miss.**
+    #: looks like. **Off by default**; set a number of seconds to enable it.
     #:
-    #: Why a blind timer is needed at all
-    #: ----------------------------------
-    #: Both other triggers key on *evidence* of damage, and there is a band of
-    #: interference that wedges the radio's decoder without producing enough
-    #: evidence to cross either threshold. Measured on the song-titles channel:
-    #: the radio went into the permanent garble with **neither trigger firing**
-    #: - the journal for the whole episode has no "retransmitted" and no
-    #: "silence" line - while the stream being delivered was verified perfect
-    #: (555 frames, 0 bad syncs, clean `ffmpeg -err_detect explode` decode).
+    #: Why it is off
+    #: -------------
+    #: It works, and it was shipped on by default in 2.3.1. On the real radio it
+    #: is worse than the problem it solves: every fire costs audible audio, and
+    #: the listener hears it every time. Verbatim, from the hardware test of
+    #: 2.3.1 with `scheduled_reconnects` climbing every two minutes:
     #:
-    #: That is not a tuning problem. Once the interference stops, a wedged radio
-    #: is indistinguishable from a healthy one: measured while garbled, it
-    #: acknowledged every byte at full rate for 776 s. No threshold can separate
-    #: two identical observations, so *no* evidence-based trigger can bound how
-    #: long a radio stays broken. Only a timer can.
+    #:     "every 2 minutes, I'm noticing the radio either skipping a few
+    #:      seconds, or repeating a few seconds"
     #:
-    #: Why 120 seconds
-    #: ---------------
-    #: The radio reconnects itself every 20-60 s anyway (measured in the journal
-    #: over hundreds of connections), so one forced reconnect per two minutes is
-    #: the same order as behaviour the hardware already exhibits and the decoder
-    #: already tolerates. It bounds "broken until someone restarts the service"
-    #: - the reported failure - to two minutes.
+    #: Both halves are this mechanism, and neither is a bug in it. The re-anchor
+    #: discards the listener's queued backlog (up to the 9.2 s reserve) so the
+    #: disconnect is immediate - the radio resumes at the live edge, having never
+    #: decoded that audio, which is heard as a **skip**. Then the fresh
+    #: connection is primed with `handoff_overlap_seconds` (1.5 s) of audio that
+    #: was already sent, to bridge the join - heard as a **repeat**.
     #:
-    #: The cost is real and should not be hidden: a brief audio gap every two
-    #: minutes, on every station, even on a perfect network. Set 0 if the
-    #: latency of the two evidence-based triggers is enough for you, and raise it
-    #: if two minutes of possible garble is acceptable in exchange for fewer
-    #: interruptions.
-    reanchor_interval_seconds: float = 120.0
+    #: That trade is worth it when the radio is genuinely broken: it is already
+    #: garbled, so a skip costs nothing. It is not worth it on a healthy stream,
+    #: and a timer cannot tell the two apart.
+    #:
+    #: What is lost by leaving it off
+    #: ------------------------------
+    #: A wedged decoder that produced no evidence of damage stays wedged until
+    #: the radio reconnects by itself - which it does every 20-60 s anyway
+    #: (measured over hundreds of connections), so the exposure is bounded by
+    #: the hardware either way. The case the timer actually covered was measured
+    #: once: the radio stuck in permanent garble with **neither** trigger firing,
+    #: while the delivered stream was verified perfect (555 frames, 0 bad syncs,
+    #: clean `ffmpeg -err_detect explode`). Once the interference stops such a
+    #: radio acknowledges every byte at full rate - identical to a healthy one -
+    #: so no evidence-based threshold can catch it. Enable this if you see that
+    #: failure and accept the periodic skip/repeat as the price.
+    #:
+    #: Valid values are 0 (off) or 30-3600 seconds.
+    reanchor_interval_seconds: float = 0.0
     #: How often the retransmission count is sampled, in seconds.
     #:
     #: One second is one ``/proc/net/snmp`` read - on the order of 10 microseconds

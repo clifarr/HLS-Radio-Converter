@@ -364,6 +364,33 @@ def test_contributing_documents_the_development_workflow():
     assert "CONTRIBUTING.md" in _read("README.md")
 
 
+def test_contributing_requires_a_listening_test_for_audio_changes():
+    """The rule has to be written down where a contributor will read it.
+
+    Every audio defect this project has shipped had a green test suite: a
+    bundled FFmpeg that segfaulted on MPEG-TS, a stream verified byte-perfect
+    that a radio rendered as garble, and a repair timer that made the radio
+    skip and repeat every two minutes. All of them were only ever audible.
+
+    So the requirement is a policy, not a preference, and it belongs in the
+    contributor guide - not left as folklore in a release note.
+    """
+    contributing = _read("CONTRIBUTING.md")
+    lowered = contributing.lower()
+
+    for phrase in ("listening test", "real radio", "hardware"):
+        assert phrase in lowered, (
+            f"CONTRIBUTING.md dropped {phrase!r} - the listening-test rule has "
+            "been weakened; audio changes must be verified by ear on a real "
+            "device, because the test suite cannot hear"
+        )
+
+    # The rule must be scoped to audio, not read as "test everything by hand".
+    assert "affect the audio" in lowered or "affects the audio" in lowered, (
+        "CONTRIBUTING.md no longer scopes the listening test to changes that affect the audio"
+    )
+
+
 def test_lint_claims_in_the_contributing_guide_match_the_configuration():
     """The dev guide must not overstate how clean the lint configuration is.
 

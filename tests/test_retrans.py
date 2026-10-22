@@ -882,6 +882,34 @@ async def test_the_safety_net_can_be_disabled():
         await manager.aclose()
 
 
+async def test_a_default_manager_never_starts_the_timer_loop():
+    """Off has to mean *no task*, not "a task that finds nothing to do".
+
+    A background loop that ticks every 30 s forever is a real cost on a Pi and
+    it re-reads the clock, so "the default is 0" is only true if `start()`
+    declines to launch it at all.
+    """
+    settings = Settings()
+    manager, session, subscriber = await _manager_with_a_listener(settings)
+    try:
+        await manager.start()
+        assert manager._safety_task is None, (
+            "the periodic re-anchor loop was started even though it is disabled"
+        )
+        # A healthy listener must also survive an arbitrarily long outage of
+        # evidence: nothing may close it just because time passed.
+        assert manager.reanchor_overdue_sessions(now=1e9) == 0
+        drained = []
+        with contextlib.suppress(asyncio.QueueEmpty):
+            while True:
+                drained.append(subscriber.queue.get_nowait())
+        assert None not in drained, "a listener was ended by the timer"
+        assert session.scheduled_reconnects == 0
+        assert manager.scheduled_reconnects == 0
+    finally:
+        await manager.aclose()
+
+
 async def test_the_safety_net_leaves_a_station_with_no_listeners_alone():
     settings = _settings()
     settings.reanchor_interval_seconds = 120.0
@@ -898,23 +926,25 @@ async def test_the_safety_net_leaves_a_station_with_no_listeners_alone():
         await manager.aclose()
 
 
-def test_the_default_safety_net_is_on_and_sane():
-    """The reported failure was "glitches until the service is restarted".
+def test_the_default_safety_net_is_off_because_it_is_audible():
+    """It was on by default in 2.3.1, and the hardware test rejected it.
 
-    A default of 0 would mean the release cannot fix that on its own for anyone
-    who does not read the config, so the default has to be on - and the interval
-    has to be short enough to matter while staying in the same order as the
-    radio's own reconnect cadence (20-60 s, measured over hundreds of
-    connections in the journal).
+    Every fire discards the listener's queued backlog so the disconnect is
+    immediate (heard as a skip, since the radio resumes at the live edge having
+    never decoded that audio) and then primes the new connection with
+    ``handoff_overlap_seconds`` of already-sent audio (heard as a repeat).
+    Reported verbatim from the 2.3.1 test on the real radio: "every 2 minutes,
+    I'm noticing the radio either skipping a few seconds, or repeating a few
+    seconds".
+
+    That is an acceptable price for repairing a radio that is already garbled.
+    It is not acceptable on a healthy stream, and a timer cannot tell the
+    difference - so it must not be on unless an operator asks for it.
     """
     settings = Settings()
-    assert settings.reanchor_interval_seconds > 0, (
-        "the safety net is off by default, so a radio that stops decoding with "
-        "no evidence of damage would stay broken until the service restarts"
-    )
-    assert 60.0 <= settings.reanchor_interval_seconds <= 300.0, (
-        f"an interval of {settings.reanchor_interval_seconds}s is out of proportion "
-        "to the radio's own reconnect cadence (20-60 s)"
+    assert settings.reanchor_interval_seconds == 0.0, (
+        "the periodic re-anchor is on by default, so every healthy stream pays "
+        "an audible skip/repeat on a timer for a failure it is not having"
     )
 
 

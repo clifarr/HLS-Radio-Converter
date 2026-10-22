@@ -3,6 +3,64 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.3.2] - 2026-10-22
+
+2.3.1 fixed the self-repair, and the repair worked. It also introduced a
+regression that the next hardware test caught within minutes, because one of
+the three repair triggers was a blind timer and a blind timer cannot tell a
+healthy stream from a broken one.
+
+### Fixed
+
+- **The periodic re-anchor is off by default.** `reanchor_interval_seconds` was
+  `120`, so every listener of every station was disconnected every two minutes
+  whether or not anything was wrong. Heard on the real radio, verbatim:
+
+  > every 2 minutes, I'm noticing the radio either skipping a few seconds, or
+  > repeating a few seconds
+
+  Both halves are this mechanism, and neither is a bug in it:
+
+  - the re-anchor **discards the listener's queued backlog** (up to the 9.2 s
+    reserve) so the disconnect is immediate - which is correct, and was the
+    whole point of 2.3.1. The radio then resumes at the live edge having never
+    decoded that audio: heard as a **skip**.
+  - the fresh connection is primed with `handoff_overlap_seconds` (1.5 s) of
+    audio that was already sent, to bridge the join: heard as a **repeat**.
+
+  Paying that is right when the radio is already garbled - a skip costs nothing
+  on audio you cannot hear anyway. It is wrong on a healthy stream, and a timer
+  has no way to know which it is looking at. The two evidence-based triggers
+  are unaffected and still repair real damage; in the 2.3.1 hardware test they
+  recovered three induced glitches in about a second each.
+
+  What is given up: a decoder wedged with *no* evidence of damage stays wedged
+  until the radio reconnects by itself, which it does every 20-60 s anyway
+  (measured over hundreds of connections), so the exposure is bounded by the
+  hardware regardless. That case was observed once, on the song-titles channel
+  - permanent garble with neither trigger firing while the delivered stream was
+  verified perfect. Operators who see it can set `reanchor_interval_seconds` to
+  a value between 30 and 3600 and accept the periodic skip/repeat as the price.
+
+### Repo
+
+- The CI `Install ffmpeg` step no longer depends on a single apt mirror. The
+  GitHub runner image points apt at `azure.archive.ubuntu.com`, which stalled
+  mid-transfer on three consecutive runs (once sitting on one 9 MB archive for
+  9.5 minutes without a byte arriving) and got two of them cancelled. Each
+  attempt is now bounded with `timeout --signal=INT` and retried, rotating
+  through the image's own mirror, `archive.ubuntu.com` and
+  `mirrors.edge.kernel.org`.
+
+- `CONTRIBUTING.md` now requires a **listening test on a real radio** for
+  anything that can change what is heard, and says why: every audio defect this
+  project has shipped had a green test suite. The bundled FFmpeg that
+  segfaulted on MPEG-TS, the stream verified byte-perfect that a radio rendered
+  as garble, and the 120 s timer in 2.3.1 were all only ever audible, because
+  the tests measure the bytes we send while the defect lives in how the
+  receiver decodes them. Guarded by
+  `test_contributing_requires_a_listening_test_for_audio_changes`.
+
 ## [2.3.1] - 2026-10-22
 
 Makes the self-repair actually work, after measuring the previous release on the
@@ -1060,6 +1118,7 @@ for the FFmpeg-free pass-through path, per-listener pacing with drop
 isolation, a dashboard with health metrics, and a systemd installer for the
 Raspberry Pi.
 
+[2.3.2]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.3.2
 [2.3.1]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.3.1
 [2.3.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.3.0
 [2.2.2]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.2.2

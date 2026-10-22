@@ -166,24 +166,37 @@ retransmit_poll_seconds = 1.0
 
 # --- the safety net: re-anchor on a timer, whatever the network looks like ---
 #
-# This is the ONLY trigger that cannot miss, and it exists because both
-# triggers above key on evidence of damage - and there is a band of
-# interference that wedges the radio's decoder without producing any.
+# OFF BY DEFAULT. It shipped on by default in 2.3.1 and the hardware test
+# rejected it: every fire costs audible audio, every time.
 #
-# Measured on the song-titles channel: the radio went into the permanent garble
-# with NEITHER trigger firing (the journal for the whole episode has no
-# "retransmitted" and no "silence" line), while the stream being delivered was
-# verified perfect - 555 frames, 0 bad syncs, a clean `ffmpeg -err_detect
-# explode` decode. There was nothing to detect. Once the interference stops, a
-# wedged radio acknowledges every byte at full rate, exactly like a healthy one,
-# so no threshold can separate two identical observations.
+#   "every 2 minutes, I'm noticing the radio either skipping a few seconds, or
+#    repeating a few seconds"
 #
-# The cost is real: one brief audio gap per interval, on every station, even on
-# a perfect network. 120 s is chosen to be the same order as the radio's own
-# reconnect cadence (20-60 s, measured over hundreds of connections), so the
-# decoder already tolerates it. It bounds "glitches until someone restarts the
-# service" to two minutes. Set 0 to disable it and rely on the triggers above.
-reanchor_interval_seconds = 120.0
+# Both halves are this mechanism, and neither is a bug. The re-anchor discards
+# the listener's queued backlog (up to the 9.2 s reserve) so the disconnect is
+# immediate - so the radio resumes at the live edge, never having decoded that
+# audio, which is heard as a SKIP. The fresh connection is then primed with
+# handoff_overlap_seconds (1.5 s) of audio that was already sent, to bridge the
+# join - heard as a REPEAT.
+#
+# That price is fair when the radio is already garbled, since a skip costs
+# nothing on audio you cannot hear anyway. It is not fair on a healthy stream,
+# and a timer cannot tell the two apart.
+#
+# What leaving it off gives up: a decoder wedged with NO evidence of damage
+# stays wedged until the radio reconnects by itself - and it does that every
+# 20-60 s anyway (measured over hundreds of connections), so the exposure is
+# bounded by the hardware regardless. The failure this timer actually covered
+# was measured once, on the song-titles channel: the radio stuck in permanent
+# garble with NEITHER evidence trigger firing (no "retransmitted" and no
+# "silence" line in the whole episode) while the delivered stream was verified
+# perfect - 555 frames, 0 bad syncs, a clean `ffmpeg -err_detect explode`
+# decode. Once the interference stops such a radio acknowledges every byte at
+# full rate, exactly like a healthy one, so no threshold can separate them.
+#
+# Enable it (30-3600 seconds) only if you see that failure and are willing to
+# pay a periodic skip/repeat on every stream to bound it.
+reanchor_interval_seconds = 0.0
 
 # --- the upstream starved (the station, not the network) ---------------------
 #
