@@ -62,7 +62,30 @@ jobs:
           # looked like it covered four versions and covered one.
           python-version: ${{ matrix.python }}
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+        # Every network call is bounded. Plain `apt-get update && apt-get
+        # install` can wait forever on a stalled mirror or on the dpkg lock that
+        # the runner's unattended-upgrades service holds, and an unbounded step
+        # wedges the whole job: runs 39802019682 and 39804942257 were both
+        # killed that way, in both cases *only* the matrix entries that were
+        # still on this step (3.9/3.11/3.13 and 3.9/3.13 respectively) - the
+        # ones that had got past it all passed. `timeout-minutes` turns a stall
+        # into a red step in 10 minutes instead of a 20-minute hang, so the
+        # answer is "re-run the job" rather than "the release cannot be
+        # verified".
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          # Stop the service that grabs the dpkg lock on these images. `|| true`
+          # because it is absent on some runner revisions.
+          sudo systemctl stop unattended-upgrades.service 2>/dev/null || true
+          sudo apt-get update \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            ffmpeg
       - name: Install
         run: uv sync --locked
       - name: Test
