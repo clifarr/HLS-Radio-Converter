@@ -115,7 +115,116 @@ code { font-size: .88em; background: #fff; border: 1px solid var(--line); border
   font: inherit;
   cursor: pointer;
 }
+/* The "also check the stream" opt-in. `.card input` is full-width for the URL
+   field, which would stretch a checkbox across the page and leave its label
+   stranded underneath it. */
+.card label.check {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  margin: .55rem 0 0;
+  font-size: .9rem;
+  color: var(--muted);
+}
+.card label.check input { width: auto; margin: 0; padding: 0; }
+
+/* The `/probe` diagnostics on the converter page. The verdict is the sentence
+   an operator needs; the table is the evidence behind it. Only the three states
+   that mean something are coloured - "info" is the ordinary case (FFmpeg is
+   simply required) and must not look like a problem. */
+.card.check h2 { margin: 0 0 .4rem; font-size: 1rem; }
+.verdict { margin: 0 0 .7rem; }
+.verdict[data-state="good"] { color: var(--ok); }
+.verdict[data-state="warn"] { color: var(--warn); }
+.verdict[data-state="bad"] { color: var(--bad); }
 .card.result code.block { background: #fff; }
+
+/* ----------------------------------------------------------- settings page */
+/* A row per setting: label and control on one line, the explanation under it.
+   The help text is the reason this page exists at all - a settings form without
+   it is a list of names whose effects you have to guess - so it is always
+   visible rather than hidden behind the tooltip convention the figures use. */
+.setting {
+  padding: .6rem 0;
+  border-top: 1px solid var(--line);
+}
+.setting:first-of-type { border-top: 0; }
+.setting > label {
+  font-weight: 600;
+  font-size: .92rem;
+  margin-bottom: .3rem;
+}
+.setting .control {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  flex-wrap: wrap;
+}
+/* `.card input` is full-width for the converter page's URL field, which would
+   stretch a number box across the page. Constrain the control instead. */
+.setting input[type="number"] { width: 9rem; }
+.setting input[type="text"] { width: 100%; max-width: 24rem; }
+.setting input[type="checkbox"] { width: auto; margin: 0; padding: 0; }
+.setting select {
+  padding: .4rem;
+  border: 1px solid var(--line);
+  border-radius: .25rem;
+  font: inherit;
+  font-size: .9rem;
+  background: #fff;
+}
+.setting .unit { color: var(--muted); font-size: .82rem; }
+.setting .help {
+  margin: .3rem 0 0;
+  font-size: .82rem;
+  color: var(--muted);
+  max-width: 46rem;
+}
+/* Locked on purpose (allow_ui_settings = false): still readable, and visibly
+   not clickable. Disabled is the browser's own affordance, so nothing extra is
+   needed beyond not making it look broken. */
+.setting :disabled { opacity: .6; }
+/* A rejected value: the label and the control both go red, and the sentence
+   under it says which rule it broke. Colour alone would be the only signal for
+   a reader who can tell red from green, so the control also carries
+   aria-invalid and points at the sentence. */
+.setting.invalid > label { color: var(--bad); }
+.setting.invalid input,
+.setting.invalid select { border-color: var(--bad); }
+.setting .problem {
+  margin: .2rem 0 0;
+  font-size: .82rem;
+  color: var(--bad);
+}
+/* "new streams" - a claim about *when* a value takes effect, which is the one
+   thing a settings form cannot show by itself. */
+.tag {
+  font-size: .7rem;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: .8rem;
+  padding: .05rem .45rem;
+  background: #fff;
+  white-space: nowrap;
+}
+/* The banner above the form: green for "saved", amber for "saved but...". */
+.notice {
+  padding: .6rem .8rem;
+  border-radius: .35rem;
+  border-left: 3px solid var(--ok);
+  background: #e6f4ea;
+  margin: 1rem 0;
+}
+.notice[data-state="warn"] { border-left-color: var(--warn); background: #fdf3d5; }
+.notice[data-state="bad"] { border-left-color: var(--bad); background: #fbeae9; }
+.settings button[type="submit"] {
+  margin-top: .6rem;
+  padding: .55rem 1.2rem;
+  font: inherit;
+  cursor: pointer;
+}
 
 code.block {
   display: block;

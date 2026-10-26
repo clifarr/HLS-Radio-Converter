@@ -789,15 +789,53 @@ async def inspect(url: str, settings: Optional[Settings] = None) -> Dict[str, An
                 kind = PASSTHROUGH_TYPES.get(tables["audio"]) if tables["audio"] else None
                 result["passthrough_possible"] = kind is not None
                 result["passthrough_kind"] = kind
+            elif detected in ("adts", "mp3"):
+                # A bare elementary stream: there is no container and nothing to
+                # demux, so the audio can be forwarded as it is - the same bytes
+                # a radio would play, with the per-segment ID3 tags removed.
+                result["passthrough_possible"] = True
+                result["passthrough_kind"] = detected
             else:
-                # Pass-through is a TS-table lookup, so it is only available for a
-                # transport stream. Raw ADTS can still avoid a re-encode, but by
-                # remuxing (`output_codec = "adts"`), which is a different path.
+                # fMP4 and anything unrecognised need a real demuxer, which the
+                # FFmpeg-free path does not have.
                 result["passthrough_possible"] = False
                 result["passthrough_kind"] = None
-            result["audio"] = await asyncio.to_thread(
-                ffmpeg_mod.probe_bytes, data, settings, 20.0, detected
+            # `passthrough_possible` says the *source* can be forwarded;
+            # `passthrough_engine` says the configured settings will actually do
+            # it. They differ whenever the output codec is not the source's own
+            # (forwarding an AAC source cannot produce an MP3 stream), which is
+            # exactly the confusing case a user needs told apart.
+            #
+            # `effective_output_codec` is what makes this correct on an
+            # installation with FFmpeg disabled: there, nothing is re-encoded at
+            # all, so a forwardable source is *always* the engine actually used,
+            # and reporting the configured "mp3" instead would describe a
+            # transcode that cannot happen.
+            source_kind = result["passthrough_kind"]
+            result["passthrough_engine"] = bool(
+                (settings.prefer_passthrough or settings.passthrough_only)
+                and source_kind is not None
+                and settings.effective_output_codec in (source_kind, "auto")
             )
+            # Reported alongside, because "there is no FFmpeg here" changes what
+            # every other field means: on such an installation an unfavourable
+            # verdict is final rather than a suggestion.
+            result["ffmpeg_enabled"] = settings.ffmpeg_enabled
+            if settings.ffmpeg_enabled:
+                result["audio"] = await asyncio.to_thread(
+                    ffmpeg_mod.probe_bytes, data, settings, 20.0, detected
+                )
+            else:
+                # The exact codec is normally read by ffmpeg from the audio. With
+                # ffmpeg switched off that is both unavailable and unwanted, so
+                # answer from the container instead: the demuxer has just told us
+                # what these bytes are, and that is the same codec without the
+                # sample rate. Omitted fields are omitted (not guessed) by the
+                # page, so this reads as "AAC" rather than "AAC, ?, ?".
+                result["audio"] = {
+                    "codec": {"adts": "aac", "mp3": "mp3"}.get(source_kind or detected),
+                    "source": "container",
+                }
     except Exception as exc:  # noqa: BLE001 - /probe must always answer, never raise
         result["error"] = str(exc)
         result["error_type"] = type(exc).__name__

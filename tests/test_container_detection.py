@@ -21,6 +21,7 @@ import tempfile
 from pathlib import Path
 
 import httpx
+from conftest import canned_station, serving
 
 from radioconv import ffmpeg as ffmpeg_mod
 from radioconv import hls as hls_mod
@@ -44,9 +45,26 @@ def test_probe_describes_an_id3_adts_stream_correctly(live_server, id3_adts_serv
     assert body["container"] == "adts", "the measured container must win over the URL guess"
     assert body["audio"]["codec"] == "aac", "ffmpeg could not read the segment"
     assert body["audio"]["sample_rate"] == 48000
-    # Pass-through is a TS table lookup, so it cannot apply - but the stream is
-    # still decodable, which is the thing that matters.
-    assert body["passthrough_possible"] is False
+    # The audio can be forwarded as it is: there is no container to demux, only
+    # an ID3 tag to strip. Whether this *service* will do that depends on the
+    # output codec, and the live server here asks for the default MP3.
+    assert body["passthrough_possible"] is True
+    assert body["passthrough_kind"] == "adts"
+    assert body["passthrough_engine"] is False, "forwarding AAC cannot produce MP3"
+
+
+async def test_probe_reports_the_engine_the_configured_codec_will_use(id3_adts_server):
+    """`passthrough_possible` and `passthrough_engine` answer different questions.
+
+    Reading only the first one is how a user concludes "no FFmpeg needed" about
+    a station that is being re-encoded, so both are reported and both are
+    checked here - with the identical stream, differing only in `output_codec`.
+    """
+    for codec, expected in (("adts", True), ("auto", True), ("mp3", False)):
+        info = await hls_mod.inspect(id3_adts_server, Settings(output_codec=codec))
+        assert info["passthrough_possible"] is True, codec
+        assert info["passthrough_kind"] == "adts", codec
+        assert info["passthrough_engine"] is expected, f"output_codec={codec}"
 
 
 async def test_probe_reports_the_codec_for_an_id3_adts_segment(id3_adts_server):
@@ -173,7 +191,12 @@ async def test_the_audio_from_an_id3_adts_stream_is_valid_mp3(id3_adts_server):
 
 
 def test_the_pipeline_reports_the_detected_container(live_server, id3_adts_server):
-    """`/health` and the dashboard show what was measured, not what was guessed."""
+    """`/health` and the dashboard show what was measured, not what was guessed.
+
+    This request asks for the default MP3 output, which a raw ADTS source cannot
+    be forwarded into - so the engine is a transcode, while the *measured* source
+    kind is still reported as ``adts``. Both facts come from the bytes.
+    """
     with httpx.stream(
         "GET", live_server + "/stream", params={"url": id3_adts_server}, timeout=60
     ) as response:
@@ -182,9 +205,45 @@ def test_the_pipeline_reports_the_detected_container(live_server, id3_adts_serve
                 break
         health = httpx.get(live_server + "/health", timeout=20).json()
 
-    modes = [detail["pipeline"]["mode"] for detail in health["streams"]["details"]]
-    assert modes, "no session was created"
-    assert "transcode" in modes, f"expected ffmpeg for raw ADTS, got {modes}"
+    sessions = {detail["key"]: detail for detail in health["streams"]["details"]}
+    key = next(key for key in sessions if key.endswith("|mp3|192000"))
+    pipeline = sessions[key]["pipeline"]
+    assert pipeline["mode"] == "transcode", f"expected ffmpeg for ADTS->MP3, got {pipeline}"
+    assert pipeline["detected_kind"] == "adts", "the source kind is what was measured"
+
+
+def test_a_raw_adts_stream_is_forwarded_when_the_radio_asks_for_aac(live_server, id3_adts_server):
+    """The point of the raw forwarder: ``?codec=aac`` needs no FFmpeg at all.
+    The same station as above, differing only in the requested output codec.
+    What the radio receives is the source's own ADTS frames - no decoder, no
+    encoder, no child process - and the Content-Type has to say so, because that
+    header is how a radio chooses its decoder.
+    """
+    received = 0
+    with httpx.stream(
+        "GET",
+        live_server + "/stream",
+        params={"url": id3_adts_server, "codec": "aac"},
+        timeout=60,
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("audio/aac"), (
+            "forwarded ADTS is AAC; announcing audio/mpeg would pick the wrong decoder"
+        )
+        for chunk in response.iter_bytes():
+            received += len(chunk)
+            if received >= 100_000:
+                break
+
+    assert received >= 100_000, f"only {received} bytes: the stream is silent"
+
+    health = httpx.get(live_server + "/health", timeout=20).json()
+    sessions = {detail["key"]: detail for detail in health["streams"]["details"]}
+    key = next(key for key in sessions if key.endswith("|adts|192000"))
+    pipeline = sessions[key]["pipeline"]
+    assert pipeline["mode"] == "passthrough", f"expected no ffmpeg, got {pipeline}"
+    assert pipeline["detected_kind"] == "adts"
+    assert pipeline["detected_codec"] == "adts", "the listener's frame grid comes from this"
 
 
 # ------------------------------------------------------- the input-format table
@@ -347,3 +406,74 @@ def test_a_tag_with_no_audio_after_it_is_not_guessed_at():
     """
     assert tsdemux.classify_segment(_REAL_LAYOUT) is None
     assert tsdemux.classify_segment(b"") is None
+
+
+# ------------------------------------------- fMP4 with FFmpeg switched off
+#: An HLS playlist whose only segment is fMP4. No ffmpeg needed to build it,
+#: which is the point: this test must run on a machine that has none.
+_FMP4_PLAYLIST = (
+    b"#EXTM3U\n"
+    b"#EXT-X-VERSION:7\n"
+    b"#EXT-X-TARGETDURATION:4\n"
+    b"#EXT-X-MEDIA-SEQUENCE:0\n"
+    b'#EXT-X-MAP:URI="init.mp4"\n'
+    b"#EXTINF:4.0,\n"
+    b"seg0.m4s\n"
+    b"#EXT-X-ENDLIST\n"
+)
+
+#: Enough of an fMP4 box structure for the classifier to say "mp4".
+_FMP4_SEGMENT = b"\x00\x00\x00\x18ftypisom" + bytes(512)
+
+
+def test_a_station_that_needs_ffmpeg_is_refused_when_ffmpeg_is_disabled():
+    """Not silence behind a 200: an error a radio can act on, with the reason.
+
+    This is the one case the FFmpeg-free configuration cannot serve, and the way
+    it fails decides whether the feature is usable. A ``200`` followed by nothing
+    leaves a radio sitting on a connection that will never carry audio, and puts
+    the explanation in a log nobody reads; a ``503`` with a sentence is something
+    a person can see and fix.
+
+    The refusal is possible at all because the effective codec is ``auto`` on
+    such an installation, so ``_settle_kind`` waits for the pipeline's verdict
+    *before* the headers go out - the failure has already happened by then.
+    """
+    routes = {
+        "/index.m3u8": _FMP4_PLAYLIST,
+        "/init.mp4": _FMP4_SEGMENT,
+        "/seg0.m4s": _FMP4_SEGMENT,
+    }
+
+    with canned_station(routes) as station, serving(Settings(ffmpeg_enabled=False)) as app:
+        response = httpx.get(app + "/stream", params={"url": station + "/index.m3u8"}, timeout=45)
+
+    assert response.status_code == 503, (
+        f"got {response.status_code}: a stream that cannot be produced must not "
+        "answer 200 and then deliver nothing"
+    )
+    assert "FFmpeg is disabled" in response.text
+    assert "fMP4" in response.text, "the reason must be named, not just the outcome"
+    assert "Retry-After" in response.headers, "a radio should be told to come back"
+
+
+def test_the_refused_station_leaves_no_listener_behind():
+    """A refusal must not hold a capacity slot: the generator never runs.
+
+    The normal path unsubscribes in the response generator's ``finally``. A
+    request refused *before* the response exists has no generator to run, so the
+    unsubscribe has to be explicit - otherwise every attempt leaves a phantom
+    listener that only the reaper clears, and a station repeatedly tried by a
+    radio eventually reports itself full.
+    """
+    routes = {"/index.m3u8": _FMP4_PLAYLIST, "/seg0.m4s": _FMP4_SEGMENT}
+
+    with canned_station(routes) as station, serving(Settings(ffmpeg_enabled=False)) as app:
+        source = station + "/index.m3u8"
+        for _ in range(2):
+            refused = httpx.get(app + "/stream", params={"url": source}, timeout=45)
+            assert refused.status_code == 503
+        health = httpx.get(app + "/health", timeout=10).json()
+
+    assert health["streams"]["listeners"] == 0, health["streams"]
+    assert health["streams"]["sessions"] == 0, health["streams"]

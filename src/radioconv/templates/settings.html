@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}Settings - HLS Radio Converter{% endblock %}
+{% block bodyclass %}wide{% endblock %}
+
+{% block main %}
+<p class="muted">
+  These are the settings this service reads at runtime. A change is applied
+  immediately and saved, so it survives a restart - but a <em>running</em>
+  station keeps the settings it started with, because its buffer, bitrate and
+  jitter grid already describe audio that is playing.
+  {% if editable %}Tick <strong>restart the stations playing now</strong> to apply
+  a change to them at once; the radios reconnect by themselves.
+  {% endif %}
+</p>
+
+{% if message %}
+<p class="notice" data-state="good">{{ message }}</p>
+{% endif %}
+{% for warning in warnings %}
+<p class="notice" data-state="warn">{{ warning }}</p>
+{% endfor %}
+
+{% if not editable %}
+<p class="notice" data-state="warn">
+  Changes from this page are turned off (<code>allow_ui_settings = false</code>),
+  so this is a read-only view. Edit the config file, or remove that setting, to
+  change anything.
+</p>
+{% endif %}
+
+<form method="post" action="{{ settings_url }}" class="settings">
+  {% for group in groups %}
+  <section class="card">
+    <h2>{{ group.name }}</h2>
+    <p class="muted small">{{ group.blurb }}</p>
+    {% for field in group.fields %}
+    {# A rejected value is marked on the wrapper for the colour, and on the
+       control itself with `aria-invalid`/`aria-describedby`, so the reader that
+       cannot see the red gets told which field the sentence belongs to. #}
+    {% set bad = problems.get(field.name) %}
+    <div class="setting{% if bad %} invalid{% endif %}">
+      <label for="f-{{ field.name }}">{{ field.label }}</label>
+      <div class="control">
+        {% if field.kind == "bool" %}
+        <input type="checkbox" id="f-{{ field.name }}" name="{{ field.name }}"
+               value="1" {% if field.checked %}checked{% endif %}
+               {% if bad %}aria-invalid="true" aria-describedby="p-{{ field.name }}"{% endif %}
+               {% if not editable %}disabled{% endif %}>
+        {% elif field.kind in ("choice", "choice-int") %}
+        <select id="f-{{ field.name }}" name="{{ field.name }}"
+                {% if bad %}aria-invalid="true" aria-describedby="p-{{ field.name }}"{% endif %}
+                {% if not editable %}disabled{% endif %}>
+          {% for choice in field.choices %}
+          {# An empty choice is a real choice for an optional field ("keep the
+             source rate"), so it gets a name of its own rather than a blank
+             option. #}
+          <option value="{{ choice }}"
+                  {% if field.value == choice %}selected{% endif %}>{% if choice %}{{ choice }}{% else %}(unset){% endif %}</option>
+          {% endfor %}
+        </select>
+        {% elif field.kind == "text" %}
+        <input type="text" id="f-{{ field.name }}" name="{{ field.name }}"
+               value="{{ field.value }}"
+               {% if bad %}aria-invalid="true" aria-describedby="p-{{ field.name }}"{% endif %}
+               {% if not editable %}disabled{% endif %}>
+        {% else %}
+        <input type="number" id="f-{{ field.name }}" name="{{ field.name }}"
+               value="{{ field.value }}" step="{{ 'any' if field.kind == 'float' else '1' }}"
+               {% if bad %}aria-invalid="true" aria-describedby="p-{{ field.name }}"{% endif %}
+               {% if not editable %}disabled{% endif %}>
+        {% endif %}
+        {% if field.unit %}<span class="unit">{{ field.unit }}</span>{% endif %}
+        {% if field.new_streams_only %}
+        <span class="tag" tabindex="0"
+              data-tooltip="Reaches a station when its pipeline next starts. Tick 'restart the stations playing now' to apply it immediately.">new streams</span>
+        {% endif %}
+      </div>
+      {% if bad %}
+      <p class="problem" id="p-{{ field.name }}">{{ bad }}</p>
+      {% endif %}
+      <p class="help">{{ field.help }}</p>
+    </div>
+    {% endfor %}
+  </section>
+  {% endfor %}
+
+  {% if editable %}
+  <section class="card">
+    <h2>Apply</h2>
+    <div class="setting">
+      <label for="f-restart">Restart the stations playing now</label>
+      <div class="control">
+        <input type="checkbox" id="f-restart" name="restart" value="1">
+      </div>
+      <p class="help">
+        Ends every pipeline so it is rebuilt with the new settings. Radios
+        reconnect on their own, and each one is given recent audio
+        immediately - so this is a moment of silence, not a dropped stream.
+        Leave it unticked and the change reaches a station the next time it
+        restarts anyway.
+      </p>
+    </div>
+    <button type="submit">Save settings</button>
+    {% if saved_to %}
+    <p class="muted small">Saved values live in <code>{{ saved_to }}</code>.</p>
+    {% endif %}
+  </section>
+  {% endif %}
+</form>
+
+{% if restarted %}
+<p class="notice" data-state="good">
+  {{ restarted }} station{{ "" if restarted == 1 else "s" }} restarted with the
+  new settings.
+</p>
+{% endif %}
+
+<h2>Not changeable here</h2>
+<p class="muted small">
+  These are fixed when the process starts, so this page does not pretend
+  otherwise. Set them in <code>config.toml</code>, with a
+  <code>RADIOCONV_*</code> environment variable, or on the command line.
+</p>
+<div class="scroll">
+<table class="kv">
+  <tbody>
+  {% for name, why in read_only %}
+    <tr>
+      <th scope="row" tabindex="0" data-tooltip="{{ why }}">{{ name }}</th>
+      <td>{{ read_only_values[name] }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

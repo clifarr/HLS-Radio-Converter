@@ -141,9 +141,8 @@ CASES: List[Case] = [
         "the pacer stops pacing entirely",
         PKG / "api.py",
         "        while True:\n            delay = target - time.monotonic()\n"
-        "            if delay <= 0:\n                return",
-        "        while True:\n            delay = target - time.monotonic()\n"
-        "            if True:\n                return",
+        "            if delay <= 0:",
+        "        while True:\n            delay = target - time.monotonic()\n            if True:",
         f"{CONTINUITY}::test_the_pacer_releases_at_the_stream_rate",
     ),
     Case(
@@ -165,11 +164,47 @@ CASES: List[Case] = [
     Case(
         "the output bitrate is no longer measured",
         PKG / "pipeline.py",
-        '        if self.stats.mode != MODE_PASSTHROUGH and self.settings.output_codec == "mp3":\n'
+        "        if self.stats.mode != MODE_PASSTHROUGH and self.settings.effective_output_codec"
+        ' == "mp3":\n'
         "            # Re-encoded to a bitrate we asked for.\n"
         "            return float(self.settings.bitrate)",
         "        if False:\n            return float(self.settings.bitrate)",
         f"{CONTINUITY}::test_a_transcode_reports_the_bitrate_we_asked_for",
+    ),
+    Case(
+        # The radiom2o defect: the rate was the DOWNLOAD rate, and a transport
+        # stream is ~20% bigger than the audio inside it. The pacer then released
+        # 1.35 s of audio per second, ran the jitter buffer dry in about four
+        # segments, and left a ~2 s hole before every following one - which makes
+        # a radio reconnect, heard as a repeat (handoff overlap) or a skip
+        # (discarded backlog).
+        "the pacing rate is measured on the download, not the audio",
+        PKG / "pipeline.py",
+        "            return self.stats.forwarded_bytes * 8.0 / self.stats.forwarded_seconds",
+        "            return self.stats.bytes_in * 8.0 / self.stats.forwarded_seconds",
+        f"{CONTINUITY}::test_the_forwarded_rate_ignores_the_container_it_arrived_in",
+    ),
+    Case(
+        # The low-bitrate defect: a fixed 8192-byte piece is a *second* of audio
+        # at 64 kbit/s, so handing one over at once left a radio with nothing to
+        # read for a second - it dropped the connection, rejoined, and replayed
+        # the handoff overlap. Heard as "constant repeating every few seconds".
+        "a whole piece is handed to the socket at once again",
+        PKG / "api.py",
+        "    size = max(1, int(max(1.0, rate) * MAX_WRITE_SECONDS))",
+        "    size = len(chunk)",
+        f"{CONTINUITY}::test_a_socket_write_never_carries_more_than_a_quarter_second_of_audio",
+    ),
+    Case(
+        # The smaller half of the same defect: EXTINF is the packager's claim.
+        # radiom2o declares 10 s for 10.325 s of audio, so pacing on it is 3 %
+        # fast - invisible in a short run, a gap before every segment after a few
+        # minutes.
+        "the pacing duration comes from the playlist instead of the frames",
+        PKG / "pipeline.py",
+        "        if self.stats.forwarded_seconds > 0 and self.stats.forwarded_bytes > 0:",
+        "        if False:",
+        f"{CONTINUITY}::test_the_forwarded_rate_ignores_what_the_playlist_claims",
     ),
     Case(
         "a silent session no longer degrades the status",
@@ -294,6 +329,83 @@ CASES: List[Case] = [
         "        self.stats.bytes_out += len(chunk)",
         "        self.stats.bytes_out += len(chunk)\n        self.throughput.add_out(len(chunk))",
         "tests/test_session.py::test_audio_produced_for_nobody_is_not_counted_as_sent",
+    ),
+    Case(
+        # The reported "radio loses power and the server thinks it is listening
+        # for 15 minutes": the write blocks, and the stall watchdog only runs
+        # *between* writes, so nothing notices until the kernel's retransmission
+        # limit expires. Removing the deadline restores that wait exactly - and
+        # the test bounds itself, so it fails in seconds instead of hanging.
+        "a socket write is given no deadline",
+        PKG / "api.py",
+        "        await asyncio.wait_for(send(message), timeout=self._write_timeout)",
+        "        await send(message)",
+        f"{CONTINUITY}::test_a_radio_that_stops_reading_is_dropped_instead_of_waited_for",
+    ),
+    Case(
+        # Detecting the dead listener is only half of it: the subscriber has to
+        # go, or the page keeps listing a radio that is not there and `dropped`
+        # keeps climbing on its behalf.
+        "an abandoned listener is never unsubscribed",
+        PKG / "api.py",
+        "        await self._on_abandoned()",
+        "        return",
+        f"{CONTINUITY}::test_a_radio_that_stops_reading_is_dropped_instead_of_waited_for",
+    ),
+    Case(
+        # Ending the response unfinished is what makes the server close a socket
+        # whose write buffer is full - claiming the response is complete keeps a
+        # dead connection alive for the rest of the kernel's retransmission
+        # timeout, even after the listener has been forgotten.
+        "a response abandoned mid-stream claims to be complete",
+        PKG / "api.py",
+        "            await self._abandon(iterator)\n            return",
+        '            await self._abandon(iterator)\n            await send({"type": "http.response.body", "body": b"", "more_body": False})\n            return',
+        f"{CONTINUITY}::test_a_radio_that_stops_reading_is_dropped_instead_of_waited_for",
+    ),
+    Case(
+        # Read the configured codec instead of the effective one and, with FFmpeg
+        # disabled, every AAC station is sent to an engine that cannot run - so
+        # nothing plays, and the retry loop hides why.
+        "the engine decision reads the configured codec, not the effective one",
+        PKG / "pipeline.py",
+        "    wanted = settings.effective_output_codec",
+        "    wanted = settings.output_codec",
+        "tests/test_pipeline.py::test_with_ffmpeg_disabled_the_source_codec_wins_over_the_setting",
+    ),
+    Case(
+        # The other direction: honouring the preference alone means the pipeline
+        # decides TRANSCODE for a station it could have played, and with no
+        # engine available that is silence behind a 200 for every listener.
+        "passthrough-only is dropped from the engine decision",
+        PKG / "pipeline.py",
+        "    if not (settings.prefer_passthrough or settings.passthrough_only):",
+        "    if not settings.prefer_passthrough:",
+        "tests/test_pipeline.py::test_a_contradictory_configuration_still_forwards_rather_than_going_silent",
+    ),
+    Case(
+        # The failure mode this project has shipped before: 200, then nothing.
+        # Undoing the refusal puts a radio on a connection that will never carry
+        # audio, with the explanation only in a log.
+        "a stream that cannot be produced is served as a silent 200",
+        PKG / "api.py",
+        "    if session.dead and not session.producing:",
+        "    if False:",
+        "tests/test_container_detection.py::test_a_station_that_needs_ffmpeg_is_refused_when_ffmpeg_is_disabled",
+    ),
+    Case(
+        # The generator never runs for a refused request, so the unsubscribe in
+        # its `finally` never does either - and every attempt then leaves a
+        # phantom listener holding a capacity slot.
+        "a refused request leaves its listener behind",
+        PKG / "api.py",
+        "        # Not via the response generator, which will never run: unsubscribe here\n"
+        "        # or the phantom listener holds a capacity slot until the reaper notices.\n"
+        "        await manager.unsubscribe(session, subscriber)",
+        "        # Not via the response generator, which will never run: unsubscribe here\n"
+        "        # or the phantom listener holds a capacity slot until the reaper notices.\n"
+        "        pass",
+        "tests/test_container_detection.py::test_the_refused_station_leaves_no_listener_behind",
     ),
 ]
 

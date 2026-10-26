@@ -132,6 +132,11 @@
 </p>
 
 <h2>Configuration</h2>
+{# This used to be a table of every setting. It was read-only, so it answered a
+   question nobody asked at the moment they were looking at live numbers - and
+   the answer they did want ("can I change this?") was always no. The few
+   figures a reader actually needs *while watching* stay here; everything else
+   lives on the settings page, where it can be edited. #}
 <div class="scroll">
 <table class="kv">
   <tbody>
@@ -142,8 +147,9 @@
 </table>
 </div>
 <p class="muted small">
-  These come from the config file or <code>RADIOCONV_*</code> environment
-  variables and are fixed for the life of the process.
+  Runtime settings can be changed on the
+  <a href="{{ settings_url }}">settings page</a>. Address and port are fixed when
+  the service starts.
 </p>
 
 <noscript>

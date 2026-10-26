@@ -35,7 +35,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Coroutine, Deque, Dict, List, Optional, Set, Tuple
 
-from .config import Settings
+from .config import Settings, SettingsStore
 from .pipeline import PipelineFatal, StreamPipeline
 from .retrans import RetransmitCounter, tcp_retransmit_counter
 from .throughput import SAMPLE_SECONDS, Throughput
@@ -516,9 +516,15 @@ class StreamSession:
             return "adts"
         # Not known yet: fall back to the setting, which is right for the
         # transcode paths (where we always know what we asked for).
-        if self.settings.output_codec == "mp3":
+        #
+        # The *effective* setting, because on an installation with FFmpeg
+        # disabled nothing is re-encoded: ``output_codec = "mp3"`` there would
+        # claim the listener is being sent MP3 while the station's ADTS audio is
+        # forwarded untouched, and aligning an ADTS stream on an MP3 frame grid
+        # is precisely the misalignment this method exists to prevent.
+        if self.settings.effective_output_codec == "mp3":
             return "mp3"
-        if self.settings.output_codec == "adts":
+        if self.settings.effective_output_codec == "adts":
             return "adts"
         return None
 
@@ -1345,8 +1351,16 @@ class StreamSession:
 class SessionManager:
     """Registry of live sessions with capacity control and idle reaping."""
 
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
+    def __init__(self, settings: Settings | SettingsStore) -> None:
+        #: A plain ``Settings`` is accepted (tests build one, and so does any
+        #: caller with no interest in live edits) and wrapped, so there is one
+        #: code path rather than an ``if`` in every reader. Reading through the
+        #: store is what makes ``max_sessions``, ``linger_seconds`` and the
+        #: retransmit thresholds follow a change made on the settings page
+        #: without restarting the process.
+        self.settings_store = (
+            settings if isinstance(settings, SettingsStore) else SettingsStore(settings)
+        )
         self.sessions: Dict[str, StreamSession] = {}
         self._lock = asyncio.Lock()
         self._reaper: Optional[asyncio.Task] = None
@@ -1403,6 +1417,11 @@ class SessionManager:
         #: only referenced by the event loop can be garbage collected mid-flight,
         #: which silently cancels it half way through shutting a session down.
         self._background: Set[asyncio.Task] = set()
+
+    @property
+    def settings(self) -> Settings:
+        """The settings in force *now*, which a live edit may have replaced."""
+        return self.settings_store.current
 
     def _spawn_background(self, coro: Coroutine[Any, Any, None], name: str) -> None:
         task = asyncio.create_task(coro, name=name)
@@ -1640,7 +1659,16 @@ class SessionManager:
     def make_key(primary_url: str, settings: Settings, overrides: Optional[dict] = None) -> str:
         overrides = overrides or {}
         bitrate = overrides.get("bitrate") or settings.bitrate
-        codec = overrides.get("output_codec") or settings.output_codec
+        if settings.passthrough_only:
+            # Every stream is the station's own codec, so a `?codec=` in the URL
+            # (or a different `output_codec` in the config) cannot produce a
+            # different stream. Keying on it anyway would give two radios on one
+            # station two pipelines - two downloads, two buffers - producing
+            # byte-identical audio, which is the one thing the shared session
+            # exists to prevent.
+            codec = "auto"
+        else:
+            codec = overrides.get("output_codec") or settings.output_codec
         return f"{primary_url}|{codec}|{bitrate}"
 
     def _unique_key(self, primary_url: str, settings: Settings, overrides: Optional[dict]) -> str:
@@ -1748,6 +1776,27 @@ class SessionManager:
         )
         log.warning("evicting idle session to free a slot", extra={"session": victim.id})
         self._retire(victim, "evicted for capacity")
+
+    def retire_all(self, reason: str) -> int:
+        """Stop every station, so the next listener gets a fresh pipeline.
+
+        This is how a settings change reaches the audio of stations that are
+        already playing: a session copies its settings at birth (deliberately -
+        see `SettingsStore`), so the only way to change a running pipeline's
+        bitrate is to end it. Radios reconnect on their own, which is the
+        behaviour the whole service already depends on.
+
+        Returns how many stations were retired, so the page can say so. Idle
+        stations are retired too, not just the ones with listeners: an idle one
+        is kept warm *with the old settings*, and it is the one a radio would
+        otherwise reconnect to.
+        """
+        victims = list(self.sessions.values())
+        for session in victims:
+            self._retire(session, reason)
+        if victims:
+            log.warning("retiring %d station(s): %s", len(victims), reason)
+        return len(victims)
 
     # ----------------------------------------------------------------- reaper
     async def _throughput_loop(self) -> None:

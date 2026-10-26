@@ -36,11 +36,14 @@ from conftest import ffmpeg_binary, has_ffmpeg
 from radioconv import ffmpeg as ffmpeg_mod
 from radioconv.api import (
     ICY_METAINT,
+    MAX_WRITE_SECONDS,
     _insert_icy_metadata,
+    _ListenerStream,
     _Pacer,
     icy_metadata_block,
     icy_metaint_for_frame,
     stall_watchdog_due,
+    write_slices,
 )
 from radioconv.config import Settings
 from radioconv.pipeline import PipelineStats, StreamPipeline
@@ -181,7 +184,228 @@ async def test_the_buffer_absorbs_a_whole_segment_without_dropping():
         await session.close("test")
 
 
-# ------------------------------------------------------------- the pacer
+# ------------------------------------------- one write, one slice of audio
+#: The rate a radio consumes audio at, per stream bitrate. The whole point of
+#: these tests: the *piece* is a fixed 8192 bytes, so how long it lasts varies by
+#: a factor of ten across the bitrates this project serves.
+RATES = {
+    "32 kbit/s": 32_000 / 8,
+    "64 kbit/s (the reported station)": 64_000 / 8,
+    "128 kbit/s": 128_000 / 8,
+    "192 kbit/s (the shipped default)": 192_000 / 8,
+    "320 kbit/s": 320_000 / 8,
+}
+
+
+def test_a_socket_write_never_carries_more_than_a_quarter_second_of_audio():
+    """The reported defect: at 64 kbit/s one write was a *second* of audio.
+
+    Reported as *"constant repeating every few seconds, much worse than
+    radiom2o"*, on a 64 kbit/s HE-AAC station, with the user's own diagnosis
+    attached: *"maybe because it's lower bitrate?"* - which was exactly right.
+
+    A queue piece is a fixed 8192 bytes, so the silence that follows handing one
+    over is ``8192 / rate``: 0.34 s at the shipped 192 kbit/s, but **1.02 s** at
+    64 kbit/s. Measured on the real station: one ~8.5 KiB burst every ~1.02 s
+    with 1.1 s of nothing in between - just under the ~1.2 s a Frontier radio
+    tolerates, so it dropped the connection every second or two and the rejoin
+    replayed ``handoff_overlap_seconds`` of audio it had already played.
+
+    So the ceiling has to be a *duration*, and it has to hold at every bitrate.
+    """
+    for label, rate in RATES.items():
+        chunk = bytes(8192)
+        slices = write_slices(chunk, rate)
+        assert b"".join(slices) == chunk, f"{label}: slicing lost or duplicated audio"
+
+        for piece in slices:
+            seconds = len(piece) / rate
+            assert seconds <= MAX_WRITE_SECONDS + 1e-9, (
+                f"{label}: one write carried {seconds:.2f}s of audio - a radio "
+                f"gets nothing to read for that long"
+            )
+        assert len(slices) >= 1
+
+
+def test_the_silence_between_writes_is_short_compared_with_a_radios_tolerance():
+    """The number that matters is the gap, and a radio gives up at ~1.2 s.
+
+    At least eight writes per second at *every* bitrate this project serves, so
+    the stream is a trickle rather than a burst - which is what the whole pacer
+    exists to produce (see the module docstring: 31 of 40 seconds carrying zero
+    bytes).
+    """
+    for label, rate in RATES.items():
+        slices = write_slices(bytes(8192), rate)
+        gap = len(slices[0]) / rate
+        assert gap * 4 <= 1.2, f"{label}: a radio could see {gap:.2f}s of silence"
+        assert gap <= 0.25, f"{label}: {gap:.2f}s between writes"
+
+
+def test_a_piece_shorter_than_one_write_goes_out_whole():
+    """A small piece (a flushed remainder, or a 320 kbit/s chunk) is one write."""
+    assert write_slices(b"abc", 8000.0) == [b"abc"]
+    assert write_slices(b"", 8000.0) == []
+    # 8192 bytes at 320 kbit/s is 0.20 s, under the ceiling.
+    assert write_slices(bytes(8192), 40_000.0) == [bytes(8192)]
+
+
+def test_the_slice_size_never_rounds_down_to_nothing():
+    """A very low bitrate must still make progress, not spin on empty writes."""
+    for rate in (1.0, 0.5, 100.0):
+        slices = write_slices(bytes(2000), rate)
+        assert slices and all(slices), f"rate {rate} produced an empty write"
+        assert b"".join(slices) == bytes(2000)
+
+
+def test_slicing_is_skipped_when_pacing_is_off():
+    """`pace_output = false` means an infinite rate, not an infinite slice count.
+
+    ``_pace_rate`` answers ``inf`` when pacing is disabled, which is the
+    documented escape hatch for diagnosing pacing itself. Multiplying that out
+    would raise ``OverflowError`` (an infinity is not an integer), so a listener
+    would be dropped for a reason that has nothing to do with its stream - the
+    kind of collision between two settings that only a test like this one
+    catches.
+    """
+    assert write_slices(bytes(2000), float("inf")) == [bytes(2000)]
+    assert write_slices(bytes(2000), float("nan")) == [bytes(2000)]
+
+
+# ------------------------------- the socket write has a deadline as well
+class _StalledSocket:
+    """An ASGI ``send`` whose writes never complete, and what it was given.
+
+    A radio that loses power is exactly this: a TCP connection whose peer stops
+    acknowledging. The kernel buffers keep the application writing for a while
+    (measured: the socket absorbed 2.8 s of stall before a write blocked at all),
+    and then one ``send`` never returns.
+    """
+
+    def __init__(self, block: bool = False) -> None:
+        self.messages: list = []
+        self._block = block
+
+    async def send(self, message: dict) -> None:
+        if self._block and message.get("body"):
+            await asyncio.Event().wait()
+        self.messages.append(message)
+
+
+def _audio_stream(chunks, closed: list):
+    """A body generator that records whether it was closed."""
+
+    async def _gen():
+        try:
+            for chunk in chunks:
+                yield chunk
+        finally:
+            closed.append("closed")
+
+    return _gen()
+
+
+async def _not_abandoned() -> None:
+    raise AssertionError("a listener that is reading must never be abandoned")
+
+
+async def test_a_radio_that_stops_reading_is_dropped_instead_of_waited_for():
+    """A powered-off radio never sends a FIN, so the *kernel* owns the decision.
+
+    Reported: *"if the radio loses power suddenly, the server keeps thinking the
+    radio is listening ... `dropped` keeps accumulating, but it keeps the stream
+    active for a very long time, like 15 minutes."* Fifteen minutes is
+    ``tcp_retries2``: the peer acknowledges nothing, TCP retransmits fifteen
+    times, the send buffer fills and the write blocks. The stall watchdog cannot
+    see it, because it is evaluated *between* writes and the write is the thing
+    that is stuck - so the generator sits there until the kernel gives up.
+
+    This is the bound that replaces that wait: no single write may block for
+    longer than ``listener_write_timeout``, and when one does the listener is
+    unsubscribed and the response ends, which makes the server close a socket
+    that will never accept another byte.
+    """
+    socket_ = _StalledSocket(block=True)
+    closed: list = []
+    abandoned: list = []
+
+    async def on_abandoned() -> None:
+        abandoned.append(True)
+
+    response = _ListenerStream(
+        _audio_stream([bytes(8), bytes(8), bytes(8)], closed),
+        write_timeout=0.05,
+        on_abandoned=on_abandoned,
+        media_type="audio/mpeg",
+        status_code=200,
+    )
+
+    # The outer bound is the assertion as much as a safety net: without the
+    # deadline this call never returns, and a test that hangs is worse than one
+    # that fails - the guard script has to report a red test, not stall.
+    await asyncio.wait_for(response.stream_response(socket_.send), timeout=5.0)
+
+    assert abandoned == [True], "the listener was never unsubscribed, so it stays on the page"
+    assert closed == ["closed"], (
+        "the body generator was never closed, so its `finally` never logs "
+        "`listener done` and never runs the cleanup it owns"
+    )
+    # The response ends *without* a terminating chunk, deliberately: that is the
+    # only way to make the server close a socket whose write buffer is full. See
+    # the class docstring.
+    assert all(m.get("more_body") is not False for m in socket_.messages), (
+        "the response claimed to be complete: the server would keep a dead "
+        "connection alive for the rest of the kernel's retransmission timeout"
+    )
+
+
+async def test_a_working_radio_still_gets_the_whole_stream():
+    """The deadline must be invisible to a radio that is reading: no clipping."""
+    socket_ = _StalledSocket()
+
+    response = _ListenerStream(
+        _audio_stream([b"aaaa", b"bbbb"], []),
+        write_timeout=5.0,
+        on_abandoned=_not_abandoned,
+        media_type="audio/mpeg",
+        status_code=200,
+    )
+    await response.stream_response(socket_.send)
+
+    assert [m.get("body") for m in socket_.messages[1:]] == [b"aaaa", b"bbbb", b""]
+    assert socket_.messages[0]["type"] == "http.response.start"
+    assert socket_.messages[-1]["more_body"] is False, "the response was not terminated"
+
+
+async def test_the_write_deadline_can_be_turned_off():
+    """0 means "no deadline", and nothing else may change: a slow write finishes.
+
+    It is a diagnostic setting, for telling a genuinely dead peer from a busy
+    one, so it has to restore the stock behaviour exactly rather than merely
+    loosen it.
+    """
+    socket_ = _StalledSocket()
+    seen: list = []
+
+    async def slow_send(message: dict) -> None:
+        if message.get("body"):
+            seen.append(message.get("body"))
+            await asyncio.sleep(0.2)  # slower than the deadline below would allow
+        socket_.messages.append(message)
+
+    response = _ListenerStream(
+        _audio_stream([b"aaaa"], []),
+        write_timeout=0.0,
+        on_abandoned=_not_abandoned,
+        media_type="audio/mpeg",
+        status_code=200,
+    )
+    await response.stream_response(slow_send)
+
+    assert seen == [b"aaaa"]
+    assert socket_.messages[-1]["more_body"] is False
+
+
 async def test_the_pacer_releases_at_the_stream_rate():
     pacer = _Pacer(lambda: FAST_RATE, initial_burst=0.0)
     started = time.monotonic()
@@ -945,18 +1169,108 @@ def test_a_forwarded_stream_reports_its_own_bitrate():
     audio - the very symptom being fixed.
     """
     pipeline = _pipeline_with(
-        PipelineStats(mode="passthrough", seconds_in=10.0, bytes_in=320_000),
+        PipelineStats(mode="passthrough", forwarded_bytes=320_000, forwarded_seconds=10.0),
         Settings(bitrate=192_000),
     )
-    assert pipeline.output_bitrate == 256_000
+    measured = pipeline.output_bitrate
+    assert measured == 256_000
+
+
+def test_the_forwarded_rate_ignores_the_container_it_arrived_in():
+    """The rate must be measured on the audio, not on the download.
+
+    Reported against a real station (radiom2o, AAC in MPEG-TS): *"every few
+    seconds, it either repeats the last few seconds or else skips a few
+    seconds"*. The cause was here - the rate was ``bytes_in``, which for a
+    transport stream is 20 % bigger than the audio it carries (188-byte packets,
+    PAT/PMT, PES headers, adaptation-field stuffing). Measured on that station:
+    199 KB downloaded per 10.3 s of audio, 165 KB of elementary stream.
+
+    Pacing at the downloaded rate hands a radio 1.25 s of audio every second. The
+    jitter buffer covers that for about four segments and then runs dry, so from
+    then on every segment is followed by ~2 s of silence - longer than the ~1.2 s
+    a Frontier-Silicon radio tolerates, so it reconnects, and the rejoin replays
+    ``handoff_overlap_seconds`` (heard as a repeat) or drops the backlog (heard
+    as a skip).
+
+    The numbers below are that station's, in miniature: a TS whose audio payload
+    is a fraction of what was downloaded, over the audio's real duration.
+    """
+    audio_bytes = 165_148
+    downloaded = 199_092  # the same 10.325 s inside MPEG-TS
+    pipeline = _pipeline_with(
+        PipelineStats(
+            mode="passthrough",
+            seconds_in=10.0,  # what the playlist claims
+            bytes_in=downloaded,
+            bytes_out=audio_bytes,
+            forwarded_bytes=audio_bytes,
+            forwarded_seconds=10.325,  # what the frames say
+        ),
+        Settings(bitrate=192_000),
+    )
+
+    measured = pipeline.output_bitrate
+    assert measured is not None
+    assert measured == audio_bytes * 8 / 10.325
+    assert measured < 130_000, (
+        f"{measured:.0f} bit/s is the *download* rate, not the audio rate - "
+        "pacing there makes the listener run dry every segment"
+    )
+
+
+def test_the_forwarded_rate_ignores_what_the_playlist_claims():
+    """EXTINF is the packager's claim; the frames are the measurement.
+
+    radiom2o declares ``EXTINF:10`` for segments that hold **10.325 s** of audio
+    (HE-AAC: 1024 samples per frame at a 24 kHz core rate). Using the claim is a
+    +3 % error, which does not sound like much and is invisible in a short test -
+    but it drains a five-second jitter buffer in under three minutes, after which
+    every segment is followed by a gap. Delivering a fraction of a per cent too
+    *slowly* is just as bad in the other direction: the queue fills and audio is
+    dropped for the listener.
+    """
+    audio_bytes = 165_148
+    pipeline = _pipeline_with(
+        PipelineStats(
+            mode="passthrough",
+            seconds_in=10.0,
+            bytes_out=audio_bytes,
+            forwarded_bytes=audio_bytes,
+            forwarded_seconds=10.325,
+        ),
+        Settings(bitrate=192_000),
+    )
+
+    measured = pipeline.output_bitrate
+    assert measured is not None
+    claimed = audio_bytes * 8 / 10.0
+    assert measured < claimed, "the playlist's EXTINF must not outrank the frames"
+    assert abs(measured - claimed) / claimed > 0.02, "this test needs the two to differ"
+
+
+def test_the_rate_falls_back_to_the_playlist_before_any_frames_are_counted():
+    """A ``-c:a copy`` remux produces no counted frames: use what we have."""
+    pipeline = _pipeline_with(
+        PipelineStats(mode="transcode", seconds_in=10.0, bytes_out=240_000),
+        Settings(bitrate=192_000, output_codec="adts"),
+    )
+    assert pipeline.output_bitrate == 192_000
 
 
 def test_a_transcode_reports_the_bitrate_we_asked_for():
+    """A re-encode runs at the bitrate we chose, so that *is* the answer.
+
+    ``bytes_out`` is deliberately not a round multiple of the bitrate here: it
+    used to be (240 KB over 10 s is 192 kbit/s), which made this test pass
+    whether the constant was used or the measurement was - and the guard script
+    for "the bitrate is no longer measured" then had nothing to catch.
+    """
     pipeline = _pipeline_with(
-        PipelineStats(mode="transcode", seconds_in=10.0, bytes_in=320_000),
+        PipelineStats(mode="transcode", seconds_in=10.0, bytes_out=250_000),
         Settings(bitrate=192_000, output_codec="mp3"),
     )
-    assert pipeline.output_bitrate == 192_000
+    assert pipeline.output_bitrate == 192_000, "the *measured* figure would be 200 kbit/s"
 
 
 def test_the_output_rate_is_unknown_until_measured():

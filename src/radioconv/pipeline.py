@@ -3,10 +3,19 @@
 Two engines are possible, chosen per stream *after looking at the actual data*:
 
 ``passthrough``
-    The segments are MPEG-TS carrying an elementary stream the radio can play
-    as-is (MP3 or ADTS AAC). A pure-python demuxer (``tsdemux``) extracts the
-    elementary stream. **No FFmpeg process, no decoding, no re-encoding** - on
-    a Raspberry Pi this costs a fraction of one core and cannot leak a child
+    The audio in the segments is something the radio can play as-is (MP3 or
+    ADTS AAC). Two source shapes reach this engine, and both are recognised
+    from the bytes:
+
+    * an **MPEG-TS** carrying that elementary stream, which a pure-python
+      demuxer (``tsdemux.TSDemuxer``) extracts;
+    * a **bare elementary stream** - the ``.aac`` segments many CDNs serve as
+      raw ADTS behind an ID3v2 tag - which needs no demuxing at all, only the
+      per-segment metadata tags removed
+      (``tsdemux.ElementaryStreamForwarder``).
+
+    Either way: **no FFmpeg process, no decoding, no re-encoding** - on a
+    Raspberry Pi this costs a fraction of one core and cannot leak a child
     process.
 
 ``transcode``
@@ -51,7 +60,15 @@ from . import ffmpeg as ffmpeg_mod
 from .config import Settings
 from .hls import HLSClient, HLSError, HLSFatal, PlaylistTracker, Segment
 from .throughput import Throughput
-from .tsdemux import PASSTHROUGH_TYPES, TSDemuxer, classify_segment, id3_song_title, scan_tables
+from .tsdemux import (
+    PASSTHROUGH_TYPES,
+    ElementaryStreamForwarder,
+    TSDemuxer,
+    audio_duration,
+    classify_segment,
+    id3_song_title,
+    scan_tables,
+)
 
 log = logging.getLogger(__name__)
 
@@ -115,10 +132,20 @@ class PipelineStats:
     segments: int = 0
     bytes_in: int = 0
     bytes_out: int = 0
-    #: Total *duration* of the upstream audio consumed. Together with
-    #: ``bytes_in`` this gives the stream's real bitrate, which is what the
-    #: output pacer needs to know and cannot guess - see ``output_bitrate``.
+    #: Total duration the *playlist* claims for the segments consumed
+    #: (``EXTINF``). The packager's own accounting, kept for diagnosis: it is a
+    #: claim, not a measurement, and live packagers get it wrong in both
+    #: directions - see ``forwarded_seconds`` for the number to measure with.
     seconds_in: float = 0.0
+    #: Audio **as produced** by the FFmpeg-free path, and its real duration
+    #: counted from the elementary stream's own frames. Together these give the
+    #: exact rate a radio consumes audio at, which is what the output pacer has
+    #: to keep up with. Measured rather than derived because both alternatives
+    #: are wrong in a way that is only visible after minutes of playback:
+    #: ``bytes_in`` includes the container (20 % for a transport stream), and
+    #: ``EXTINF`` is the packager's claim (radiom2o declares 10 s for 10.32 s).
+    forwarded_bytes: int = 0
+    forwarded_seconds: float = 0.0
     failures: int = 0
     failovers: int = 0
     started_at: float = field(default_factory=time.time)
@@ -149,16 +176,65 @@ class PipelineStats:
         }
 
 
+def _why_it_needs_ffmpeg(detected: Optional[str], kind: Optional[str]) -> str:
+    """One clause naming why this stream cannot be forwarded, for the radio owner.
+
+    The counterpart of ``web._why_not_forwarded``, and deliberately separate:
+    that one is written for somebody looking at a web page who can try a
+    different URL, this one for a log line and an HTTP error where the reader is
+    deciding whether to turn FFmpeg back on. Both exist because "it does not
+    work" is not a diagnosis.
+    """
+    if detected == "mp4":
+        return "the audio is packaged in fMP4, which needs a demuxer"
+    if detected == "ts":
+        if kind is None:
+            return "its transport stream carries no MP3 or ADTS AAC audio"
+        return f"forwarding cannot turn {kind} into what this installation asked for"
+    if detected is None:
+        return "the segment container was not recognised, so it cannot be forwarded"
+    return f"the source audio ({kind or detected}) cannot be forwarded as-is"
+
+
 # --------------------------------------------------------------- mode picking
 def decide_mode(first_segment: bytes, settings: Settings) -> Tuple[str, Optional[str]]:
     """Decide whether the FFmpeg-free path can be used.
 
     Returns ``(mode, kind)``; ``kind`` is ``"mp3"``/``"adts"`` when the source
-    elementary stream can be forwarded untouched.
+    audio can be forwarded untouched.
+
+    Two source shapes can be forwarded, and both are answered by the bytes
+    rather than by the playlist:
+
+    * a **transport stream** carrying an MP3 or ADTS AAC elementary stream,
+      which the demuxer extracts by PID;
+    * a **bare elementary stream** - ``.aac`` segments on Microsoft's CDN are
+      raw ADTS behind an ID3v2 tag - which needs no demuxing at all, only the
+      metadata tags removed.
+
+    What the output codec allows decides whether forwarding is *used*:
+    forwarding an AAC source can only ever produce AAC, so asking for MP3 means
+    a real re-encode, and ``kind`` is still reported because it tells the
+    transcoder which input it is being handed.
+
+    ``effective_output_codec`` rather than ``output_codec`` is read here, and
+    that is not a shortcut: on an installation with FFmpeg disabled nothing can
+    be re-encoded, so the answer to "which codec may we emit?" is "the station's
+    own" whatever the config file says. See :attr:`Settings.passthrough_only`.
     """
-    if not settings.prefer_passthrough:
+    if not (settings.prefer_passthrough or settings.passthrough_only):
         return MODE_TRANSCODE, None
-    if classify_segment(first_segment) != "ts":
+
+    detected = classify_segment(first_segment)
+    wanted = settings.effective_output_codec
+
+    if detected in ("mp3", "adts"):
+        # Already a playable elementary stream: there is no container in the way.
+        if wanted in (detected, "auto"):
+            return MODE_PASSTHROUGH, detected
+        return MODE_TRANSCODE, detected
+
+    if detected != "ts":
         return MODE_TRANSCODE, None
 
     tables = scan_tables(first_segment)
@@ -166,9 +242,9 @@ def decide_mode(first_segment: bytes, settings: Settings) -> Tuple[str, Optional
     if kind is None:
         return MODE_TRANSCODE, None
 
-    if kind == "adts" and settings.output_codec in ("adts", "auto"):
+    if kind == "adts" and wanted in ("adts", "auto"):
         return MODE_PASSTHROUGH, kind
-    if kind == "mp3" and settings.output_codec in ("mp3", "auto"):
+    if kind == "mp3" and wanted in ("mp3", "auto"):
         return MODE_PASSTHROUGH, kind
     return MODE_TRANSCODE, kind
 
@@ -214,25 +290,62 @@ class StreamPipeline:
         listener fall permanently behind (so the queue fills and audio is
         dropped).
 
-        Three cases, and only the first is a guess-free constant:
+        Two cases, and only the first is a guess-free constant:
 
         * **re-encoded** (the default: AAC in, MP3 out at ``settings.bitrate``) -
           FFmpeg is encoding to a bitrate we chose, so that bitrate *is* the
           answer.
-        * **boxed up** (``output_codec = "adts"``, a ``-c:a copy`` remux) - the
-          same audio in a different wrapper, so upstream bytes per second is
-          downstream bytes per second.
-        * **forwarded** (the FFmpeg-free path) - likewise, the source's own rate.
+        * **everything else** - a ``-c:a copy`` remux, or either FFmpeg-free
+          forward - where the rate is whatever the *produced* bytes work out to
+          over the audio they carry.
 
-        ``None`` when nothing has been measured yet, and the caller falls back to
-        the configured bitrate.
+        Why it is ``bytes_out`` and not ``bytes_in``
+        --------------------------------------------
+        ``bytes_in`` is what was **downloaded**, and for a transport stream that
+        is mostly not audio: 188-byte packets with PAT/PMT tables, PES headers
+        and adaptation-field stuffing around every payload. Measured on a real
+        station (radiom2o, AAC in MPEG-TS): 199 KB downloaded per 10.3 s of audio
+        against 165 KB of elementary stream - **20 % overhead**. Pacing the
+        output at the downloaded rate therefore hands a radio 1.25 s of audio
+        every second.
+
+        That is not a harmless mis-timing: the queue drains in about four
+        segments, and from then on the listener gets a segment's bytes and then
+        two seconds of silence, every segment, forever. A Frontier-Silicon radio
+        gives up after ~1.2 s of silence and reconnects, so the audible result
+        is the reported *"every few seconds it either repeats the last few
+        seconds or skips a few seconds"* - the repeat being
+        ``handoff_overlap_seconds`` replayed on the rejoin, the skip being the
+        backlog discarded with the old socket.
+
+        Each segment also carries its own ID3 tags, so bare-ADTS forwarding has
+        the same defect in miniature (a few per cent). ``bytes_out`` has both
+        problems by construction: it counts only the audio that is handed
+        downstream.
+
+        Why the **duration** is counted from the frames too
+        ---------------------------------------------------
+        Dividing by ``EXTINF`` instead leaves a smaller version of the same
+        error, and one that only shows up after minutes: the pacer's rate would
+        be a few per cent above or below the real one, so the jitter buffer
+        creeps empty (or full) until the listener hears gaps (or dropped audio).
+        radiom2o declares 10 s for 10.32 s of audio, which is +3 % - enough to
+        drain a five-second buffer in under three minutes. ``forwarded_seconds``
+        is counted from the ADTS/MPEG frame headers, so both sides of the ratio
+        come from the audio itself and the drift is exactly zero.
         """
-        if self.stats.mode != MODE_PASSTHROUGH and self.settings.output_codec == "mp3":
+        if self.stats.mode != MODE_PASSTHROUGH and self.settings.effective_output_codec == "mp3":
             # Re-encoded to a bitrate we asked for.
             return float(self.settings.bitrate)
-        if self.stats.seconds_in > 0 and self.stats.bytes_in > 0:
-            # Forwarded or remuxed: the source's own bytes per second.
-            return self.stats.bytes_in * 8.0 / self.stats.seconds_in
+        if self.stats.forwarded_seconds > 0 and self.stats.forwarded_bytes > 0:
+            # Forwarded: bytes produced over the audio duration they carry, both
+            # counted from the stream itself. This is the rate the radio's
+            # decoder consumes at, so it is the rate to release at.
+            return self.stats.forwarded_bytes * 8.0 / self.stats.forwarded_seconds
+        if self.stats.seconds_in > 0 and self.stats.bytes_out > 0:
+            # A `-c:a copy` remux (no frames counted), or the first moments of a
+            # forwarded stream before a whole segment has been measured.
+            return self.stats.bytes_out * 8.0 / self.stats.seconds_in
         return None
 
     def _note_input(self, segment: Segment, data: bytes) -> None:
@@ -267,6 +380,11 @@ class StreamPipeline:
         failures = 0
         consecutive_fatal = 0
         backoff = self.settings.restart_backoff
+        #: The reason the last source gave up, kept so the final error can say it.
+        #: "all 1 source URL(s) failed" is true, unhelpful, and - for the failures
+        #: that are decided rather than suffered, such as a stream that needs
+        #: disabled FFmpeg - it throws away the only sentence anybody can act on.
+        last_fatal: Optional[str] = None
 
         while not self._closed:
             url = self.current_url
@@ -286,6 +404,7 @@ class StreamPipeline:
                 raise
             except (PipelineFatal, HLSFatal) as exc:
                 consecutive_fatal += 1
+                last_fatal = str(exc)
                 self.stats.failures += 1
                 # No traceback on purpose: an upstream 404 or a non-HLS URL is
                 # an expected event, and we are about to try another source.
@@ -303,8 +422,9 @@ class StreamPipeline:
                 return
 
             if consecutive_fatal >= len(self.sources):
+                reason = f": {last_fatal}" if last_fatal else ""
                 raise PipelineFatal(
-                    f"all {len(self.sources)} source URL(s) failed; last tried {url}"
+                    f"all {len(self.sources)} source URL(s) failed; last tried {url}{reason}"
                 )
             if failures >= self.settings.failover_after:
                 failures = 0
@@ -364,19 +484,38 @@ class StreamPipeline:
 
         mode = MODE_TRANSCODE
         kind: Optional[str] = None
-        if self.settings.prefer_passthrough:
+        if self.settings.prefer_passthrough or self.settings.passthrough_only:
             mode, kind = decide_mode(first_data, self.settings)
+
+        if mode == MODE_TRANSCODE and self.settings.passthrough_only:
+            # FFmpeg is disabled and this stream needs it, so there is nothing to
+            # try and no point retrying: say why, in a message a radio owner can
+            # act on, and end the session rather than emit silence behind a
+            # `200 audio/...` (the failure mode this project has shipped before).
+            raise PipelineFatal(
+                "this station has to be re-encoded, and FFmpeg is disabled on this "
+                f"installation ({_why_it_needs_ffmpeg(detected, kind)}). Enable it "
+                "again (remove --no-ffmpeg, or set ffmpeg_enabled = true) to play "
+                "this station, or use one whose audio can be forwarded as-is."
+            )
 
         self.stats.mode = mode
         self.stats.detected_kind = kind
+        if mode == MODE_PASSTHROUGH and detected in ("mp3", "adts"):
+            # A forwarded elementary stream *is* the output, so the format is
+            # known before a single byte is produced. That matters: the
+            # listener's frame grid and the ICY grid are both derived from
+            # `detected_codec`, and they have to be right from byte one.
+            self.stats.detected_codec = detected
         if mode == MODE_PASSTHROUGH:
             log.info(
-                "pass-through engine: %s elementary stream forwarded without ffmpeg "
+                "pass-through engine: %s %s forwarded without ffmpeg "
                 "(no re-encode, no child process)",
+                "bare" if detected in ("mp3", "adts") else "MPEG-TS",
                 kind,
             )
         else:
-            if self.settings.output_codec == "adts":
+            if self.settings.effective_output_codec == "adts":
                 target = (
                     "ADTS (copy, no re-encode)" if kind == "adts" else "ADTS (re-encoded to AAC)"
                 )
@@ -390,7 +529,13 @@ class StreamPipeline:
             )
 
         if mode == MODE_PASSTHROUGH:
-            iterator = self._run_passthrough(tracker, pending)
+            # Pass-through is only ever chosen for a container that was
+            # recognised, so this is the classifier's ``None`` living in the
+            # type rather than a case that can happen.
+            container = "ts"
+            if detected in {"adts", "mp3"}:
+                container = detected
+            iterator = self._run_passthrough(tracker, pending, container=container)
         else:
             iterator = self._run_transcode(tracker, input_format, pending, init_segments, kind)
 
@@ -444,9 +589,21 @@ class StreamPipeline:
 
     # ---------------------------------------------------------- passthrough
     async def _run_passthrough(
-        self, tracker: PlaylistTracker, pending: List[WorkItem]
+        self, tracker: PlaylistTracker, pending: List[WorkItem], container: str = "ts"
     ) -> AsyncGenerator[bytes, None]:
-        demux = TSDemuxer(prefer_passthrough=True)
+        """Forward the source's audio with no FFmpeg, from either source shape.
+
+        ``container`` is what the first segment's bytes were classified as. A
+        transport stream has to be demuxed; a bare elementary stream
+        (``"adts"``/``"mp3"``) only needs its ID3 tags skipped and its frames
+        kept whole. Both expose the same three members - ``feed``, ``ready``
+        and ``output_kind`` - so the loop below is identical for each, and
+        neither can start a child process.
+        """
+        if container == "ts":
+            demux = TSDemuxer(prefer_passthrough=True)
+        else:
+            demux = ElementaryStreamForwarder(container)
 
         async def feeder(queue: asyncio.Queue) -> None:
             async def emit(segment: Segment, data: bytes) -> None:
@@ -457,6 +614,15 @@ class StreamPipeline:
                     # bytes need to know what they are, because the frame
                     # grid they are aligned to depends on it.
                     self.stats.detected_codec = demux.output_kind or self.stats.detected_codec
+                    # Both halves of the pacing rate come from the audio that is
+                    # actually being forwarded, and the duration is counted from
+                    # the frame headers rather than taken from EXTINF - see
+                    # `output_bitrate`. Counting is one header walk per segment
+                    # (~250 frames), i.e. free.
+                    self.stats.forwarded_bytes += len(plain)
+                    self.stats.forwarded_seconds += audio_duration(
+                        plain, self.stats.detected_codec or "adts"
+                    )
                     await queue.put(plain)
 
             # The first couple of segments may not carry PAT/PMT, so the
@@ -473,7 +639,10 @@ class StreamPipeline:
                     self._note_input(segment, data)
                 await emit(segment, data)
             if not demux.ready:
-                raise PipelineError("no usable MPEG-TS audio stream found; use ffmpeg instead")
+                raise PipelineError(
+                    f"no usable audio stream found in the {container.upper()} segments; "
+                    "use ffmpeg instead"
+                )
 
             while not self._closed:
                 try:
@@ -511,9 +680,11 @@ class StreamPipeline:
         # we are outputting. An MP3 source going to an ADTS output has to be
         # *encoded*, not copied: ffmpeg accepts ``-acodec copy -f adts`` for
         # MP3 input and then produces nothing a radio can decode.
-        copy_audio = self.settings.output_codec == "adts" and source_kind == "adts"
+        copy_audio = self.settings.effective_output_codec == "adts" and source_kind == "adts"
         command = ffmpeg_mod.build_command(self.settings, input_format, copy_audio=copy_audio)
-        self.stats.detected_codec = "aac" if self.settings.output_codec == "adts" else "mp3"
+        self.stats.detected_codec = (
+            "aac" if self.settings.effective_output_codec == "adts" else "mp3"
+        )
 
         async def feeder(queue: asyncio.Queue) -> None:
             proc = await self._spawn(command)

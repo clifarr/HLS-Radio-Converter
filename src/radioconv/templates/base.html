@@ -30,6 +30,7 @@
   <nav>
     <a href="/" {% if current == "converter" %}aria-current="page"{% endif %}>Converter</a>
     <a href="{{ dashboard_url }}" {% if current == "dashboard" %}aria-current="page"{% endif %}>Dashboard</a>
+    <a href="{{ settings_url }}" {% if current == "settings" %}aria-current="page"{% endif %}>Settings</a>
     <a href="/docs">API reference</a>
   </nav>
   {# Hidden until the script runs, so a browser with scripting off shows

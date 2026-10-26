@@ -5,10 +5,37 @@
 <p>Turn an HLS (<code>.m3u8</code>) stream into a plain audio stream your radio
 can play.</p>
 
+{% if not ffmpeg_enabled %}
+{# Above the form, not inside the check result: this changes what every URL on
+   this page means, including the ones produced with no diagnostics at all. A
+   person who never ticks the checkbox still has to know why a station might
+   not play. #}
+<section class="card">
+  <h2>FFmpeg is off on this installation</h2>
+  <p>The station's own audio is forwarded untouched, so nothing is re-encoded
+  and no FFmpeg process is ever started. That saves the CPU and gives the best
+  possible quality &mdash; but it also means this service cannot convert
+  anything.</p>
+  <p class="muted">A station can be played only if its audio is already MP3 or
+  ADTS AAC (inside a transport stream, or as bare frames). Anything that needs
+  a real demuxer or a re-encode &mdash; fMP4, or a stream carrying some other
+  codec &mdash; cannot be played at all, and says so instead of going
+  silent.</p>
+</section>
+{% endif %}
+
 <section class="card">
   <form action="/" method="get">
     <label for="url">Source <code>.m3u8</code> URL</label>
     <input id="url" name="url" value="{{ target }}" placeholder="{{ example }}" required>
+    {# On by default, because the point of the page is to tell you whether the
+       station will work - but it is a *choice*, and unticking it keeps the
+       page instant and touches no network at all. #}
+    <label class="check" for="probe">
+      <input type="checkbox" id="probe" name="probe" value="1"
+             {% if probe_checked %}checked{% endif %}>
+      <span>also check the stream (takes a few seconds)</span>
+    </label>
     <button type="submit">Get radio URL</button>
   </form>
 </section>
@@ -18,8 +45,7 @@ can play.</p>
   <p><strong>Radio URL</strong> - paste this into the radio:</p>
   <code class="block">{{ radio_url }}</code>
   <p class="muted">
-    Or <a href="{{ listen_url }}">play it in this browser</a> (an endless stream,
-    so the tab will not stop on its own).
+    Or <a href="{{ listen_url }}">play it in this browser</a>.
   </p>
 </section>
 {% elif target %}
@@ -28,6 +54,42 @@ can play.</p>
   <p class="muted">It must start with <code>http://</code> or
   <code>https://</code> and point at either a <code>.m3u8</code> playlist or a
   page that redirects to one.</p>
+</section>
+{% endif %}
+
+{% if probe %}
+<section class="card check">
+  <h2>Stream check</h2>
+  {# The one sentence that answers "will this work, and will it cook the Pi?".
+     Coloured by state: good = nothing to do, warn = a better URL exists,
+     bad = we could not look, info = FFmpeg is simply required. #}
+  <p class="verdict" data-state="{{ engine.state }}">{{ engine.verdict }}</p>
+  {% if probe_rows %}
+  <table class="kv">
+    <tbody>
+    {% for row in probe_rows %}
+      <tr>
+        <th scope="row" tabindex="0" data-tooltip="{{ row.tip }}">{{ row.label }}</th>
+        <td>{{ row.value }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  {% if passthrough_url %}
+  <p>The URL that avoids FFmpeg for this station:</p>
+  <code class="block">{{ passthrough_url }}</code>
+  {# The URL is only half the decision: it also changes what the radio is told
+     the audio is, and that is what decides whether an old radio will play it.
+     Saying "cheaper" without saying "and the header changes" would hand
+     somebody a silent radio and no way to explain it. #}
+  <p class="muted small">
+    Only use it if the radio decodes AAC itself: this URL makes the service
+    announce <code>audio/aac</code> instead of <code>audio/mpeg</code>. A radio
+    that plays MP3 only needs the URL above; re-encoding costs the Pi CPU, not
+    you any quality.
+  </p>
+  {% endif %}
 </section>
 {% endif %}
 
@@ -74,5 +136,11 @@ can play.</p>
   URL above is all it needs. Optional <code>&amp;name=</code> sets the station
   name shown on the radio's display, and <code>&amp;br=</code> /
   <code>&amp;codec=</code> override the output.
+  {% if not ffmpeg_enabled %}
+  With FFmpeg off, <code>&amp;codec=</code> does nothing &mdash; there is
+  nothing to re-encode, so the station's own audio is served as it is &mdash;
+  and <code>&amp;br=</code> only changes the bitrate <em>reported</em> to the
+  radio, not the audio.
+  {% endif %}
 </p>
 {% endblock %}

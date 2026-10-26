@@ -4,8 +4,10 @@
 # edit. Every value can also be supplied as an environment variable with the
 # RADIOCONV_ prefix, e.g. RADIOCONV_BITRATE=128000.
 #
-# Precedence: built-in defaults < this file < RADIOCONV_* environment < command
-# line flags.
+# Precedence: built-in defaults < this file < values saved from the settings
+# page (ui-settings.json, same directory as this file) < RADIOCONV_*
+# environment < command line flags. A value set by the last two cannot be
+# overridden from the browser, and the page says so rather than pretending.
 
 # ---------------------------------------------------------------- networking
 host = "0.0.0.0"          # 0.0.0.0 = every interface (what you want for a radio)
@@ -13,6 +15,17 @@ port = 8123
 # Shown on the index page; set this if the machine has several addresses.
 # public_host = "192.168.1.50:8123"
 # cors_origins = "http://localhost:3000"   # only needed for a browser client
+
+# ---------------------------------------------------------------- management
+# The settings page at /settings is a write endpoint that anything on your LAN
+# can reach, and nothing here is authenticated. Most values can be changed from
+# it - a change is validated, saved to ui-settings.json in this directory, and
+# can be applied to the stations that are playing. Set this to false to make
+# the installation read-only: the page still shows every value, and a submit is
+# refused with 403. host, port, log_level, ffmpeg_path and cors_origins are
+# never editable from the page, because a page that can change its own bind
+# address is a page you lose.
+allow_ui_settings = true
 
 # ------------------------------------------------------------------ encoding
 bitrate = 192000          # 8000..320000 bit/s. The default, and the value the
@@ -35,6 +48,19 @@ output_codec = "mp3"
 prefer_passthrough = true
 
 # --------------------------------------------------------------------- ffmpeg
+# FFmpeg is REQUIRED by default: it is what re-encodes AAC to MP3, and MP3 is
+# what most internet radios play. Turn it off only if every station you use
+# already sends a codec your radio decodes - then nothing needs converting.
+#
+# With `ffmpeg_enabled = false` (or `radioconv serve --no-ffmpeg`):
+#   * no FFmpeg process is ever started, and the binary is not even looked for;
+#   * `output_codec` and `?codec=` are ignored - the station's own audio is
+#     forwarded untouched, which is the same as every URL ending in `?codec=auto`;
+#   * a station whose audio cannot be forwarded (fMP4, or a transport stream
+#     carrying something other than MP3/ADTS AAC) CANNOT BE PLAYED, and says so
+#     instead of going silent. That is the trade: a fraction of the CPU and no
+#     quality loss, in exchange for a smaller set of playable stations.
+ffmpeg_enabled = true
 # Leave unset to use the binary bundled with the pip package, then $PATH.
 # ffmpeg_path = "/usr/bin/ffmpeg"
 # One thread is the right answer on a single-board computer: audio transcoding
@@ -219,6 +245,23 @@ stall_reconnect_cooldown_seconds = 5.0
 # /dashboard, because a radio hears silence as nothing at all.
 stall_timeout = 30.0
 restart_backoff = 2.0
+
+# How long a single write to a radio may block before that listener is dropped.
+# 0 = no deadline (leave it to the kernel, which is the old behaviour).
+#
+# A radio that loses power sends no FIN, so the kernel just keeps retransmitting
+# until tcp_retries2 gives up: fifteen attempts, about FIFTEEN MINUTES. Until
+# then the service counted the radio as listening and kept dropping its audio,
+# so `dropped` climbed on the dashboard for a quarter of an hour after the radio
+# was switched off. This is the bound that replaces that wait: one write may not
+# block for longer than this, and then the listener is unsubscribed and the
+# connection closed.
+#
+# Do not go much below 30. A congested Wi-Fi link absorbs a measured 2.8s of
+# stall inside the kernel before the application even sees a blocked write, and
+# a healthy radio on a bad link can pause for a few seconds more. Anything under
+# a few seconds would drop working radios.
+listener_write_timeout = 30.0
 
 # --------------------------------------------------------------- housekeeping
 # Ask systemd for a clean restart above this RSS. 0 = disabled. Pair with

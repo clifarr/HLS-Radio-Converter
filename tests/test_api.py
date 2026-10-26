@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from radioconv.api import decode_target, parse_controls
+from radioconv.config import Settings
 
 
 # ------------------------------------------------------- pure helper functions
@@ -65,6 +66,7 @@ class _Request:
         ("br=96k", {"bitrate": 96000}),
         ("bitrate=128000", {"bitrate": 128000}),
         ("codec=aac", {"output_codec": "adts"}),
+        ("codec=adts", {"output_codec": "adts"}),
         ("codec=mp3", {"output_codec": "mp3"}),
         ("br=1", {}),  # out of range, ignored rather than fatal
         ("bogus=1", {}),
@@ -72,6 +74,93 @@ class _Request:
 )
 def test_parse_controls(query, expected):
     assert parse_controls(_Request(query).query_params) == expected
+
+
+def test_aac_and_adts_are_the_same_request():
+    """Two spellings, one meaning - so neither can be "the better one".
+
+    The page prints ``adts`` (that is ``passthrough_kind``'s value and the word
+    its verdict sentence uses), while people type ``aac`` because that is what
+    the radio's specification sheet says. Both set the same field, so both
+    produce the same engine decision, the same bytes and the same
+    ``Content-Type``.
+
+    Pinned here so a later edit cannot quietly give them different meanings -
+    for example a real LOAS/HE-AAC output, which no old radio decodes.
+    """
+    aac = parse_controls(_Request("codec=aac").query_params)
+    adts = parse_controls(_Request("codec=adts").query_params)
+
+    assert aac == adts == {"output_codec": "adts"}
+
+
+# ------------------------------------------------ ffmpeg turned off entirely
+def test_the_content_type_follows_what_is_actually_being_sent():
+    """With FFmpeg off every stream is an ``auto`` stream, header included.
+
+    ``audio/mpeg`` for a forwarded AAC stream makes a radio pick its MP3
+    decoder: it plays nothing, or noise, and the station looks broken. The header
+    is decided before the first byte, which is why ``_settle_kind`` waits - and
+    why it has to ask the *effective* codec rather than the configured one.
+    """
+    from radioconv.api import _media_type
+
+    off = Settings(ffmpeg_enabled=False)
+    assert _media_type(off, "adts") == "audio/aac"
+    assert _media_type(off, "mp3") == "audio/mpeg"
+
+    # The configured codec alone would have said audio/mpeg for both.
+    assert _media_type(Settings(output_codec="mp3"), None) == "audio/mpeg"
+    assert _media_type(Settings(output_codec="adts"), None) == "audio/aac"
+
+    # An explicit override still wins: it exists for picky firmware.
+    assert _media_type(Settings(ffmpeg_enabled=False, mime_override="audio/aacp"), None) == (
+        "audio/aacp"
+    )
+
+
+async def test_settling_the_codec_waits_when_ffmpeg_is_disabled():
+    """``auto`` means "wait and see", and with FFmpeg off that is every stream.
+
+    Skipping the wait would send the header before the pipeline had identified
+    the source, so a forwarded ADTS station would be announced as ``audio/mpeg``
+    for the life of the connection - the exact bug ``_settle_kind`` exists to
+    prevent.
+    """
+    from types import SimpleNamespace
+
+    from radioconv.api import _settle_kind
+
+    session = SimpleNamespace(
+        pipeline=SimpleNamespace(stats=SimpleNamespace(detected_kind="adts", mode="passthrough")),
+        dead=False,
+    )
+    assert await _settle_kind(Settings(ffmpeg_enabled=False), session) == "adts"  # ty: ignore[invalid-argument-type]
+    # A normal install with a concrete codec does not wait at all.
+    assert await _settle_kind(Settings(output_codec="mp3"), session) is None  # ty: ignore[invalid-argument-type]
+
+
+def test_the_ffmpeg_report_does_not_look_for_a_binary_when_it_is_disabled():
+    """`--no-ffmpeg` must mean "not used", not "search for one anyway".
+
+    ``_probe_ffmpeg`` runs the binary twice to fill in its answer, once per
+    process, and ``/health`` is polled. On an installation that has deliberately
+    turned FFmpeg off, reporting a path would read as a working install being
+    ignored - and the whole point of the setting is that nothing is forked.
+    """
+    from radioconv import ffmpeg as ffmpeg_mod
+    from radioconv.api import _probe_ffmpeg
+
+    report = _probe_ffmpeg(Settings(ffmpeg_enabled=False))
+    assert report["enabled"] is False
+    assert report["disabled"] is True
+    assert report["path"] is None
+    assert report["version"] is None
+
+    # And the enabled answer still says so explicitly, so a monitor can tell the
+    # two apart without inferring it from a missing key.
+    assert "enabled" in _probe_ffmpeg(Settings())
+    assert ffmpeg_mod.INPUT_FORMATS["adts"] == "aac", "sanity: ffmpeg module still importable"
 
 
 # ------------------------------------------------------------- live HTTP tests

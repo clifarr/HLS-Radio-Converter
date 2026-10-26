@@ -97,6 +97,18 @@ def check_demuxer() -> Check:
 
 
 def check_ffmpeg(settings: Settings) -> Check:
+    if not settings.ffmpeg_enabled:
+        # Not a failure, and not a skip either: on this installation the
+        # FFmpeg-free path is the whole design, so "there is no ffmpeg here" is
+        # the correct state of affairs. Reporting FAIL would make `radioconv
+        # check` exit 1 on a perfectly healthy box - and it is the one command a
+        # person runs when something *is* wrong, so a false alarm there is worse
+        # than no check at all.
+        return Check(
+            "ffmpeg",
+            True,
+            "disabled (--no-ffmpeg): only MP3/ADTS stations can be played",
+        )
     try:
         path = ffmpeg_mod.locate_ffmpeg(settings.ffmpeg_path)
     except Exception as exc:  # noqa: BLE001 - report any failure, never raise
@@ -301,8 +313,16 @@ async def _collect(pipeline: StreamPipeline, min_bytes: int, timeout: float) -> 
 
 
 async def _end_to_end(settings: Settings, codec: str) -> Check:
-    """Generate, serve and stream a real HLS source; verify the engine used."""
+    """Generate, serve and stream a real HLS source; verify the engine used.
+
+    Needs FFmpeg even to *build the test content* (``_generate_hls`` runs it), so
+    with FFmpeg disabled there is nothing to test. The FFmpeg-free path is then
+    covered by ``check_demuxer`` above, which is a real round-trip through the
+    demuxer and needs no binary at all.
+    """
     name = f"end-to-end ({codec} source)"
+    if not settings.ffmpeg_enabled:
+        return Check(name, True, "skipped: FFmpeg is disabled", skipped=True)
     try:
         ffmpeg_mod.locate_ffmpeg(settings.ffmpeg_path)
     except Exception as exc:  # noqa: BLE001 - report any failure, never raise

@@ -172,11 +172,83 @@ def test_sample_rate_whitelist():
         Settings(sample_rate=12_345)
 
 
+def test_the_listener_write_deadline_is_bounded_both_ways():
+    """The window this setting exists to close, in both directions.
+
+    Too short and it drops radios that are only congested: the kernel absorbs a
+    measured 2.8 s of Wi-Fi stall before the application even sees a blocked
+    write, so the validator refuses anything under 5 s. Too long and it puts the
+    fifteen-minute wait back that the deadline was introduced to remove. Zero is
+    allowed on purpose - it turns the deadline off and restores the stock
+    behaviour, which is what makes it useful for telling a dead peer from a busy
+    one.
+    """
+    assert Settings().listener_write_timeout == 30.0
+    assert Settings(listener_write_timeout=0.0).listener_write_timeout == 0.0
+    assert Settings(listener_write_timeout=5.0).listener_write_timeout == 5.0
+    assert Settings(listener_write_timeout=300.0).listener_write_timeout == 300.0
+
+    for bad in (1.0, 4.9, 301.0, 900.0):
+        with pytest.raises(ValidationError):
+            Settings(listener_write_timeout=bad)
+
+
 def test_upstream_headers():
     headers = Settings(referer="https://example.com").headers
     assert headers["Referer"] == "https://example.com"
     assert "User-Agent" in headers
     assert "Referer" not in Settings().headers
+
+
+# ------------------------------------------------------- ffmpeg is optional
+def test_ffmpeg_is_required_unless_somebody_says_otherwise():
+    """The default must not change: this is an opt-out, not a new default.
+
+    Most radios on the market are still MP3-only, and the whole promise of the
+    project is that *any* station can be played. Turning FFmpeg off by default
+    would trade a requirement nobody notices for a class of stations that
+    silently stop working.
+    """
+    assert Settings().ffmpeg_enabled is True
+    assert Settings().effective_output_codec == "mp3", "the shipped output is unchanged"
+    assert Settings().passthrough_only is False
+
+
+def test_disabling_ffmpeg_makes_every_stream_ask_for_the_source_codec():
+    """`--no-ffmpeg` is equivalent to appending `?codec=auto` to every URL.
+
+    That translation is the whole feature: with nothing to encode with, the only
+    producible output is the audio the station already sends, so the "what codec
+    may we emit?" question has exactly one answer regardless of configuration.
+    """
+    off = Settings(ffmpeg_enabled=False, output_codec="mp3")
+
+    assert off.passthrough_only is True
+    assert off.effective_output_codec == "auto"
+    # The configured value is *kept*, not rewritten: the setting still says what
+    # somebody chose, and turning FFmpeg back on must restore it.
+    assert off.output_codec == "mp3"
+    assert Settings(ffmpeg_enabled=True, output_codec="mp3").effective_output_codec == "mp3"
+
+    # And the header follows the effective codec, not the configured one - the
+    # ``auto`` decision needs the stream's kind, which is why it is not answered
+    # here (see api._media_type).
+    assert off.mime_type == "audio/mpeg"
+
+
+def test_ffmpeg_off_with_passthrough_off_is_refused():
+    """Two settings that leave no engine at all must fail at startup.
+
+    ``prefer_passthrough = false`` means "always re-encode", and
+    ``ffmpeg_enabled = false`` means "never re-encode". Together they describe a
+    service that answers every request with nothing, and a configuration that
+    looks deliberate should not have to be discovered as silence on a radio.
+    """
+    with pytest.raises(ValidationError, match="prefer_passthrough"):
+        Settings(ffmpeg_enabled=False, prefer_passthrough=False)
+
+    # The supported spelling of "forward everything" is the preference left on.
+    assert Settings(ffmpeg_enabled=False, prefer_passthrough=True).passthrough_only is True
 
 
 def test_stations_file_no_longer_exists():

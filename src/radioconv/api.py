@@ -55,9 +55,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncGenerator, Callable, Mapping
-from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager, suppress
+from math import isfinite
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, unquote
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -69,11 +70,12 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 
 from . import __version__, web
 from . import hls as hls_mod
 from . import metrics as metrics_mod
-from .config import Settings
+from .config import Settings, SettingsStore
 from .monitor import ResourceMonitor
 from .session import CapacityError, SessionManager, StreamSession
 
@@ -129,6 +131,12 @@ def parse_controls(params: Mapping[str, str]) -> Dict[str, Any]:
 
     Takes the query parameters rather than a whole ``Request``: that is all it
     ever needed, and it makes the function trivially testable.
+
+    A codec override is still *parsed* on an installation with FFmpeg disabled,
+    and deliberately not rejected: a radio already pointed at a URL with
+    ``?codec=mp3`` in it keeps working there, because the effective codec is the
+    station's own regardless (see ``Settings.effective_output_codec``). Failing
+    the request instead would break a URL that is perfectly playable.
     """
     overrides: Dict[str, Any] = {}
     raw_bitrate = params.get("br") or params.get("bitrate")
@@ -259,11 +267,26 @@ class _RevalidatingStaticFiles(StaticFiles):
         return response
 
 
-def create_app(settings: Optional[Settings] = None) -> FastAPI:
-    settings = settings or Settings()
+def create_app(
+    settings: Optional[Settings] = None, *, pinned: Optional[Dict[str, Any]] = None
+) -> FastAPI:
+    settings = settings or Settings.load()
+    #: The live settings, and what everything that outlives a request must read
+    #: rather than the captured ``settings`` above - otherwise a change made on
+    #: the settings page would be ignored by exactly the objects that matter.
+    #: ``settings`` is only the starting point.
+    #:
+    #: ``pinned`` is how the caller says "a command-line flag decided this",
+    #: which is knowledge only it has: by the time a `Settings` object exists, the
+    #: fact that ``--bitrate`` supplied one of its fields is gone.
+    store = SettingsStore(settings, pinned=pinned)
 
-    manager = SessionManager(settings)
+    manager = SessionManager(store)
     monitor = ResourceMonitor(settings, extra=manager.as_dict)
+
+    def live() -> Settings:
+        """The settings in force for *this* request."""
+        return store.current
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -286,6 +309,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.settings_store = store
     app.state.manager = manager
     app.state.monitor = monitor
 
@@ -296,12 +320,20 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     #: cannot change while we are running is unacceptable, so the answer is
     #: cached. A monitor is answering "is this install healthy?", and it is: the
     #: binary cannot appear or vanish underneath a running process.
-    ffmpeg_report_cache: Dict[str, Any] = {}
+    #:
+    #: Cached **per configuration**, though, not for ever: the settings page can
+    #: turn FFmpeg off and back on, and that changes the answer wholesale. Keyed
+    #: on the two fields it depends on, so a live edit cannot leave the report
+    #: describing the previous configuration - the failure would be a health
+    #: endpoint claiming FFmpeg is available while nothing can be transcoded.
+    ffmpeg_reports: Dict[Tuple[bool, Optional[str]], Dict[str, Any]] = {}
 
     def ffmpeg_report() -> Dict[str, Any]:
-        if not ffmpeg_report_cache:
-            ffmpeg_report_cache.update(_probe_ffmpeg(settings))
-        return ffmpeg_report_cache
+        current = live()
+        key = (current.ffmpeg_enabled, current.ffmpeg_path)
+        if key not in ffmpeg_reports:
+            ffmpeg_reports[key] = _probe_ffmpeg(current)
+        return ffmpeg_reports[key]
 
     if settings.cors_list:
         from fastapi.middleware.cors import CORSMiddleware
@@ -329,7 +361,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         "/",
         response_class=HTMLResponse,
         tags=["browser"],
-        summary="Test page: turn a stream URL into a radio URL",
+        summary="Test page: turn a stream URL into a radio URL, and check the stream",
         description=(
             "An HTML page for a human with a web browser - not part of the machine "
             "interface, which is `/stream` and the legacy encoded route.\n\n"
@@ -337,6 +369,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "page shows the exact percent-encoded URL to type into a radio, plus a "
             "link to play it in the browser. It also shows live figures polled from "
             "`/metrics.json`, and links to the diagnostic endpoints.\n\n"
+            "With `probe=1` it additionally runs the same diagnostics as `/probe` "
+            "and prints them on the page: container, audio codec, and whether "
+            "FFmpeg is needed at all. That is a network fetch plus an FFmpeg "
+            "probe, so it is opt-in and **a bare `?url=` touches no network at "
+            "all** - which keeps the page instant and keeps a bookmark of it "
+            "free.\n\n"
             "The form is a plain `GET`, so **no request body is parsed** and the "
             "result is an ordinary, bookmarkable page - it does not start streaming "
             "in your browser."
@@ -350,8 +388,20 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             description="Optional .m3u8 URL to convert into a radio URL.",
             examples=["https://example.com/live/index.m3u8"],
         ),
+        probe: bool = Query(
+            False,
+            description=(
+                "Also show the `/probe` diagnostics for `url` on the page. The "
+                "form's checkbox sets this; it is off unless asked because it "
+                "downloads a segment and runs FFmpeg."
+            ),
+        ),
     ) -> HTMLResponse:
-        return web.index_page(settings, request, url)
+        target = (url or "").strip()
+        result = None
+        if probe and target.startswith(("http://", "https://")):
+            result = await _probe_for_page(target, live())
+        return web.index_page(live(), request, url, probe=result, probe_on=probe)
 
     @app.get(
         "/dashboard",
@@ -372,7 +422,127 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         response_description="An HTML page.",
     )
     async def dashboard(request: Request) -> HTMLResponse:
-        return web.dashboard_page(settings, request)
+        return web.dashboard_page(live(), request)
+
+    @app.get(
+        "/settings",
+        response_class=HTMLResponse,
+        tags=["browser"],
+        summary="Settings: read and change the runtime configuration",
+        description=(
+            "An HTML page with a form for the settings that can change while the "
+            "service runs: encoding, limits, streaming behaviour and the "
+            "administrative switches.\n\n"
+            "A submitted change is **validated in full before anything is "
+            "applied** - a rejected value leaves the running configuration "
+            "untouched - and then saved to `ui-settings.json` beside the config "
+            "file, so it survives a restart. Saved values override `config.toml` "
+            "but are overridden by `RADIOCONV_*` and by command-line flags; when "
+            "that happens the page says so instead of pretending the change took "
+            "effect.\n\n"
+            "A change reaches **new** pipelines only, because a running station's "
+            "buffer and codec describe audio that is already playing. The form "
+            "offers to restart the running stations, which makes radios reconnect "
+            "and rebuild with the new settings.\n\n"
+            "Settings that are fixed at process start (`host`, `port`, "
+            "`log_level`, `ffmpeg_path`, CORS origins) are listed as read-only "
+            "rather than offered and ignored.\n\n"
+            "`POST` is refused with `403` when `allow_ui_settings` is off. This "
+            "page has no login, like the rest of the service: turn that setting "
+            "off before exposing the port to anything you do not control."
+        ),
+        response_description="An HTML page.",
+    )
+    async def settings_page(request: Request) -> HTMLResponse:
+        return web.settings_page(live(), request)
+
+    @app.post(
+        "/settings",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+        summary="Apply a settings change",
+    )
+    async def settings_save(request: Request) -> HTMLResponse:
+        current = live()
+        if not current.allow_ui_settings:
+            # 403 rather than a silent no-op: a form that appears to work and
+            # changes nothing is worse than one that refuses, because the reader
+            # concludes the *setting* is broken rather than the permissions.
+            raise HTTPException(
+                status_code=403,
+                detail="changing settings from the web page is disabled (allow_ui_settings)",
+            )
+
+        form = await _form_fields(request)
+        patch, problems = web.parse_settings_form(form)
+        if problems:
+            return web.settings_page(
+                current,
+                request,
+                message="Nothing was changed: some values need fixing.",
+                problems=problems,
+                submitted=form,
+            )
+
+        try:
+            updated = store.apply(patch)
+        except ValidationError as exc:
+            return web.settings_page(
+                current,
+                request,
+                message="Nothing was changed: a value was rejected.",
+                problems=_field_errors(exc),
+                submitted=form,
+            )
+
+        saved_to = ""
+        warnings: List[str] = []
+        try:
+            saved_to = str(store.save(patch))
+        except OSError as exc:
+            # The change is live but not durable. Saying so is the difference
+            # between "my setting reverted after a reboot" being a mystery and
+            # being a file-permission problem somebody can fix.
+            warnings.append(
+                f"The new settings are in effect but could not be saved ({exc}), so "
+                "they will be lost when the service restarts."
+            )
+
+        # A value that was saved but did not take effect was pinned by something
+        # with higher precedence. Reporting it is the whole point of ordering the
+        # sources: otherwise the page would claim success and the operator would
+        # find out by listening.
+        pinned = [
+            name
+            for name, wanted in patch.items()
+            if not _same(getattr(updated, name, None), wanted)
+        ]
+        if pinned:
+            warnings.append(
+                "Saved, but not in effect: "
+                + ", ".join(sorted(pinned))
+                + ". A RADIOCONV_* environment variable or a command-line flag "
+                "takes precedence over this page - remove that to let the saved "
+                "value apply."
+            )
+
+        restarted = 0
+        if str(form.get("restart", "")).lower() in ("1", "on", "true", "yes"):
+            restarted = manager.retire_all("settings changed from the web page")
+            if restarted:
+                warnings.append(
+                    f"{restarted} station(s) were ended so they rebuild with the new "
+                    "settings. Radios reconnect by themselves."
+                )
+
+        return web.settings_page(
+            updated,
+            request,
+            message="Settings saved and applied.",
+            warnings=warnings,
+            saved_to=saved_to,
+            restarted=restarted,
+        )
 
     @app.get(
         "/health",
@@ -482,6 +652,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "Use it to answer *why is this station slow?* before attaching a "
             "radio, and to check whether a station can use "
             '`output_codec = "adts"` (which avoids re-encoding entirely).\n\n'
+            "`ffmpeg_enabled` says whether this installation can re-encode at "
+            "all (`--no-ffmpeg` turns that off). When it is false, "
+            "`passthrough_engine` is the *only* possibility rather than a "
+            "preference: a stream that cannot be forwarded cannot be played.\n\n"
             "The CLI equivalent is `radioconv probe <url>`, which prints the same "
             "information as readable text."
         ),
@@ -492,9 +666,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "(variant selection); `container`, `segment_container`, "
             "`segment_count`, `target_duration`, `encrypted`, "
             "`has_init_segment`; `passthrough_possible` and `passthrough_kind` "
-            "(whether FFmpeg is needed at all); `ts_streams` (the MPEG-TS "
-            "stream types found); and `audio` with `codec`, `profile`, "
-            "`sample_rate`, `channels` and `bitrate`."
+            "(whether the source audio could be forwarded at all) and "
+            "`passthrough_engine` (whether the configured `output_codec` will "
+            "actually use that path, i.e. whether FFmpeg is needed for *this* "
+            "request); `ffmpeg_enabled` (whether this installation can re-encode "
+            "at all); `ts_streams` (the MPEG-TS stream types found); and "
+            "`audio` with `codec`, `profile`, `sample_rate`, `channels` and "
+            "`bitrate`."
         ),
         responses={400: {"description": "`url` is not an http(s) URL."}},
     )
@@ -507,7 +685,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     ) -> JSONResponse:
         if not url.startswith(("http://", "https://")):
             raise HTTPException(status_code=400, detail="url must be http(s)")
-        result = await hls_mod.inspect(url, settings)
+        result = await hls_mod.inspect(url, live())
         return JSONResponse(result)
 
     @app.get(
@@ -524,7 +702,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "* `br` / `bitrate` - output bitrate, e.g. `br=128k` or `br=128000`. "
             "Accepted range 8000-320000.\n"
             "* `codec` / `output_codec` - `mp3` (default) or `aac`/`adts` to remux "
-            "instead of re-encoding.\n"
+            "instead of re-encoding. `aac` and `adts` are the **same request**, "
+            "not two codecs: the output is ADTS-framed AAC either way, and the "
+            "response is announced as `audio/aac`. On an installation running "
+            "with FFmpeg disabled (`--no-ffmpeg`) this parameter has no effect: "
+            "nothing can be re-encoded there, so every stream is already served "
+            "in whatever codec the station uses.\n"
             "* `name` - the station name shown on the radio's display. Without it "
             "the display shows the source URL.\n\n"
             "If the same `url` is already playing, this joins that pipeline "
@@ -562,7 +745,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             request,
             primary_url=target,
             sources=[target],
-            settings=settings,
+            settings=live(),
             manager=manager,
             overrides=overrides,
             label=parse_label(request.query_params, target),
@@ -585,13 +768,73 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             request,
             primary_url=target,
             sources=[target],
-            settings=settings,
+            settings=live(),
             manager=manager,
             overrides=overrides,
             label=parse_label(request.query_params, target),
         )
 
     return app
+
+
+#: How long the audio in one queue piece lasts, as a ceiling on a single socket
+#: write - see :func:`write_slices`.
+#:
+#: 0.25 s is chosen to sit far below a Frontier-Silicon radio's tolerance
+#: (~1.2 s of silence before it drops the connection), with room for the jitter
+#: of a Pi under load, while still being only four writes a second per listener.
+MAX_WRITE_SECONDS = 0.25
+
+
+def write_slices(chunk: bytes, rate: float) -> List[bytes]:
+    """Cut one queue *piece* into writes of at most ``MAX_WRITE_SECONDS`` of audio.
+
+    Why the pacer must hand audio over in slices rather than piece by piece
+    ----------------------------------------------------------------------
+    A queue piece is a fixed **8192 bytes**, so how long it *lasts* depends
+    entirely on the stream's bitrate:
+
+    =========== ==================
+    Bitrate     One 8192 B piece
+    =========== ==================
+    320 kbit/s  0.20 s
+    192 kbit/s  0.34 s
+    128 kbit/s  0.51 s
+    64 kbit/s   1.02 s
+    =========== ==================
+
+    Handing a whole piece over at once therefore means silence between writes
+    for exactly that long, and at 64 kbit/s that is **1.02 s** - measured on a
+    real station as one ~8.5 KiB burst followed by 1.1 s of nothing, repeating
+    forever (the average rate was right, the instantaneous one was not). A radio
+    gives up after ~1.2 s without bytes, so it reconnected every second or two,
+    and the rejoin replays ``handoff_overlap_seconds`` of already-heard audio:
+    the reported *"constant repeating every few seconds"*, worse the lower the
+    bitrate - and entirely invisible at 192 kbit/s, where the same code gives
+    0.34 s gaps that every radio rides out.
+
+    So the slice size is a **duration**, converted to bytes at the stream's own
+    rate. It is the same reasoning as ``output_bitrate`` and
+    ``handoff_overlap_seconds``: anything that is meant to be "N milliseconds of
+    audio" has to be measured in seconds and converted, never hard-coded as a
+    byte count.
+
+    Slicing the *socket write* does not disturb anything else: pieces stay
+    8192-byte and frame-aligned, so a joining listener still starts on a frame
+    boundary (and the ICY grid is counted by `_insert_icy_metadata` over the
+    bytes it receives, whatever sizes they arrive in).
+    """
+    if not chunk:
+        return []
+    if not isfinite(rate):
+        # Pacing is off (`pace_output = false`, where `_pace_rate` returns
+        # infinity). There is no duration to keep writes under, and the
+        # arithmetic below cannot even be done - hand the piece over as it is.
+        return [chunk]
+    size = max(1, int(max(1.0, rate) * MAX_WRITE_SECONDS))
+    if size >= len(chunk):
+        return [chunk]
+    return [chunk[start : start + size] for start in range(0, len(chunk), size)]
 
 
 class _Pacer:
@@ -1058,6 +1301,117 @@ def _wants_icy_metadata(request: Request) -> bool:
     return raw.strip().lower() in ("1", "yes", "true", "on")
 
 
+class _ListenerStream(StreamingResponse):
+    """A ``StreamingResponse`` that gives up on a radio which stopped reading.
+
+    Why this exists
+    ---------------
+    ``stall_watchdog_due`` closes a listener whose *queue* has starved. That
+    covers a radio with an empty buffer, and it covers a slow network as long as
+    writes keep completing - the check runs **between** writes, so it can never
+    fire while a write is the thing that is stuck.
+
+    A radio that loses power is exactly that case, and it stays stuck for a very
+    long time. Nothing is acknowledged, so TCP retransmits into the void; the
+    socket's send buffer fills; the server's write blocks on its own flow
+    control; and the response generator never reaches another watchdog check.
+    The connection is finally torn down by the *kernel's* retransmission limit -
+    ``tcp_retries2``, fifteen attempts, about **15 minutes** - and only then does
+    the listener disappear. Reported as *"if the radio loses power, the server
+    thinks it is still listening for about 15 minutes, and `dropped` keeps
+    climbing"*.
+
+    That fifteen minutes is not our timeout and the application cannot configure
+    it away: ``tcp_retries2`` is system-wide (changing it would change it for
+    every connection on the machine) and ``TCP_USER_TIMEOUT``, which *is* per
+    socket, can only be set on a socket that ASGI never hands to the app.
+
+    What the application can bound is its own write. This class puts a deadline
+    on each ``send`` and, when one expires, treats the client as gone: it
+    unsubscribes the listener and closes the body generator, so the listener
+    disappears ``write_timeout`` seconds after the first blocked write instead of
+    a quarter of an hour later.
+
+    Why it ends the response unfinished
+    -----------------------------------
+    There is no ASGI message that means "close this connection", and the socket
+    is full - a terminating chunk would block on exactly the write that just
+    timed out. So the response returns without one, which every server treats as
+    "this connection is not reusable" and closes: uvicorn closes the transport
+    and logs ``ASGI callable returned without completing response`` at ERROR.
+    That line is expected here and is preceded by this project's own explanation;
+    it is the mechanism, not a fault.
+
+    While the write is stuck the pieces being produced have nowhere to go, so the
+    subscriber's bounded queue overflows and ``dropped`` climbs at the audio
+    rate. That figure is *correct* - it is the same listener that is stuck - and
+    it stops climbing the moment the listener is removed.
+
+    Why the socket write, and not the listener's speed
+    --------------------------------------------------
+    Pacing exists so a radio gets audio at the rate it can play it, so "slow" is
+    normal and is not what this looks at. A write that has not completed inside
+    ``write_timeout`` is not slowness; it is a socket nobody is reading.
+    """
+
+    def __init__(
+        self,
+        content: AsyncGenerator[bytes, None],
+        *,
+        write_timeout: float,
+        on_abandoned: Callable[[], Awaitable[None]],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(content, **kwargs)
+        self._write_timeout = write_timeout
+        self._on_abandoned = on_abandoned
+
+    async def stream_response(self, send: Any) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": self.status_code,
+                "headers": self.raw_headers,
+            }
+        )
+        iterator = self.body_iterator
+        try:
+            async for chunk in iterator:
+                if not isinstance(chunk, (bytes, memoryview)):
+                    chunk = chunk.encode(self.charset)
+                await self._write(send, chunk)
+        except asyncio.TimeoutError:
+            await self._abandon(iterator)
+            return
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    async def _write(self, send: Any, chunk: bytes | memoryview) -> None:
+        message = {"type": "http.response.body", "body": chunk, "more_body": True}
+        if self._write_timeout <= 0:
+            # Deadline disabled: behave exactly like the stock response, so a
+            # diagnostic setting cannot change anything but the deadline.
+            await send(message)
+            return
+        # ``wait_for`` cancels the write when the deadline expires, which is what
+        # unblocks a generator that would otherwise sit here until the kernel
+        # gives up. Nothing in the server's own state is left half-done by
+        # cancelling it: the message has either been written to the transport or
+        # it has not, and the connection is dropped either way.
+        await asyncio.wait_for(send(message), timeout=self._write_timeout)
+
+    async def _abandon(self, iterator: Any) -> None:
+        await self._on_abandoned()
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            # Best effort, and not what does the cleaning up - ``on_abandoned``
+            # already has. This only lets the generator's own ``finally`` run, so
+            # the two accounts of "this listener has gone" cannot disagree.
+            with suppress(Exception):
+                await aclose()
+        # No terminating chunk: see the class docstring. Returning here is what
+        # makes the server close a socket that will never accept another byte.
+
+
 async def _stream(
     request: Request,
     *,
@@ -1126,7 +1480,31 @@ async def _stream(
         extra={"session": session.id},
     )
 
-    media_type = _media_type(session_settings, await _settle_kind(session_settings, session))
+    settled_kind = await _settle_kind(session_settings, session)
+    if session.dead and not session.producing:
+        # The pipeline refused the source before writing a byte, so this can
+        # still be an HTTP error instead of ``200`` followed by nothing.
+        #
+        # That distinction is the whole of this check: a radio given a status it
+        # understands shows a message or gives up, while a radio given a
+        # successful stream that then delivers nothing sits on it - and the
+        # reason, which is the only useful part, disappears into a log nobody
+        # reads. Reachable mainly with `--no-ffmpeg`, where a station that needs
+        # re-encoding exists but no engine does; that is also the one case where
+        # `_settle_kind` waits (the effective codec is always ``auto`` there), so
+        # the failure has already happened by now.
+        detail = session.fatal_error or "this stream could not be started"
+        log.warning("refusing %s: %s", client, detail, extra={"session": session.id})
+        # Not via the response generator, which will never run: unsubscribe here
+        # or the phantom listener holds a capacity slot until the reaper notices.
+        await manager.unsubscribe(session, subscriber)
+        return PlainTextResponse(
+            f"{detail}\n",
+            status_code=503,
+            headers={"Retry-After": "30", "Cache-Control": "no-store"},
+        )
+
+    media_type = _media_type(session_settings, settled_kind)
     headers = {
         "Cache-Control": "no-store, no-cache, must-revalidate",
         "Pragma": "no-cache",
@@ -1180,33 +1558,41 @@ async def _stream(
                 if item is None:
                     return
                 offset, chunk = item
-                lag = await pacer.wait(len(chunk))
-                if stall_watchdog_due(lag, session, session_settings, time.monotonic()):
-                    session.last_stall_reconnect = time.monotonic()
-                    session.stall_reconnects += 1
-                    # Service-wide as well as per-session: the per-session count
-                    # dies with the session, and a counter that falls is a lie.
-                    manager.note_stall_reconnect()
-                    log.warning(
-                        "listener %s got %.2fs of silence; closing the "
-                        "connection so the radio reconnects and re-anchors "
-                        "(threshold %.2fs)",
-                        subscriber.id,
-                        lag,
-                        session_settings.stall_reconnect_seconds,
-                        extra={"session": session.id},
-                    )
-                    return
+                # One *piece* of audio, but not necessarily one *write*: at a low
+                # bitrate a whole piece is more than a second of audio, and
+                # handing it over at once would leave a radio with nothing to
+                # read for that second. See `write_slices`.
+                for piece in write_slices(chunk, _pace_rate(session_settings, session)):
+                    lag = await pacer.wait(len(piece))
+                    if stall_watchdog_due(lag, session, session_settings, time.monotonic()):
+                        session.last_stall_reconnect = time.monotonic()
+                        session.stall_reconnects += 1
+                        # Service-wide as well as per-session: the per-session count
+                        # dies with the session, and a counter that falls is a lie.
+                        manager.note_stall_reconnect()
+                        log.warning(
+                            "listener %s got %.2fs of silence; closing the "
+                            "connection so the radio reconnects and re-anchors "
+                            "(threshold %.2fs)",
+                            subscriber.id,
+                            lag,
+                            session_settings.stall_reconnect_seconds,
+                            extra={"session": session.id},
+                        )
+                        return
+                    subscriber.bytes_sent += len(piece)
+                    # The one place a byte actually reaches a radio. Counted here and
+                    # not at the pipeline, because the pipeline also produces audio
+                    # for a listener that has fallen behind (dropped) and while a
+                    # station is merely being kept warm with nobody listening - and
+                    # neither of those is "audio sent".
+                    session.stats.bytes_sent += len(piece)
+                    manager.throughput.add_out(len(piece))
+                    yield piece
+                # Counted per *piece* rather than per write: the chunks figure
+                # describes the audio, so slicing it for the socket must not
+                # change it.
                 subscriber.chunks += 1
-                subscriber.bytes_sent += len(chunk)
-                # The one place a byte actually reaches a radio. Counted here and
-                # not at the pipeline, because the pipeline also produces audio
-                # for a listener that has fallen behind (dropped) and while a
-                # station is merely being kept warm with nobody listening - and
-                # neither of those is "audio sent".
-                session.stats.bytes_sent += len(chunk)
-                manager.throughput.add_out(len(chunk))
-                yield chunk
                 # Only what the transport accepted counts as delivered: this is
                 # the floor a rejoining connection is primed from (see
                 # `StreamSession._join_floor`), and claiming audio the client
@@ -1249,7 +1635,65 @@ async def _stream(
             lambda: session.pipeline.stats.now_playing or "",
             on_block=_count_metadata,
         )
-    return StreamingResponse(stream, media_type=media_type, headers=headers, status_code=200)
+
+    async def _abandoned() -> None:
+        # Reached only from `_ListenerStream`, i.e. only when a write was stuck
+        # for `listener_write_timeout`. The radio is gone: a powered-off device
+        # does not send a FIN, so the kernel keeps the connection for a quarter
+        # of an hour and nothing else would notice.
+        log.warning(
+            "listener %s accepted nothing for %.0fs; closing the connection "
+            "(the radio is off, or its network has gone)",
+            subscriber.id,
+            session_settings.listener_write_timeout,
+            extra={"session": session.id},
+        )
+        # Unconditionally, and before the generator is closed: `body`'s own
+        # `finally` then runs against an already-removed subscriber, which
+        # `remove_subscriber` tolerates. Cleanup must not depend on a generator
+        # being tidy.
+        await manager.unsubscribe(session, subscriber)
+
+    return _ListenerStream(
+        stream,
+        write_timeout=session_settings.listener_write_timeout,
+        on_abandoned=_abandoned,
+        media_type=media_type,
+        headers=headers,
+        status_code=200,
+    )
+
+
+#: How long the converter page waits for its own diagnostics, in seconds.
+#:
+#: ``hls.inspect()`` bounds each step of its own accord (playlist, segment, the
+#: FFmpeg probe), but those bounds add up to longer than anybody will sit in
+#: front of a form - so the page gets one overall cap. It is generous enough for
+#: a slow station on a Pi and short enough that a broken URL is *reported*
+#: rather than waited on.
+PAGE_PROBE_SECONDS = 20.0
+
+
+async def _probe_for_page(url: str, settings: Settings) -> Dict[str, Any]:
+    """Run the ``/probe`` inspection for the converter page. Never raises.
+
+    The page is a *result* the user is waiting for, so an unreachable station has
+    to come back as a sentence on the page, not as a 500 - the same contract the
+    ``/probe`` route has, for the same reason. The difference is the overall
+    deadline: ``/probe`` is an API a script calls with its own timeout, while
+    this is rendered inside a page a person is staring at.
+    """
+    try:
+        return await asyncio.wait_for(hls_mod.inspect(url, settings), timeout=PAGE_PROBE_SECONDS)
+    except asyncio.TimeoutError:
+        return {
+            "url": url,
+            "ok": False,
+            "error_type": "Timeout",
+            "error": f"the check did not finish within {PAGE_PROBE_SECONDS:.0f}s",
+        }
+    except Exception as exc:  # noqa: BLE001 - a page must render, whatever happened
+        return {"url": url, "ok": False, "error_type": type(exc).__name__, "error": str(exc)}
 
 
 async def _settle_kind(
@@ -1260,8 +1704,12 @@ async def _settle_kind(
     The ``Content-Type`` cannot be changed once the first byte is on the wire,
     so for the auto codec we wait (briefly) for the pipeline to tell us whether
     it is forwarding MP3 or ADTS AAC.
+
+    ``effective_output_codec`` rather than ``output_codec``: with FFmpeg disabled
+    every stream is an ``auto`` stream, so this waits there too - which is
+    exactly what keeps the header right on an install that cannot transcode.
     """
-    if settings.output_codec != "auto":
+    if settings.effective_output_codec != "auto":
         return None
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -1279,9 +1727,102 @@ async def _settle_kind(
 def _media_type(settings: Settings, kind: Optional[str]) -> str:
     if settings.mime_override:
         return settings.mime_override
-    if settings.output_codec == "auto":
+    if settings.effective_output_codec == "auto":
         return "audio/aac" if kind == "adts" else "audio/mpeg"
     return settings.mime_type
+
+
+def _field_errors(exc: ValidationError) -> Dict[str, str]:
+    """Pydantic's complaints, keyed by the form field that caused each one.
+
+    A list of errors at the top of the page is useless here: the form has twenty
+    inputs, and "Input should be less than or equal to 320000" without a field
+    name is a puzzle rather than a correction. So the location pydantic already
+    provides is mapped back onto the input it came from.
+
+    A cross-field failure has no single field, so it is attached to every field
+    the error names - and to ``__all__`` when it names none, which the template
+    shows above the form.
+    """
+    problems: Dict[str, str] = {}
+    for error in exc.errors():
+        message = str(error.get("msg") or "invalid value")
+        # Pydantic prefixes value errors raised by a validator with "Value error, ".
+        message = message.removeprefix("Value error, ")
+        locations = [str(part) for part in error.get("loc", ()) if isinstance(part, str)]
+        if not locations:
+            problems["__all__"] = message
+            continue
+        for name in locations:
+            problems.setdefault(name, message)
+    return problems
+
+
+def _same(a: Any, b: Any) -> bool:
+    """Compare a saved value with the one in force, tolerating int/float.
+    ``True == 1`` in Python, which is what makes a boolean field compare cleanly
+    against the ``1`` a form submits. The float coercion covers a value saved as
+    ``30`` and read back as ``30.0`` - a difference in type that is not a
+    difference in meaning, and reporting it as "saved but not applied" would be a
+    false alarm about the most ordinary change there is.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return bool(a) == bool(b)
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return a == b
+
+
+#: The largest form body the settings page will read, in bytes.
+#:
+#: The form has about twenty short values, so this is two orders of magnitude of
+#: headroom. It exists because ``request.body()`` reads whatever it is sent: the
+#: service is a LAN appliance with no authentication, and "post 500 MB to the
+#: settings form" should be a 413 rather than an out-of-memory kill that takes
+#: every radio off the air.
+MAX_FORM_BYTES = 16 * 1024
+
+
+async def _form_fields(request: Request) -> Dict[str, str]:
+    """The submitted form as a plain dict, without adding a dependency.
+
+    Deliberately **not** ``await request.form()``. That needs
+    ``python-multipart``, and this project removed that requirement on purpose:
+    the converter page is a ``GET`` form precisely so no request body is ever
+    parsed, and pulling in a parser to read twenty urlencoded strings would undo
+    it for the sake of one page. ``application/x-www-form-urlencoded`` is one
+    ``parse_qsl`` call, and every browser sends exactly that from a form whose
+    ``enctype`` is not set.
+
+    Anything else is refused rather than guessed at: a multipart body read as
+    urlencoded would produce nonsense field names, and silently ignoring the
+    submit is the kind of failure that makes people think the page is broken.
+
+    Duplicate keys collapse to the last one. A crafted form cannot therefore
+    submit a list where the code expects a scalar - the alternative, keeping
+    duplicates, would hand ``parse_settings_form`` something with no sane
+    interpretation.
+    """
+    content_type = request.headers.get("content-type", "")
+    if not content_type.startswith("application/x-www-form-urlencoded"):
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                "this form must be submitted as application/x-www-form-urlencoded "
+                f"(got {content_type or 'no content-type'})"
+            ),
+        )
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_FORM_BYTES:
+        raise HTTPException(status_code=413, detail="form body too large")
+    body = await request.body()
+    if len(body) > MAX_FORM_BYTES:
+        raise HTTPException(status_code=413, detail="form body too large")
+    # latin-1 rather than utf-8: the body is percent-encoded, so it is ASCII in
+    # practice, and decoding it with a strict codec would turn a stray byte into
+    # a 500 instead of a field the validator can reject.
+    return dict(parse_qsl(body.decode("latin-1"), keep_blank_values=True))
 
 
 def _probe_ffmpeg(settings: Settings) -> Dict[str, Any]:
@@ -1293,7 +1834,20 @@ def _probe_ffmpeg(settings: Settings) -> Dict[str, Any]:
     """
     from . import ffmpeg as ffmpeg_mod
 
-    report: Dict[str, Any] = {"bundled": False, "path": None, "version": None}
+    report: Dict[str, Any] = {
+        "enabled": settings.ffmpeg_enabled,
+        "bundled": False,
+        "path": None,
+        "version": None,
+    }
+    if not settings.ffmpeg_enabled:
+        # Deliberately does not look for a binary. ``--no-ffmpeg`` means "this
+        # installation does not transcode", not "I wonder whether one is here":
+        # reporting a path would read as a working install that is being
+        # ignored, and running the binary twice to answer a question nobody
+        # asked is exactly the cost the setting exists to avoid.
+        report["disabled"] = True
+        return report
     try:
         path = ffmpeg_mod.locate_ffmpeg(settings.ffmpeg_path)
         report["path"] = path

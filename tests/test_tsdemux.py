@@ -575,3 +575,226 @@ def test_mpeg_1_layer_two_is_not_halved_the_way_layer_three_is():
     assert layer_three == 192
     assert layer_two == 384
     assert layer_two == layer_three * 2
+
+
+# --------------------------------------- forwarding a bare elementary stream
+def adts_frame(payload: bytes) -> bytes:
+    """One complete ADTS frame: a 7-byte header whose length field matches."""
+    length = 7 + len(payload)
+    return (
+        bytes([0xFF, 0xF1, 0x4C, 0x80 | (length >> 11), (length >> 3) & 0xFF])
+        + bytes([((length & 0x07) << 5) | 0x1F, 0xFC])
+        + payload
+    )
+
+
+def mp3_frame(fill: int = 0) -> bytes:
+    """One complete MPEG-1 Layer III frame at 128 kbit/s / 44.1 kHz (417 bytes)."""
+    header = _mpeg_header(3, 1, 128, 44100)
+    size = T.mp3_frame_size(header + b"\x00" * 4)
+    assert size == 417
+    return header + bytes([fill]) * (size - 4)
+
+
+def test_a_bare_adts_stream_is_forwarded_frame_for_frame():
+    """The new engine: no transport stream, no ffmpeg, no byte changed.
+
+    The tags are the only thing removed. Every audio byte comes out in the
+    order it went in, which is what makes this a *copy* rather than a remux.
+    """
+    frames = b"".join(adts_frame(bytes([0x40 + index]) * 100) for index in range(4))
+    segment = id3_tag(b"PRIV" + b"\x00" * 40) + id3_tag(b"TEXT" + b"\x00" * 30) + frames
+
+    forwarder = T.ElementaryStreamForwarder("adts")
+    assert not forwarder.ready, "nothing has been fed yet"
+
+    out = forwarder.feed(segment)
+
+    assert out == frames, "the audio must be byte-identical to the source frames"
+    assert forwarder.ready
+    assert forwarder.output_kind == "adts"
+    assert forwarder.skipped == len(segment) - len(frames), "only the tags were dropped"
+
+
+def test_a_frame_cut_by_a_segment_boundary_is_held_and_completed():
+    """A packager's segment cut need not fall between two frames.
+
+    Forwarding half a frame sends a radio a stream it cannot decode, and the
+    missing bytes are gone for good - so the incomplete tail waits for the next
+    segment instead.
+    """
+    frames = b"".join(adts_frame(bytes([0x40 + index]) * 100) for index in range(3))
+    cut = len(frames) // 2  # deliberately in the middle of a frame
+
+    forwarder = T.ElementaryStreamForwarder("adts")
+    first = forwarder.feed(frames[:cut])
+    second = forwarder.feed(frames[cut:])
+
+    assert first + second == frames, "no byte may be lost or reordered"
+    assert len(first) < cut, "the partial frame must not have been sent"
+    assert len(first) % 107 == 0, "only whole 107-byte frames may go out"
+
+
+def test_a_tag_split_across_chunks_is_resolved_not_half_skipped():
+    """Only the tag's own length field says where the audio starts.
+
+    A tag longer than one chunk is real: the CDN's two tags are ~1.5 kB, and a
+    chunk boundary can fall anywhere. Half-skipping it would leave tag bytes in
+    the audio, which is the "radio decodes text as audio" defect in miniature.
+    """
+    frames = b"".join(adts_frame(b"\x70" * 100) for _ in range(2))
+    segment = id3_tag(b"PRIV" + b"\x00" * 400) + frames
+
+    forwarder = T.ElementaryStreamForwarder("adts")
+    chunks = [
+        forwarder.feed(segment[:5]),
+        forwarder.feed(segment[5:200]),
+        forwarder.feed(segment[200:]),
+    ]
+
+    assert b"".join(chunks) == frames
+
+
+def test_forwarding_starts_on_a_frame_boundary_and_drops_what_precedes_it():
+    """Junk before the first frame is not audio; a radio would only resync past it."""
+    frames = b"".join(adts_frame(b"\x50" * 60) for _ in range(3))
+    leading = b"\x00garbage" * 20
+
+    forwarder = T.ElementaryStreamForwarder("adts")
+    out = forwarder.feed(leading + frames)
+
+    assert out == frames
+    assert forwarder.skipped >= len(leading)
+
+
+def test_a_bare_mp3_stream_is_forwarded_too():
+    """The other playable elementary stream, and the one old radios want."""
+    frames = b"".join(mp3_frame(fill=index) for index in range(3))
+    segment = id3_tag(b"TIT1" + b"\x00" * 20) + frames
+
+    forwarder = T.ElementaryStreamForwarder("mp3")
+    out = forwarder.feed(segment)
+
+    assert out == frames
+    assert forwarder.output_kind == "mp3"
+
+
+def test_forwarding_resynchronises_after_damaged_bytes():
+    """Junk between two frames must not be forwarded as audio.
+
+    A frame's own length field says where it ends, so damaged bytes can look
+    like a perfectly good frame. What catches it is the position the length
+    points at: if that is not a frame header, the frame cannot be real either.
+    Trusting it would send a radio a run of bytes that is not audio - noise,
+    then a decoder that has to resynchronise *and* an ICY grid shifted off by
+    however many bytes went out.
+
+    The price of that rule is one frame: the frame immediately before the
+    damage is suspect too (nothing valid follows it), so it is dropped rather
+    than risk forwarding junk. One 87-byte frame is ~21 ms; bytes that are not
+    audio are a broken radio.
+    """
+    payloads = [bytes([0x60 + index]) * 80 for index in range(4)]
+    frames = b"".join(adts_frame(payload) for payload in payloads)
+    # Damage *between* two frames, the way a dropped or mangled packet looks.
+    damaged = frames[:174] + b"\x00" * 40 + frames[174:]
+
+    forwarder = T.ElementaryStreamForwarder("adts")
+    first = forwarder.feed(damaged)
+    second = forwarder.feed(adts_frame(b"\x55" * 80))
+
+    assert len(first) % 87 == 0, "whole frames only"
+    assert b"\x00" * 40 not in first, "the junk was forwarded as audio"
+    assert first == frames[:87] + frames[174:], (
+        "the audio before the damage is delivered, the frame it touches is "
+        "dropped, and everything after it is delivered in order"
+    )
+    assert second == adts_frame(b"\x55" * 80), "and the stream carries on"
+
+
+def test_forwarding_rejects_a_kind_it_cannot_forward():
+    """Only the two directly playable formats: everything else needs ffmpeg."""
+    with pytest.raises(ValueError, match="elementary stream kind"):
+        T.ElementaryStreamForwarder("ts")
+
+
+# -------------------------------------------------- how long is the audio
+def adts_frame_at(rate_index: int, payload: bytes) -> bytes:
+    """One ADTS frame with a chosen ``sampling_frequency_index``.
+
+    The header is laid out the way the format says, because the frame length is
+    split across three bytes (2 + 8 + 3 bits) and the channel configuration
+    straddles two - a naive concatenation produces a header whose length field
+    does not match the bytes, which is not a frame at all.
+    """
+    length = 7 + len(payload)
+    return (
+        bytes(
+            [
+                0xFF,
+                0xF1,  # MPEG-4, layer 00, no CRC
+                (1 << 6) | (rate_index << 2),  # profile LC, stereo: channel high bit = 0
+                (0b10 << 6) | (length >> 11),  # channel low bits = 10, length bits 12-11
+                (length >> 3) & 0xFF,  # length bits 10-3
+                ((length & 0x07) << 5) | 0x1F,  # length bits 2-0, buffer fullness
+                0xFC,  # buffer fullness low bits, one raw data block
+            ]
+        )
+        + payload
+    )
+
+
+def test_adts_duration_comes_from_the_frames_not_the_playlist():
+    """The number the output pacer needs, and the one thing EXTINF cannot give.
+
+    Measured on radiom2o: 242 frames of HE-AAC against ``EXTINF:10``. The header
+    declares a 24 kHz core rate (SBR doubles the *output* to 48 kHz, but a frame
+    still carries 1024 samples of the core), so the segment is
+    ``242 * 1024 / 24000`` = 10.325 s, not the 10.0 s the playlist claims.
+
+    That 3 % is the whole reason this function exists. Using the claim makes the
+    pacer run 3 % fast, which drains the jitter buffer in a few minutes and then
+    produces a gap before every segment - the reported "repeats or skips a few
+    seconds".
+    """
+    frame = adts_frame_at(6, bytes(100))  # index 6 = 24000 Hz
+    assert T.adts_sample_rate(frame) == 24000
+    frames = frame * 242
+
+    assert T.audio_duration(frames, "adts") == pytest.approx(242 * 1024 / 24000)
+    assert T.audio_duration(frames, "adts") > 10.0, "the playlist said 10.0 exactly"
+    # And the rate that falls out of it is the audio's, not the container's.
+    assert len(frames) * 8 / T.audio_duration(frames, "adts") < 200_000
+
+
+def test_mp3_duration_follows_the_layer_and_version():
+    """1152 samples in MPEG-1 Layer III and Layer II, 576 in MPEG-2/2.5, 384 in I."""
+    cases = [
+        ((3, 1, 192, 48000), 1152),
+        ((2, 1, 64, 24000), 576),
+        ((3, 2, 192, 48000), 1152),
+        ((2, 2, 64, 24000), 1152),
+        ((3, 3, 32, 48000), 384),
+    ]
+    for (version, layer, bitrate, rate), samples in cases:
+        header = _mpeg_header(version, layer, bitrate, rate)
+        assert T.mp3_samples_per_frame(header) == samples, (version, layer)
+        frame = T.mp3_frame_size(header + b"\x00" * 4)
+        assert frame is not None
+        assert T.audio_duration(header + b"\x00" * (frame - 4), "mp3") == pytest.approx(
+            samples / rate
+        )
+
+
+def test_a_truncated_frame_adds_no_duration():
+    """A partial tail contributes nothing rather than a guessed fraction.
+
+    The pacer's rate is a ratio of two measurements; a guess on either side is
+    drift, and drift is exactly what this replaced.
+    """
+    frame = adts_frame_at(3, bytes(80))  # index 3 = 48000 Hz
+    whole = frame * 5
+
+    assert T.audio_duration(whole + frame[:10], "adts") == pytest.approx(5 * 1024 / 48000)
+    assert T.audio_duration(b"\x00" * 500, "adts") == 0.0
+    assert T.audio_duration(b"", "adts") == 0.0

@@ -205,6 +205,350 @@ async def test_passthrough_startup_feeds_every_pending_segment():
     assert offsets == sorted(offsets), f"segments emitted out of order: {offsets}"
 
 
+async def test_the_pacer_is_told_the_audio_rate_not_the_download_rate(monkeypatch):
+    """End to end through ``stream()``: the rate the pacer is handed.
+
+    Reported against radiom2o (AAC in MPEG-TS): *"every few seconds, it either
+    repeats the last few seconds or skips a few seconds"*. ``output_bitrate`` was
+    measured on the **downloaded** bytes, and a transport stream is 20 % bigger
+    than the audio inside it (188-byte packets, PAT/PMT, PES headers, stuffing),
+    so the pacer released 159 kbit/s for audio that needs 128 kbit/s - 1.25 s of audio every second. The jitter buffer covered
+    that for about four segments, then ran dry - and a ~2 s hole per segment makes
+    a radio reconnect, which replays ``handoff_overlap_seconds`` on the way back
+    in (repeat) or drops the backlog (skip).
+
+    The payload is 40 real ADTS frames (7-byte headers included) wrapped in a
+    transport stream, and the declared ``EXTINF`` is wrong on purpose, so both
+    wrong answers - the download rate and the playlist's duration - are far from
+    the right one and a mix-up cannot pass by luck.
+    """
+    frames = b"".join(_adts_frame(bytes([0x40 + index]) * 40) for index in range(40))
+    segment = build_test_ts(frames)
+    settings = Settings(prefer_passthrough=True, output_codec="adts")
+
+    class _Info:
+        container = "ts"
+
+    class _Tracker:
+        endlist = True
+        target_duration = 2.0
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.info = Segment(url="http://x/100.ts", sequence=100, duration=1.0)
+
+        async def prime(self):
+            return _Info()
+
+        def take_buffered(self) -> list:
+            return [self.info]
+
+        async def poll(self) -> list:
+            return []
+
+        def seconds_until_reload(self) -> float:
+            return 0.0
+
+    monkeypatch.setattr(pipeline, "PlaylistTracker", _Tracker)
+
+    stream = pipeline.StreamPipeline(settings, ["http://x/one.m3u8"], label="rate")
+    await stream._client.aclose()
+    stream._client = _RecordingClient({100: segment})  # ty: ignore[invalid-assignment]
+
+    generator = stream.stream()
+    received = 0
+    try:
+        async for chunk in generator:
+            received += len(chunk)
+            if received >= len(frames):
+                break
+    finally:
+        await generator.aclose()
+        await stream.aclose()
+
+    assert stream.stats.mode == "passthrough"
+    assert received >= len(frames), "the frames must reach the output"
+    measured = stream.output_bitrate
+    assert measured is not None
+    # 40 frames at 1024 samples / 48 kHz = 0.8533 s of audio.
+    seconds = 40 * 1024 / 48000
+    assert stream.stats.forwarded_seconds == pytest.approx(seconds, rel=1e-6)
+    assert measured == pytest.approx(len(frames) * 8 / seconds, rel=1e-6)
+
+    download_rate = len(segment) * 8 / seconds
+    assert measured < download_rate * 0.8, (
+        f"{measured:.0f} bit/s is the download rate ({download_rate:.0f}), not the "
+        "audio rate - the pacer would hand the radio audio faster than it plays"
+    )
+
+
+# ------------------------------------------------- ffmpeg turned off entirely
+class _OneSegment:
+    """``PlaylistTracker`` with a single segment and nothing more to poll."""
+
+    endlist = True
+    target_duration = 2.0
+
+    def __init__(self, container: str = "ts", *_args, **_kwargs) -> None:
+        self.info = Segment(url="http://x/100.ts", sequence=100, duration=1.0)
+        self._container = container
+
+    async def prime(self):
+        return type("_Info", (), {"container": self._container})()
+
+    def take_buffered(self) -> list:
+        return [self.info]
+
+    async def poll(self) -> list:
+        return []
+
+    def seconds_until_reload(self) -> float:
+        return 0.0
+
+
+async def test_an_unplayable_station_is_a_fatal_error_not_a_silent_stream(monkeypatch):
+    """With FFmpeg off, a stream it cannot forward must say so and stop.
+
+    The alternative - which this project has shipped before - is a ``200
+    audio/mpeg`` response followed by no audio at all: the radio reports a
+    successful connection and the user hears silence with no way to tell a dead
+    station from a misconfigured server. ``PipelineFatal`` is what stops the
+    session retrying for ever, and the message is what tells somebody which
+    setting to change.
+    """
+    fmp4 = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 40
+    monkeypatch.setattr(pipeline, "PlaylistTracker", _OneSegment)
+    # If anything tried to build a command, this would fail - which is the
+    # second half of the claim: no child process is even considered.
+    monkeypatch.setattr(
+        pipeline.ffmpeg_mod,
+        "locate_ffmpeg",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("ffmpeg was consulted")),
+    )
+
+    settings = Settings(ffmpeg_enabled=False)
+    stream = pipeline.StreamPipeline(settings, ["http://x/one.m3u8"], label="no-ffmpeg")
+    await stream._client.aclose()
+    stream._client = _RecordingClient({100: fmp4})  # ty: ignore[invalid-assignment]
+
+    try:
+        with pytest.raises(pipeline.PipelineFatal) as caught:
+            async for _ in stream.stream():
+                pass
+    finally:
+        await stream.aclose()
+
+    message = str(caught.value)
+    assert "FFmpeg is disabled" in message
+    assert "fMP4" in message, "the reason must be named, not just the outcome"
+    assert "ffmpeg_enabled = true" in message, "the message must say how to fix it"
+
+
+async def test_with_ffmpeg_disabled_a_forwardable_station_still_plays(monkeypatch):
+    """The positive case: the engine that remains must work unchanged.
+
+    A setting that *removes* an engine is easy to get wrong in the direction of
+    removing too much, so this drives the whole ``stream()`` path with FFmpeg
+    made unloadable. If any part of the pipeline asks for it, the test fails
+    with the marker rather than passing by accident.
+    """
+    frames = b"".join(_adts_frame(bytes([0x40 + index]) * 40) for index in range(20))
+    segment = build_test_ts(frames)
+    monkeypatch.setattr(pipeline, "PlaylistTracker", _OneSegment)
+    monkeypatch.setattr(
+        pipeline.ffmpeg_mod,
+        "locate_ffmpeg",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("ffmpeg was consulted")),
+    )
+
+    settings = Settings(ffmpeg_enabled=False, output_codec="mp3")
+    stream = pipeline.StreamPipeline(settings, ["http://x/one.m3u8"], label="no-ffmpeg-ok")
+    await stream._client.aclose()
+    stream._client = _RecordingClient({100: segment})  # ty: ignore[invalid-assignment]
+
+    received = 0
+    generator = stream.stream()
+    try:
+        async for chunk in generator:
+            received += len(chunk)
+            if received >= len(frames):
+                break
+    finally:
+        await generator.aclose()
+        await stream.aclose()
+
+    assert stream.stats.mode == "passthrough", (
+        f"expected forwarding with ffmpeg off, got {stream.stats.mode!r}: "
+        "the configured output_codec must not force a transcode that cannot happen"
+    )
+    assert received >= len(frames)
+
+
+# --------------------------------------------- bare elementary streams (no TS)
+def _adts_frame(payload: bytes) -> bytes:
+    """One complete ADTS frame: a 7-byte header whose length field matches."""
+    length = 7 + len(payload)
+    return (
+        bytes([0xFF, 0xF1, 0x4C, 0x80 | (length >> 11), (length >> 3) & 0xFF])
+        + bytes([((length & 0x07) << 5) | 0x1F, 0xFC])
+        + payload
+    )
+
+
+def _id3_tag(payload: bytes) -> bytes:
+    size = len(payload)
+    syncsafe = bytes([(size >> 21) & 0x7F, (size >> 14) & 0x7F, (size >> 7) & 0x7F, size & 0x7F])
+    return b"ID3\x04\x00\x00" + syncsafe + payload
+
+
+def test_a_bare_adts_stream_is_a_passthrough_source():
+    """`.aac` segments are raw ADTS, not a transport stream - and need no ffmpeg.
+
+    Pass-through used to be a PAT/PMT lookup, so a station that serves the
+    elementary stream directly could never use it: it was re-encoded even when
+    the output codec was the source's own. This is the whole point of the raw
+    forwarder - forwarding AAC to AAC is a copy, and costs no CPU at all.
+    """
+    segment = _id3_tag(b"PRIV" + b"\x00" * 40) + b"".join(
+        _adts_frame(b"\x40" * 60) for _ in range(3)
+    )
+
+    assert pipeline.decide_mode(segment, Settings(output_codec="adts")) == (
+        "passthrough",
+        "adts",
+    )
+    assert pipeline.decide_mode(segment, Settings(output_codec="auto")) == ("passthrough", "adts")
+    # Asking for MP3 cannot forward AAC: the audio has to be re-encoded. The
+    # kind is still reported, because it tells the transcoder what it is given.
+    assert pipeline.decide_mode(segment, Settings(output_codec="mp3")) == ("transcode", "adts")
+
+
+def test_a_bare_mp3_stream_is_a_passthrough_source():
+    """The other forwardable shape, and the one old radios actually want."""
+    frame = b"\xff\xfb\x90\x64" + b"\x00" * 413
+    segment = _id3_tag(b"TIT1" + b"\x00" * 20) + frame * 3
+
+    assert pipeline.decide_mode(segment, Settings(output_codec="mp3")) == ("passthrough", "mp3")
+    assert pipeline.decide_mode(segment, Settings(output_codec="adts")) == ("transcode", "mp3")
+
+
+def test_passthrough_can_still_be_switched_off():
+    """`--no-passthrough` must mean exactly that, for raw streams too."""
+    segment = _id3_tag(b"PRIV" + b"\x00" * 40) + _adts_frame(b"\x40" * 60) * 3
+    settings = Settings(output_codec="adts", prefer_passthrough=False)
+    assert pipeline.decide_mode(segment, settings) == ("transcode", None)
+
+
+def test_a_container_we_cannot_forward_still_goes_to_ffmpeg():
+    """fMP4 needs a real demuxer; the forwarder only knows bare audio."""
+    fmp4 = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 40
+    assert pipeline.decide_mode(fmp4, Settings(output_codec="adts")) == ("transcode", None)
+
+
+def test_with_ffmpeg_disabled_the_source_codec_wins_over_the_setting():
+    """`--no-ffmpeg` makes every stream behave as `output_codec = "auto"`.
+
+    This is the case the feature exists for: a radio that decodes AAC should not
+    cost a re-encode at all. With FFmpeg gone there is nothing to encode *with*,
+    so the configured "mp3" must not be allowed to force a transcode that cannot
+    happen - the decision has to follow the stream.
+    """
+    off = Settings(ffmpeg_enabled=False, output_codec="mp3")
+
+    adts = _id3_tag(b"PRIV" + b"\x00" * 40) + _adts_frame(b"\x40" * 60) * 3
+    assert pipeline.decide_mode(adts, off) == ("passthrough", "adts"), (
+        "an AAC station was sent to the engine that does not exist"
+    )
+
+    mp3 = _id3_tag(b"TIT1" + b"\x00" * 20) + (b"\xff\xfb\x90\x64" + b"\x00" * 413) * 3
+    assert pipeline.decide_mode(mp3, off) == ("passthrough", "mp3")
+
+    # And what it cannot forward is still reported as needing the engine, which
+    # the pipeline turns into a fatal error rather than a silent stream.
+    fmp4 = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 40
+    assert pipeline.decide_mode(fmp4, off) == ("transcode", None)
+
+
+def test_a_contradictory_configuration_still_forwards_rather_than_going_silent():
+    """The decision must not depend on validation having been consulted.
+
+    ``Settings`` refuses ``ffmpeg_enabled = false`` together with
+    ``prefer_passthrough = false`` (see ``_check_engine_combination``), but a
+    ``model_copy(update=...)`` - which is how per-request controls are applied -
+    bypasses validators entirely. A decision that trusted the flag alone would
+    then answer TRANSCODE for a station it could have played, and with no engine
+    available that is silence behind a 200 for every listener.
+    """
+    contradictory = Settings(ffmpeg_enabled=False).model_copy(update={"prefer_passthrough": False})
+
+    adts = _id3_tag(b"PRIV" + b"\x00" * 40) + _adts_frame(b"\x40" * 60) * 3
+    assert pipeline.decide_mode(adts, contradictory) == ("passthrough", "adts")
+
+
+def test_a_stream_that_needs_ffmpeg_is_refused_when_it_is_disabled():
+    """The failure must be a diagnosis, not silence behind a 200.
+
+    Reported as a whole class of bug in this project's history: a stream that
+    could not be produced still answered `200 audio/mpeg` and then emitted
+    nothing, so a radio connected successfully and stayed mute. Here the reason
+    is known before a single byte is produced, so it is said out loud.
+    """
+    assert "fMP4" in pipeline._why_it_needs_ffmpeg("mp4", None)
+    assert "no MP3 or ADTS AAC" in pipeline._why_it_needs_ffmpeg("ts", None)
+    assert "not recognised" in pipeline._why_it_needs_ffmpeg(None, None)
+    # Never empty: an unexplained refusal is what sends somebody to the forums.
+    for detected, kind in ((None, None), ("ts", None), ("mp4", None), ("ts", "adts")):
+        assert pipeline._why_it_needs_ffmpeg(detected, kind).strip()
+
+
+async def test_a_raw_adts_stream_is_forwarded_without_ffmpeg(monkeypatch):
+    """The engine proof, not just the decision: no child process is needed.
+
+    ``locate_ffmpeg`` raising means that if anything in this path tried to
+    build a command, the test fails loudly - which is the claim being made:
+    this kind of station runs with no FFmpeg installed at all.
+    """
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("a raw ADTS stream must not need ffmpeg")
+
+    monkeypatch.setattr(pipeline.ffmpeg_mod, "locate_ffmpeg", _boom)
+
+    frames = b"".join(_adts_frame(bytes([0x40 + index]) * 60) for index in range(3))
+    data = {
+        100: _id3_tag(b"PRIV" + b"\x00" * 40) + _id3_tag(b"TEXT" + b"\x00" * 30) + frames,
+        101: _id3_tag(b"PRIV" + b"\x00" * 40) + frames,
+    }
+    settings = Settings(output_codec="adts")
+    stream = pipeline.StreamPipeline(settings, ["http://x/one.m3u8"], label="raw")
+    await stream._client.aclose()
+    stream._client = _RecordingClient(data)  # ty: ignore[invalid-assignment]
+    segments = [
+        Segment(url=f"http://x/{sequence}.aac", sequence=sequence, duration=3.0)
+        for sequence in (100, 101)
+    ]
+    pending: list[WorkItem] = [(segments[0], data[100]), (segments[1], None)]
+    # Mirrors ``_stream_once``: the first segment is fetched *before* the engine
+    # is chosen, so it is accounted for there rather than in the feeder.
+    stream._note_input(segments[0], data[100])
+
+    received = bytearray()
+    try:
+        async for chunk in stream._run_passthrough(
+            _EndOfPlaylistTracker(),  # ty: ignore[invalid-argument-type]
+            pending,
+            container="adts",
+        ):
+            received += chunk
+    finally:
+        await stream.aclose()
+
+    output = bytes(received)
+    assert output == frames + frames, "the source's own frames, and nothing else"
+    assert stream.stats.detected_codec == "adts", "the frame grid is chosen from this"
+    assert stream.stats.segments == 2, "every segment still goes through _note_input"
+    assert stream._proc is None, "pass-through must never leave a child behind"
+
+
 def _id3_song_segment(json_text: str) -> bytes:
     """A leading ID3v2.4 tag with one TEXT frame, as msvdn segments start."""
     payload = b"\x03" + json_text.encode()

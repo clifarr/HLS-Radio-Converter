@@ -1,4 +1,4 @@
-"""A small, dependency-free MPEG-TS demuxer.
+"""A small, dependency-free demuxer for the audio inside HLS segments.
 
 Why this exists
 ---------------
@@ -6,7 +6,10 @@ FFmpeg was previously needed for *everything*, even when the HLS segments
 already contained a stream the radio could play verbatim. The typical HLS radio
 segment is an MPEG-TS carrying a single audio elementary stream, and pulling
 that elementary stream out is just packet parsing - no decoder, no encoder, no
-CPU. Doing it in Python means:
+CPU. Some CDNs skip the container altogether and serve the elementary stream
+itself (``.aac`` segments are raw ADTS behind an ID3 tag, see
+:class:`ElementaryStreamForwarder`); those need even less work. Doing it in
+Python means:
 
 * **no FFmpeg process** for pass-through streams: a Raspberry Pi streams a
   station at well under 1% of one core, and there is no extra process to leak,
@@ -482,6 +485,255 @@ def mp3_align_offset(data: bytes, window: int = 8192) -> Optional[int]:
         if mp3_frame_aligned(data, offset):
             return offset
     return None
+
+
+# ------------------------------------------------------- how long is the audio
+#: Every ADTS frame carries 1024 samples of AAC. (AAC-LD's 512 and ELD's 480
+#: are never broadcast in ADTS, and neither appears in HLS in the wild.)
+ADTS_SAMPLES_PER_FRAME = 1024
+
+#: ADTS ``sampling_frequency_index`` -> the rate in the stream, in Hz.
+#:
+#: Note this is the **core** rate for HE-AAC: a station whose header says
+#: 24000 Hz with SBR doubles to 48000 Hz output, but the *duration* is still
+#: ``frames * 1024 / 24000``. Reading this field is therefore correct for both
+#: plain AAC and HE-AAC, which matters because a radio's consumption rate - the
+#: number the output pacer needs - is what this computes.
+_ADTS_RATES = (
+    96000,
+    88200,
+    64000,
+    48000,
+    44100,
+    32000,
+    24000,
+    22050,
+    16000,
+    12000,
+    11025,
+    8000,
+    7350,
+    0,
+    0,
+    0,
+)
+
+
+def adts_sample_rate(data: bytes, offset: int = 0) -> Optional[int]:
+    """Sample rate in Hz of the ADTS frame at *offset*, or ``None``."""
+    if offset + 3 > len(data):
+        return None
+    if data[offset] != 0xFF or (data[offset + 1] & 0xF6) != 0xF0:
+        return None
+    rate = _ADTS_RATES[(data[offset + 2] >> 2) & 0x0F]
+    return rate or None
+
+
+def mp3_samples_per_frame(data: bytes, offset: int = 0) -> Optional[int]:
+    """Samples carried by the MPEG audio frame at *offset*, or ``None``.
+
+    Layer I is 384 samples in every version; Layer II is 1152 in every
+    version; Layer III is 1152 in MPEG-1 and 576 in MPEG-2/2.5 (the same
+    split that makes its *byte* length halve - see :func:`mp3_frame_size`).
+    """
+    if offset + 4 > len(data):
+        return None
+    if data[offset] != 0xFF or (data[offset + 1] & 0xE0) != 0xE0:
+        return None
+    version = (data[offset + 1] >> 3) & 0x03
+    layer = (data[offset + 1] >> 1) & 0x03
+    if version == 1 or layer == 0:
+        return None
+    if layer == 3:  # Layer I
+        return 384
+    if layer == 2:  # Layer II
+        return 1152
+    return 1152 if version == 3 else 576  # Layer III
+
+
+def frame_duration(data: bytes, offset: int = 0, kind: str = "adts") -> Optional[float]:
+    """Playback duration in seconds of the frame at *offset*, or ``None``."""
+    if kind == "adts":
+        rate = adts_sample_rate(data, offset)
+        return ADTS_SAMPLES_PER_FRAME / rate if rate else None
+    if offset + 3 > len(data):
+        return None
+    version = (data[offset + 1] >> 3) & 0x03
+    rate = _MP3_RATES.get(version, (0, 0, 0, 0))[(data[offset + 2] >> 2) & 0x03]
+    samples = mp3_samples_per_frame(data, offset)
+    if not rate or not samples:
+        return None
+    return samples / rate
+
+
+def audio_duration(data: bytes, kind: str = "adts") -> float:
+    """How many seconds of audio *data* holds, measured from its own frames.
+
+    Why this exists: the playlist's ``EXTINF`` is the packager's claim, and a
+    live packager can be wrong in either direction (radiom2o declares 10 s for
+    10.32 s of audio). The output pacer needs the rate the *decoder* consumes,
+    because delivering faster than that empties the jitter buffer and delivering
+    slower fills it - both of which end in audible gaps or dropped audio after a
+    few minutes. Counting frames is exact and needs no decoding: every ADTS
+    frame is 1024 samples at the header's rate, and every MPEG audio frame is
+    384/576/1152 samples depending on layer and version.
+
+    Stops at the first byte that is not a whole frame, so a truncated tail
+    contributes nothing rather than a guess.
+    """
+    size_of = adts_frame_size if kind == "adts" else mp3_frame_size
+    total = 0.0
+    offset = 0
+    while True:
+        size = size_of(data, offset)
+        if size is None or offset + size > len(data):
+            break
+        seconds = frame_duration(data, offset, kind)
+        if seconds is None:
+            break
+        total += seconds
+        offset += size
+    return total
+
+
+# ------------------------------------------------- forward the bare stream
+class ElementaryStreamForwarder:
+    """Forward a raw elementary stream (ADTS AAC or MP3) with no FFmpeg.
+
+    Many HLS stations do not wrap the audio in anything. The ``.aac`` segments
+    of Microsoft's ``msvdn.net`` CDN are raw ADTS AAC behind two ID3v2 tags, and
+    a bare ``.mp3`` segment is likewise just MPEG audio frames. Nothing needs
+    demuxing there: the bytes a radio wants are already present, in order. What
+    is left is small, and all three parts of it matter:
+
+    * **drop the metadata.** Every segment opens with its *own* ID3v2 tags (the
+      Apple ``transportStreamTimestamp`` ``PRIV`` and a ``TEXT`` tag with the
+      song title). Those bytes are not audio. A radio that decodes them has to
+      resynchronise, losing a fraction of a second - and because the ICY grid
+      counts *audio* bytes, tags inside the stream also shift the client's
+      metadata parser off the grid for the rest of the connection. The title is
+      read from the same tags elsewhere (``pipeline._note_input``), so nothing
+      is lost by removing them here.
+    * **start on a frame boundary.** The first bytes may be the tail of a frame
+      the packager cut in half; they are discarded so the listener's decoder
+      starts on a sync word rather than resynchronising into the metadata grid.
+    * **keep frames whole.** A segment boundary is wherever the packager put it
+      and is *not* guaranteed to fall between two frames, so an incomplete
+      trailing frame is held back and completed by the next segment instead of
+      being sent cut in half.
+
+    The audio itself is never touched: every byte out is a byte in, and the
+    stream is a pure concatenation of whole source frames. ``feed()`` is called
+    once per segment and may be given any number of bytes.
+
+    The interface deliberately mirrors :class:`TSDemuxer` (``feed``,
+    ``ready``, ``output_kind``) so the pipeline can use either without caring
+    which shape the source happened to be.
+    """
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        if kind == "adts":
+            self._frame_size = adts_frame_size
+            self._align = adts_align_offset
+            self._header_bytes = 7
+        elif kind == "mp3":
+            self._frame_size = mp3_frame_size
+            self._align = mp3_align_offset
+            self._header_bytes = 4
+        else:
+            raise ValueError(f"not an elementary stream kind: {kind!r}")
+        self._audio = bytearray()
+        self._tag_tail = b""
+        self._synced = False
+        #: Bytes removed rather than forwarded: ID3 tags, a partial leading
+        #: frame, and any junk a resynchronisation stepped over.
+        self.skipped = 0
+
+    # ------------------------------------------------------------------ state
+    @property
+    def ready(self) -> bool:
+        """True once a frame boundary has been found in the stream."""
+        return self._synced
+
+    @property
+    def output_kind(self) -> Optional[str]:
+        """What we are forwarding - ``"adts"`` or ``"mp3"``, never a decode."""
+        return self.kind
+
+    # ------------------------------------------------------------------- feed
+    def feed(self, data: bytes) -> bytes:
+        """Return the complete audio frames in *data*, in order."""
+        if not data:
+            return b""
+        audio = self._strip_tags(data)
+        if not audio:
+            return b""
+        self._audio += audio
+
+        buf = bytes(self._audio)
+        out = bytearray()
+        index = 0
+        while index < len(buf):
+            if not self._synced:
+                offset = self._align(buf[index:])
+                if offset is None:
+                    # No frame *pair* here yet: either the audio is still
+                    # incomplete or this segment starts with something else.
+                    # Hold it; the next segment continues the search.
+                    break
+                self.skipped += offset
+                index += offset
+                self._synced = True
+                continue
+
+            size = self._frame_size(buf, index)
+            if size is None:
+                # The grid broke: a discontinuity, or junk where a frame should
+                # be. Search again from the next candidate rather than forward
+                # a stream a radio cannot follow.
+                self._synced = False
+                continue
+            if index + size > len(buf):
+                # A frame cut by the segment boundary: keep it for next time.
+                break
+            end = index + size
+            remaining = len(buf) - end
+            if remaining >= self._header_bytes and self._frame_size(buf, end) is None:
+                # The frame's own length field says it ends here, but what
+                # follows is not a frame header - so the length field was
+                # describing damaged data. Trusting it would forward a run of
+                # bytes that is not audio, which a radio decodes as noise.
+                self._synced = False
+                continue
+            out += buf[index:end]
+            index = end
+
+        if index:
+            del self._audio[:index]
+        return bytes(out)
+
+    # -------------------------------------------------------------- internals
+    def _strip_tags(self, data: bytes) -> bytes:
+        """Remove the ID3v2 tags a segment opens with (chained, as real ones are).
+
+        A tag that straddles the caller's chunk is held instead of half-skipped:
+        its own length field is what says where the audio starts, so a partial
+        tag cannot be resolved without the rest of it.
+        """
+        if self._tag_tail:
+            data = self._tag_tail + data
+            self._tag_tail = b""
+        for _ in range(MAX_ID3_TAGS):
+            size = id3_tag_size(data)
+            if not size:
+                break
+            if len(data) < size:
+                self._tag_tail = data
+                return b""
+            self.skipped += size
+            data = data[size:]
+        return data
 
 
 # ----------------------------------------------------------------------- CRC

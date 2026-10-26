@@ -233,7 +233,7 @@ Architecture, in the order data flows:
 |---|---|
 | `config.py` | Settings: defaults < config file < `RADIOCONV_*` env < CLI flags. |
 | `hls.py` | Fetching, master/variant selection, AES-128, byte ranges, live-edge tracking. |
-| `tsdemux.py` | Dependency-free MPEG-TS/PSI demuxer - the FFmpeg-free path. |
+| `tsdemux.py` | Dependency-free demuxer: MPEG-TS/PSI extraction, and frame-exact forwarding of a bare elementary stream - the FFmpeg-free path. |
 | `pipeline.py` | One station: pass-through or FFmpeg, bounded queues, failover, restart. |
 | `session.py` | Fan-out to many radios, capacity limits, linger, stall watchdog. |
 | `throughput.py` | Cumulative byte counters, and the rolling last-hour view of them. |
@@ -315,6 +315,28 @@ attribute; `test_the_dashboard_only_asks_for_metrics_that_exist` resolves every
 one of them against a live snapshot, so a typo fails the build rather than
 rendering a tile that reads "–" forever.
 
+### The stream check on the landing page
+
+`GET /` runs the same `hls.inspect()` call as `/probe` and prints the result.
+Two constraints, both tested:
+
+* **It is opt-in** (`probe=1` from a checkbox). The call downloads a segment and
+  runs FFmpeg, so a bare `?url=` must stay instant and touch no network at all.
+  `test_a_bare_url_never_touches_the_network` breaks the inspector outright and
+  asserts the page still renders.
+* **It reports the engine, not the source.** `passthrough_possible` describes
+  what the *station* could do; forwarding an AAC source still cannot produce the
+  MP3 that `output_codec = "mp3"` asks for, so the page reads
+  `passthrough_engine`. Reading the first field there is the exact confusion the
+  page exists to remove, and
+  `test_the_verdict_reports_the_engine_not_the_source` is what keeps it out.
+
+The rows are built in `web.py` (`_probe_rows`, `_engine`) from the dict the
+route already fetched - the template does no formatting, so a value cannot be
+rendered two ways on two pages. There is deliberately no second code path for
+the page: if `/probe` and the page ever disagreed, the page would be lying about
+what the service is about to do.
+
 `packaging/radioconv.spec` must list both directories in `datas`; a frozen
 build reads them from `sys._MEIPASS`. `test_the_packaged_assets_are_declared_for_pyinstaller`
 checks that, because getting it wrong produces a build that starts fine and then
@@ -360,6 +382,42 @@ sync word, so the audio is invisible to a naive check.
 The ADTS check requires the layer field to be zero, which is what separates it
 from an MPEG audio frame: `FF FB` (MPEG-1 Layer III) otherwise satisfies every
 field a naive ADTS check looks at.
+
+### What the container decides about the engine
+
+The container answers a second question too - how the audio is obtained:
+
+| Container | Engine | Work done |
+|---|---|---|
+| `ts` with an MP3/ADTS stream | pass-through | read the PAT/PMT, extract the elementary stream by PID (`TSDemuxer`). |
+| `adts` / `mp3` (bare) | pass-through | nothing to demux: strip the segment's ID3v2 tags, start on a frame boundary, keep frames whole (`ElementaryStreamForwarder`). |
+| `mp4`, or a TS carrying an excluded stream type | transcode | FFmpeg. |
+
+Pass-through is only *used* when the output codec matches the source, because
+forwarding AAC cannot produce MP3. That second step is a settings question, not a
+content question, so `probe` reports it separately (`passthrough_engine`).
+
+That "output codec" is `Settings.effective_output_codec`, not `output_codec`, and
+the difference matters on an installation started with `--no-ffmpeg`. There is no
+second engine there, so the only producible output is the station's own and the
+effective codec answers `auto` whatever the config file says - which makes the
+bottom row of that table unreachable, and is why such a configuration must
+*refuse* a stream it cannot forward (`503`, with the reason) rather than serve it.
+Anything that decides an engine, a `Content-Type`, a session key or a page
+verdict has to read the effective value; six sites do, and a seventh that read
+the configured one would contradict the other six.
+
+Two rules in the forwarder are worth keeping in mind, because both were bugs
+waiting to happen:
+
+* **The tags must go.** They are not audio, and the ICY grid counts *audio*
+  bytes: tags left in the stream shift every client's metadata parser off the
+  grid for the rest of the connection. They are read for the song title first.
+* **A frame's length field is not proof.** After using it to find where the next
+  frame should start, that position must be a frame header. If it is not, the
+  bytes are damaged and the frame is dropped (one frame, ~20 ms) rather than
+  forwarded as noise. The frame immediately before damage goes with it, because
+  nothing valid follows it either.
 
 ## Releasing
 

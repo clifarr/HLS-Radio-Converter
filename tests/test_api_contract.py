@@ -161,6 +161,87 @@ def test_there_is_no_post_root_endpoint(live_server):
     assert response.status_code == 405, "POST / should no longer be routed"
 
 
+# ----------------------------------------------- the page's own stream check
+def test_the_page_shows_the_probe_diagnostics_when_asked(live_server, hls_server):
+    """The feature: the same facts as `/probe`, where the URL is entered.
+
+    Reported as "we have this nice /probe endpoint, but it loses its charm since
+    we don't have a UI for it". The page now runs the identical call, so the two
+    can never disagree - which is why this compares against a real `/probe`
+    response rather than against hard-coded strings that would pin the fixture's
+    sample rate.
+    """
+    aac_url, _ = hls_server
+    body = httpx.get(live_server + "/", params={"url": aac_url, "probe": "1"}, timeout=60).text
+    probe = httpx.get(live_server + "/probe", params={"url": aac_url}, timeout=60).json()
+
+    assert "Stream check" in body
+    assert "Engine" in body
+    assert f">{probe['container']}<" in body, "the measured container is missing"
+    assert probe["audio"]["codec"].upper() in body, "the source audio was not described"
+    assert f"{probe['audio']['sample_rate'] / 1000:g} kHz" in body
+    # The engine verdict is the question the page exists to answer, and this
+    # stream needs ffmpeg (AAC in TS, output mp3 by default).
+    assert "transcode" in body
+    assert "ffmpeg" in body.lower()
+
+
+def test_the_page_offers_the_url_that_needs_no_ffmpeg(live_server, hls_server):
+    """A station that *could* be forwarded is the one case worth acting on.
+
+    The advice has to be a URL, not a sentence: "set output_codec = adts" is an
+    instruction for somebody with shell access, while the page is used by
+    somebody holding a radio - and ``?codec=`` is the per-request form of the
+    same choice, which changes nothing for other listeners.
+    """
+    aac_url, _ = hls_server
+    body = httpx.get(live_server + "/", params={"url": aac_url, "probe": "1"}, timeout=60).text
+
+    assert "avoids FFmpeg" in body
+    assert "codec=adts" in body.replace("&amp;", "&"), "the pass-through URL is missing"
+
+
+def test_a_failing_check_is_reported_on_the_page(live_server):
+    """An unreachable station is a sentence, not a 500 or a spinner.
+
+    The form is the first thing anybody tries with a URL they were given, and
+    "it just hung" is the least useful possible answer.
+    """
+    body = httpx.get(
+        live_server + "/",
+        params={"url": "http://127.0.0.1:1/dead.m3u8", "probe": "1"},
+        timeout=30,
+    ).text
+    assert "Stream check" in body
+    assert "Could not check this stream" in body
+
+
+def test_the_check_can_be_opted_out_even_with_probe_in_the_url(live_server, hls_server):
+    """Unticking the box must remove the parameter, and the page must agree.
+
+    The checkbox reflects what the user chose: after a check it stays ticked, and
+    after an unticked submit it must not silently turn itself back on.
+    """
+    aac_url, _ = hls_server
+    ticked = httpx.get(live_server + "/", params={"url": aac_url, "probe": "1"}, timeout=60).text
+    unticked = httpx.get(live_server + "/", params={"url": aac_url}, timeout=60).text
+
+    assert 'name="probe"' in ticked and "checked" in _probe_input(ticked)
+    assert "checked" not in _probe_input(unticked), "the box re-ticks itself"
+    # And a first visit defaults to on, so the diagnostics are discoverable.
+    first_visit = httpx.get(live_server + "/", timeout=10).text
+    assert "checked" in _probe_input(first_visit)
+
+
+def _probe_input(body: str) -> str:
+    """The ``<input>`` element for the probe checkbox, as it was rendered."""
+    import re
+
+    match = re.search(r'<input[^>]*name="probe"[^>]*>', body)
+    assert match, "the converter page has no probe checkbox"
+    return match.group(0)
+
+
 # --------------------------------------------------------------------- /probe
 def test_probe_returns_json_and_does_not_stream(live_server, hls_server):
     """`/probe` is a dry run: it answers and closes, it does not attach."""

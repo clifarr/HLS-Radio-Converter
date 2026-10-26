@@ -117,3 +117,22 @@ def test_check_reports_the_configured_ffmpeg_path():
     result = check_ffmpeg(Settings())
     assert result.ok, result.detail
     assert "/" in result.detail, "the path must be absolute, not a bare command name"
+
+
+def test_a_disabled_ffmpeg_is_a_pass_not_a_failure():
+    """`--no-ffmpeg` is a supported configuration, and check must not fail it.
+
+    ``radioconv check`` exits 1 on any failed row, and it is the command somebody
+    runs precisely when something is wrong. Reporting FAIL for a deliberately
+    absent binary would send them chasing an installation they chose not to
+    have - and it must not report it as *skipped* either, silently, because then
+    the absence of a working transcode is invisible.
+    """
+    from radioconv.check import check_ffmpeg
+
+    result = check_ffmpeg(Settings(ffmpeg_enabled=False))
+
+    assert result.ok, "a chosen configuration is not a fault"
+    assert not result.skipped
+    assert "disabled" in result.detail
+    assert "MP3/ADTS" in result.detail, "it must say what still works"

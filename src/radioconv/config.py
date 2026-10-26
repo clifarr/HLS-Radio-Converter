@@ -14,18 +14,21 @@ declarative ``/etc/radioconv/config.toml`` on a Raspberry Pi.
 from __future__ import annotations
 
 import json
+import logging
 import os
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from pydantic import field_validator
+from pydantic import TypeAdapter, field_validator, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from . import _toml
+
+log = logging.getLogger(__name__)
 
 OutputCodec = Literal["mp3", "adts", "auto"]
 VariantSelection = Literal["highest", "lowest", "first"]
@@ -43,6 +46,53 @@ _FILE_VALUES: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
 
 def _file_values_now() -> Dict[str, Any]:
     return _FILE_VALUES.get() or {}
+
+
+#: Values saved from the settings page, for the duration of ``load()``.
+#:
+#: A second ContextVar rather than one merged dict, because the two have
+#: different precedence (saved settings beat the config file) and because only
+#: these may ever be *written* back. Keeping them apart is what stops a save from
+#: rewriting somebody's annotated ``config.toml`` - which would delete every
+#: comment in it.
+_UI_VALUES: ContextVar[Optional[Dict[str, Any]]] = ContextVar("radioconv_ui_values", default=None)
+
+
+def _ui_values_now() -> Dict[str, Any]:
+    return _UI_VALUES.get() or {}
+
+
+def ui_settings_path() -> Path:
+    """Where the settings page saves what it is told.
+
+    JSON rather than TOML because this file is *written* by the service as well
+    as read, and hand-written TOML comments cannot survive a rewrite - so the
+    file is the machine's, and the annotated example stays the human's.
+    """
+    return default_config_dir() / "ui-settings.json"
+
+
+class _UIOverridesSource(PydanticBaseSettingsSource):
+    """Settings saved from the web page, sitting *above* the config file.
+
+    The order that matters is this one: a value somebody typed into the browser
+    is a later decision than a value in ``config.toml``, so it wins. It must not
+    win over ``RADIOCONV_*`` or a command-line flag, though - those are how
+    systemd and the installer pin an installation, and a web page quietly
+    defeating them would make the deployment's own configuration a lie. The
+    consequence is surfaced rather than hidden: the page reports a field it saved
+    but could not apply, naming the reason.
+    """
+
+    def __init__(self, settings_cls: type) -> None:
+        super().__init__(settings_cls)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> Tuple[Any, str, bool]:
+        value = _ui_values_now().get(field_name)
+        return value, field_name, False
+
+    def __call__(self) -> Dict[str, Any]:
+        return dict(_ui_values_now())
 
 
 class _ConfigFileSource(PydanticBaseSettingsSource):
@@ -73,6 +123,15 @@ def _file_values(values: Dict[str, Any]) -> Generator[None, None, None]:
         _FILE_VALUES.reset(token)
 
 
+@contextmanager
+def _ui_values(values: Dict[str, Any]) -> Generator[None, None, None]:
+    token = _UI_VALUES.set(values)
+    try:
+        yield
+    finally:
+        _UI_VALUES.reset(token)
+
+
 def default_config_dir() -> Path:
     """Where we look for ``config.toml``.
 
@@ -85,6 +144,158 @@ def default_config_dir() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg) if xdg else Path.home() / ".config"
     return base / "radioconv"
+
+
+class SettingsStore:
+    """The settings, in a form that can be changed while the service runs.
+
+    Why a holder rather than passing :class:`Settings` around
+    --------------------------------------------------------
+    A ``Settings`` instance is immutable in practice: every closure and every
+    long-lived object that captured one would keep the old values for ever, so
+    "change a setting" could only mean "restart the process". This holds *which*
+    settings are current and hands out the present one, so the objects that
+    outlive a request - the session manager, the resource monitor, the route
+    closures - follow a change instead of ignoring it.
+
+    What a change does *not* do
+    ---------------------------
+    It does not rewrite a session that is already running. A ``StreamSession``
+    copies the settings it was created with, deliberately: its chunk size, its
+    codec and its queue depth describe a pipeline that exists, and swapping them
+    underneath it would be a different stream spliced onto the current one. So a
+    change reaches every *new* session, and the page offers to retire the
+    running ones for anybody who wants it now.
+
+    Why ``model_dump`` rather than the source dicts
+    ----------------------------------------------
+    Applying a patch starts from the values that are *in force*, not from the
+    config file. Rebuilding from the file would silently discard whatever the
+    environment, a command-line flag, or a previous save had decided - and the
+    operator would watch a setting revert to something they never typed.
+    """
+
+    def __init__(self, settings: Settings, pinned: Optional[Dict[str, Any]] = None) -> None:
+        self._settings = settings
+        self._listeners: List[Callable[[Settings], None]] = []
+        #: Values that must always win, because something outside this service
+        #: decided them: a ``RADIOCONV_*`` variable, or a command-line flag (which
+        #: the CLI passes in, since it is the only place that knows about them).
+        #:
+        #: Without this, a patch would override a pinned value *in memory* and the
+        #: pin would return on the next restart - a change that appears to work
+        #: and then silently reverts, which is worse than being refused. So a pin
+        #: is re-applied over every patch, and ``apply`` reports the fields whose
+        #: submitted value lost.
+        self._pinned: Dict[str, Any] = dict(pinned or {})
+        self._pinned.update(_env_pins())
+
+    @property
+    def current(self) -> Settings:
+        return self._settings
+
+    def pinned(self) -> Dict[str, Any]:
+        """The fields whose value is decided outside this service."""
+        return dict(self._pinned)
+
+    def subscribe(self, callback: Callable[[Settings], None]) -> None:
+        """Call *callback* with the new settings whenever they change."""
+        self._listeners.append(callback)
+
+    def apply(self, patch: Dict[str, Any]) -> Settings:
+        """Merge *patch* into the current settings and validate the result.
+
+        Raises ``pydantic.ValidationError`` for a value that is out of range or
+        that contradicts another setting, in which case **nothing changes**: the
+        replacement is built and validated in full before it is installed, so a
+        rejected edit cannot leave the service half-configured.
+
+        Pinned values are re-applied last, so what is in force after this call is
+        the same thing the next process would load.
+        """
+        clean = {k: v for k, v in patch.items() if k in Settings.model_fields}
+        if not clean:
+            return self._settings
+        merged = {**self._settings.model_dump(), **clean, **self._pinned}
+        updated = Settings(**merged)
+        self._settings = updated
+        for callback in self._listeners:
+            callback(updated)
+        return updated
+
+    def save(self, patch: Dict[str, Any]) -> Path:
+        """Persist *patch* to :func:`ui_settings_path` so it survives a restart.
+
+        Merged into whatever was saved before, so saving one field does not
+        erase another that was set last week. Written atomically (temp file then
+        rename) because a power cut mid-write would otherwise leave a truncated
+        JSON file, and the service would then fail to start at all - a settings
+        page that can brick the appliance is not worth having.
+        """
+        path = ui_settings_path()
+        existing = read_ui_settings(path)
+        existing.update({k: v for k, v in patch.items() if k in Settings.model_fields})
+        # A key pydantic ignores, so the file explains itself to whoever finds
+        # it in /etc and wonders why the value is not in config.toml.
+        existing["__note__"] = (
+            "Written by the radioconv settings page. These values override "
+            "config.toml but are overridden by RADIOCONV_* and by command-line "
+            "flags. Delete this file to fall back to config.toml."
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", "utf-8")
+        temporary.replace(path)
+        return path
+
+
+def _env_pins() -> Dict[str, Any]:
+    """Settings that a ``RADIOCONV_*`` variable is deciding, as real values.
+
+    Coerced through the field's own annotation rather than read as a string,
+    because a pin of ``"false"`` has to become ``False`` - and guessing at
+    ``int()``/``bool()`` by hand is how a setting ends up pinned to the wrong
+    type and then rejected by the very validators that were supposed to check it.
+
+    A variable that does not parse is skipped rather than raised on: the service
+    is already running with whatever ``Settings`` made of it, and a settings page
+    that refuses to render because one environment variable is malformed would be
+    a new way to take the appliance down.
+    """
+    pins: Dict[str, Any] = {}
+    for name in Settings.model_fields:
+        raw = os.environ.get(f"RADIOCONV_{name.upper()}")
+        if raw is None:
+            continue
+        try:
+            annotation = Settings.model_fields[name].annotation
+            pins[name] = TypeAdapter(annotation).validate_python(raw)
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            # Logged rather than swallowed, because "my bitrate will not change"
+            # is exactly the symptom of a malformed variable, and a silent skip
+            # would leave that unanswerable from the outside.
+            log.debug("ignoring unusable RADIOCONV_%s: %s", name.upper(), exc)
+            continue
+    return pins
+
+
+def read_ui_settings(path: Optional[Path] = None) -> Dict[str, Any]:
+    """The values saved by the settings page, or ``{}``.
+
+    Unreadable or malformed is ``{}`` rather than an exception, and deliberately:
+    this file is *extra* configuration. The service must still start if somebody
+    has corrupted it - losing a preference is recoverable, refusing to boot is
+    not, and the alternative would be a settings page that can take the service
+    down by writing something it later cannot read.
+    """
+    target = path or ui_settings_path()
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if not k.startswith("__")}
 
 
 class Settings(BaseSettings):
@@ -110,6 +321,7 @@ class Settings(BaseSettings):
             init_settings,  # explicit arguments win
             env_settings,  # then RADIOCONV_*
             dotenv_settings,  # then .env
+            _UIOverridesSource(settings_cls),  # then what the settings page saved
             _ConfigFileSource(settings_cls),  # then config.toml / config.json
             file_secret_settings,  # then secrets files
         )
@@ -142,6 +354,27 @@ class Settings(BaseSettings):
     prefer_passthrough: bool = True
 
     # ---------------------------------------------------------------- ffmpeg
+    #: Can this installation run FFmpeg at all?
+    #:
+    #: ``True`` (the default) is the historical behaviour: every stream can be
+    #: re-encoded, so any station can be played whatever its source codec, and
+    #: widest compatibility is what a Frontier-Silicon radio needs.
+    #:
+    #: ``False`` turns FFmpeg into an *optional* dependency. Many radios decode
+    #: AAC, and for them a re-encode is pure waste - it costs CPU, memory and a
+    #: child process per station to produce a stream that is worse than the one
+    #: the station already broadcasts. With this off the service never starts a
+    #: child process and only ever uses the FFmpeg-free path, which is a fraction
+    #: of one core on a Pi.
+    #:
+    #: The consequence is not a degraded version of the same service, it is a
+    #: different one: what can be played is decided entirely by the station. See
+    #: :attr:`effective_output_codec` - ``output_codec`` is ignored, and every
+    #: stream behaves as though its URL ended in ``?codec=auto``. A station whose
+    #: audio cannot be forwarded (fMP4, or a transport stream with no MP3/ADTS
+    #: audio) then cannot be played at all, and says so rather than playing
+    #: silence.
+    ffmpeg_enabled: bool = True
     #: Explicit ffmpeg binary; ``None`` = bundled wheel, then ``$PATH``.
     ffmpeg_path: Optional[str] = None
     #: Threads handed to ffmpeg. 1 is the right answer on a single-board
@@ -423,6 +656,25 @@ class Settings(BaseSettings):
     icy_song_metadata: bool = True
     #: No output bytes for this long => kill and restart the pipeline.
     stall_timeout: float = 30.0
+    #: How long a single socket write to a radio may block before that listener
+    #: is dropped as gone. 0 = no deadline.
+    #:
+    #: This is the only bound the application has over a radio that vanishes
+    #: without saying goodbye - a power cut, a Wi-Fi dropout that never recovers,
+    #: a router that reboots. Nothing is acknowledged, so the kernel retransmits
+    #: until ``tcp_retries2`` gives up: fifteen attempts, **about fifteen
+    #: minutes**. That figure is system-wide and ASGI exposes neither the socket
+    #: nor ``TCP_USER_TIMEOUT``, so the application bounds its own write instead
+    #: (``api._ListenerStream``). Until it did, a powered-off radio stayed in the
+    #: listener list for a quarter of an hour while its `dropped` counter climbed
+    #: at the audio rate.
+    #:
+    #: The default is deliberately generous. A congested Wi-Fi link absorbs
+    #: measured **2.8 s** of stall inside the kernel before the application sees
+    #: a blocked write at all, and a healthy radio on a bad link can pause for a
+    #: few seconds more - 30 s is an order of magnitude above that, while still
+    #: being thirty times faster than waiting for the kernel.
+    listener_write_timeout: float = 30.0
     #: Delay before restarting a failed pipeline (exponential up to 8x).
     restart_backoff: float = 2.0
 
@@ -443,7 +695,36 @@ class Settings(BaseSettings):
     log_json: bool = False
     access_log: bool = False
 
+    # ------------------------------------------------------------- management
+    #: Whether the web page at ``/settings`` may change anything.
+    #:
+    #: On by default, because the page exists to save somebody an SSH session -
+    #: and this service is a LAN appliance behind no authentication at all. Off
+    #: makes the page read-only, which is what you want if the port is reachable
+    #: from somewhere you do not control, or if the configuration is managed by
+    #: something else (Ansible, a config file in a git repo) and must not be
+    #: edited behind its back.
+    allow_ui_settings: bool = True
+
     # ------------------------------------------------------------ validation
+    @model_validator(mode="after")
+    def _check_engine_combination(self) -> Settings:
+        """Refuse a configuration that asks for two mutually exclusive engines.
+
+        ``ffmpeg_enabled = false`` leaves forwarding as the only engine, so
+        ``prefer_passthrough = false`` next to it is a contradiction: it is the
+        setting that says "always re-encode". Left alone it would take a
+        configuration that looks deliberate and turn it into a service that
+        answers every request with nothing at all, which is a very expensive way
+        to discover a typo.
+        """
+        if not self.ffmpeg_enabled and not self.prefer_passthrough:
+            raise ValueError(
+                "ffmpeg_enabled = false needs prefer_passthrough = true: with FFmpeg "
+                "disabled, forwarding is the only engine there is"
+            )
+        return self
+
     @field_validator("bitrate")
     @classmethod
     def _check_bitrate(cls, v: int) -> int:
@@ -517,6 +798,19 @@ class Settings(BaseSettings):
         # watchdog in practice.
         if not 0.0 <= v <= 600.0:
             raise ValueError("stall_reconnect_cooldown_seconds must be between 0 and 600")
+        return v
+
+    @field_validator("listener_write_timeout")
+    @classmethod
+    def _check_listener_write_timeout(cls, v: float) -> float:
+        # Zero disables the deadline, which is a legitimate diagnostic position -
+        # it restores the old behaviour of leaving the decision to the kernel.
+        # The floor is above measured kernel buffering (2.8 s of Wi-Fi stall is
+        # absorbed before the application sees a blocked write), so anything
+        # shorter would fire on ordinary congestion and drop working radios. The
+        # ceiling keeps a typo from putting the fifteen-minute wait back.
+        if v != 0.0 and not 5.0 <= v <= 300.0:
+            raise ValueError("listener_write_timeout must be 0 (off) or between 5 and 300")
         return v
 
     @field_validator("retransmit_reconnect_segments")
@@ -597,8 +891,32 @@ class Settings(BaseSettings):
 
     # ---------------------------------------------------------------- helpers
     @property
+    def effective_output_codec(self) -> OutputCodec:
+        """The output codec this installation can actually produce.
+
+        Without FFmpeg the only possible output is the audio the station is
+        already sending, so this answers ``"auto"`` no matter what
+        ``output_codec`` says - which is exactly the same thing as every URL
+        ending in ``?codec=auto``. That translation lives in one property rather
+        than at each decision site because there are six of them (the engine, the
+        ``Content-Type``, the probe report, the two pages, the session key) and a
+        site that forgot it would disagree with the rest.
+        """
+        return "auto" if not self.ffmpeg_enabled else self.output_codec
+
+    @property
+    def passthrough_only(self) -> bool:
+        """True when the FFmpeg-free path is the only engine available.
+
+        Distinct from ``prefer_passthrough``, which is a *preference*: that one
+        means "forward when you can, re-encode when you cannot". This one means
+        there is no second engine at all.
+        """
+        return not self.ffmpeg_enabled
+
+    @property
     def mime_type(self) -> str:
-        return "audio/aac" if self.output_codec == "adts" else "audio/mpeg"
+        return "audio/aac" if self.effective_output_codec == "adts" else "audio/mpeg"
 
     #: Force the ``Content-Type`` sent to radios (some firmware is picky and
     #: wants e.g. ``audio/mpeg3`` or ``audio/aacp``).
@@ -618,11 +936,17 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------ construction
     @classmethod
     def load(cls, config_file: Optional[str] = None, **overrides: Any) -> Settings:
-        """Build settings from file + environment + explicit overrides.
+        """Build settings from file + saved settings + environment + overrides.
 
-        Precedence: defaults < config file < environment < ``overrides``.
-        ``overrides`` values that are ``None`` are ignored, so argparse
-        defaults can never clobber file or environment configuration.
+        Precedence: defaults < config file < saved-from-the-page < environment <
+        ``overrides``. ``overrides`` values that are ``None`` are ignored, so
+        argparse defaults can never clobber file or environment configuration.
+
+        The saved values sit above the config file because a change made in the
+        browser is a later decision than one written into a file, and below the
+        environment and the command line because those are how an installation
+        is *pinned* - a deployment that sets ``RADIOCONV_BITRATE`` must not have
+        it silently defeated by whoever opened the settings page.
         """
         file_values: Dict[str, Any] = {}
         path: Optional[Path] = None
@@ -640,7 +964,7 @@ class Settings(BaseSettings):
             file_values = _read_structured_file(path)
 
         clean = {k: v for k, v in overrides.items() if v is not None}
-        with _file_values(file_values):
+        with _file_values(file_values), _ui_values(read_ui_settings()):
             return cls(**clean)
 
 

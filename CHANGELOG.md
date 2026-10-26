@@ -3,6 +3,322 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.4.0] - 2026-10-26
+
+This release is mostly about **not re-encoding**. The FFmpeg-free path now covers
+the two shapes of stream that exist in the wild, which matters because most
+radios already decode AAC - any set that receives DAB+ has to - so for them a
+re-encode was a second round of lossy encoding, 165% of a core, and a child
+process, all to produce a worse copy of bytes the radio could already play. The
+converter page finally uses the diagnostics the service always had, to say which
+engine a given station will get and to offer the URL that avoids FFmpeg when the
+service's own configuration is the only thing in the way. The configuration is
+also editable from the browser now, so tuning any of it no longer means editing a
+file and restarting.
+
+### Added
+
+- **The converter page checks the stream, not just the URL.** `/probe` was only
+  reachable by a script or by hand, which made it a feature nobody used - so
+  `GET /` now runs the identical inspection and prints the answer: the engine
+  that will be used, the container as measured from the bytes, the playlist and
+  segment shape, encryption, the real audio codec, and the elementary streams
+  found inside a transport stream. An engine verdict sits above the table in one
+  sentence (*"FFmpeg is not needed: the station's own audio is forwarded
+  untouched as ADTS"*), coloured only when there is something to act on. When
+  the stream *could* be forwarded but this service's `output_codec` prevents it,
+  the page prints the `?codec=` URL that avoids FFmpeg for that station -
+  the per-request form of the same choice, so it changes nothing for anybody
+  else listening.
+
+  The check is **opt-in** (`probe=1`, set by a checkbox that is ticked on a
+  first visit): it downloads a segment and runs FFmpeg, so a bare `?url=` still
+  renders instantly and touches no network at all. A station that cannot be
+  reached comes back as a sentence on the page rather than a 500 or a hang -
+  over an overall 20 s deadline, since those bounds are additive.
+
+  When the page offers the codec override it also says what that costs, because
+  the URL is only half the decision: the response stops being `audio/mpeg` and
+  becomes `audio/aac`, which is a header old Frontier Silicon firmware may not
+  accept (and may want spelled `audio/aacp`; `mime_override` sets it). A radio
+  that decodes only MP3 should keep the plain URL, where the price of doing so
+  is CPU rather than quality. Related, and now stated in one place: `codec=aac`
+  and `codec=adts` are **the same request**, not two codecs, so the page shows a
+  single spelling (`adts` - the container name, and the word its verdict
+  sentence already uses) and the README calls `aac` an alias rather than leaving
+  the two to look like a choice.
+
+- **A station that serves bare ADTS can now run with no FFmpeg at all.**
+  Pass-through was a PAT/PMT lookup, so it only ever applied to MPEG-TS
+  segments; a stream whose `.aac` segments are raw ADTS behind an ID3v2 tag
+  (Microsoft's `msvdn.net` CDN, among others) was re-encoded even when the
+  output codec was the source's own. `tsdemux.ElementaryStreamForwarder` fills
+  that gap: it drops each segment's ID3 tags, starts on a frame boundary and
+  keeps frames whole across segment boundaries, forwarding the source's own
+  bytes. Measured on a Raspberry Pi against a real station: `passthrough`
+  instead of a 165 %-of-a-core transcode, and the delivered stream decodes with
+  `ffmpeg -err_detect explode` and zero errors. Bare `.mp3` segments take the
+  same path. Song titles are unchanged - they are read from the removed tag and
+  delivered as ICY metadata.
+
+- `/probe` and `radioconv probe` now report **`passthrough_engine`** alongside
+  `passthrough_possible`/`passthrough_kind`. The first two describe the source;
+  the new one says whether the configured `output_codec` will actually use the
+  FFmpeg-free path, and the CLI prints how to switch (`output_codec = "adts"`)
+  when it will not.
+
+- **The settings are editable from the browser, on `/settings`.** The dashboard
+  has always listed the configuration and always had to add that it was
+  read-only - a table you can only look at, on the page where you most want to
+  change something. Twenty values (bitrate, output codec, forwarding,
+  pass-through, sample rate, channels, the listener limits, the pacing and
+  timeout knobs, `public_host`) now have a form; `host`, `port`, `log_level`,
+  `ffmpeg_path` and `cors_origins` stay in `config.toml` and are listed as such,
+  because changing a bind address from a web page is how you lose the page.
+
+  A change is **validated before it is applied**: the whole candidate
+  configuration is built and checked, so a rejected edit changes nothing in
+  memory, writes nothing, and comes back with the offending field marked and the
+  sentence explaining which rule it broke - and with every *other* edit still in
+  the boxes, since reverting twenty fields because one was wrong is how people
+  stop using a form.
+
+  It is then **persisted** to `ui-settings.json` in the config directory, merged
+  into whatever was saved before (so saving one field does not erase last
+  week's), written to a sibling file and renamed over the target - a power cut
+  mid-write would otherwise leave truncated JSON and a service that will not
+  start at all. A value that cannot take effect is *reported* rather than
+  claimed: `RADIOCONV_*` variables and command-line flags still outrank the
+  page, so the result says `Saved, but not in effect: bitrate.` and names the
+  reason. The precedence order is now defaults < `config.toml` < saved page
+  values < environment < flags.
+
+  Reaching a *running* station needs one more step, because a session copies its
+  settings at birth (its buffer, bitrate and jitter grid describe audio that is
+  already playing). The form offers **restart the stations playing now**, which
+  ends them so they rebuild - radios reconnect by themselves, which is what the
+  whole service already depends on - and says how many it ended.
+
+  `allow_ui_settings = false` locks the page: `GET` renders the values and
+  explains that the installation is read-only, and `POST` is refused with `403`
+  rather than silently doing nothing. The route parses
+  `application/x-www-form-urlencoded` itself with `parse_qsl`, capped at 16 KiB,
+  and refuses any other content type: `await request.form()` would reintroduce
+  the `python-multipart` dependency this project removed, and a multipart body
+  read as urlencoded yields boundary strings as field names.
+
+### Fixed
+
+- **Pass-through no longer overruns the radio** (reported as *"every few
+  seconds, it either repeats the last few seconds or else skips a few seconds"*,
+  on a station carrying AAC in a transport stream). Two measurements fed the
+  output pacer, and both were wrong by a few per cent or more:
+
+  1. **The rate was the download rate.** It was computed from `bytes_in`, and a
+     transport stream is mostly not audio: 188-byte packets, PAT/PMT tables, PES
+     headers and adaptation-field stuffing around every payload. Measured on the
+     station in question: 199 092 bytes per segment against 165 148 bytes of
+     elementary stream - **20 % overhead**. Together with (2) that is
+     159 kbit/s of pacing for audio that needs 128 kbit/s, i.e. 1.25 s of audio
+     handed over every second.
+  2. **The duration was the playlist's claim.** It came from `EXTINF`, which
+     said 10.0 s for a segment holding **10.325 s** of audio (HE-AAC: 1024
+     samples per frame at a 24 kHz core rate). That alone is 3 % fast, which
+     looks harmless in a short run and drains the jitter buffer in under three
+     minutes - after which every segment is followed by a gap, just like (1).
+
+  The jitter buffer absorbs either error for a few segments and then runs dry, so
+  each segment's bytes were followed by roughly two seconds of silence. That is
+  longer than the ~1.2 s a Frontier-Silicon radio tolerates, so it reconnects -
+  and a rejoin replays `handoff_overlap_seconds` (heard as a **repeat**) or
+  discards the queued backlog (heard as a **skip**).
+
+  Both figures are now measured on the audio that is actually being forwarded:
+  `bytes_out` for the rate, and a duration counted from the ADTS/MPEG frame
+  headers (`tsdemux.audio_duration`) - 1024 samples per ADTS frame at the
+  header's rate, 384/576/1152 per MPEG frame depending on layer and version. No
+  decoding, one header walk per segment. Transcoded output was never affected:
+  it uses the configured bitrate, which is exact.
+
+  Verified on the station by measuring a listener connection before and after:
+  pre-fix it was paced at 162 kbit/s for audio that needs 128 kbit/s and then
+  showed ~2 s holes per segment; post-fix it holds 130 kbit/s (the audio rate
+  plus the one-off startup burst) with no interval over 1 s across four minutes.
+
+- **A low-bitrate station is no longer delivered in one-second lumps** (reported
+  as *"constant repeating every few seconds"* on a ~64 kbit/s HE-AAC stream -
+  the same symptom as above, but caused by a different mistake, and far more
+  audible). The pacer was correct to the byte; what was wrong was the *shape* of
+  what it handed over. The unit it paces is a queue chunk of **8192 bytes**, and
+  a chunk is not a fixed amount of time: that is 0.34 s of audio at 192 kbit/s
+  but **1.02 s at 64 kbit/s**. The chunk was written in one piece, so the
+  listener got ~8 KiB at once and then nothing until the next chunk was due -
+  a burst followed by a ~1.1 s silence, repeating every second. That sits just
+  under the ~1.2 s a Frontier-Silicon radio tolerates, so it reconnected every
+  one to two seconds and each rejoin replayed `handoff_overlap_seconds`, heard
+  as a stutter that never stops. It went unnoticed for so long because at
+  128 kbit/s and above the same chunk is short enough (0.5 s or less) to pass.
+
+  Every chunk is now cut, at the measured output rate, into writes of at most
+  `MAX_WRITE_SECONDS` (0.25 s) of audio before it is paced and yielded
+  (`api.write_slices`) - the rate is measured, the write size is derived from
+  it, so the shape no longer depends on the station's bitrate. Nothing else
+  changes: the same bytes, the same schedule, one `bytes_sent`/throughput
+  update per write instead of per chunk. Pacing disabled (`pace_output = false`)
+  still writes chunks whole.
+
+  Verified on the station that reported it: a listener connection delivered
+  66 kbit/s with the longest silence **0.26 s** (was ~1.1 s) and 4.9 writes a
+  second, and on the Raspberry Pi a listener now holds for minutes instead of
+  seconds - `listener done after 0s` / `after 2s` reconnects are gone, the
+  jitter buffer sits flat at 6.1 s, and stalls, retransmit reconnects and
+  dropped chunks all stay at zero.
+
+- **A radio that loses power is no longer counted as listening for a quarter of
+  an hour** (reported as *"the server keeps thinking that the radio is
+  listening ... `dropped` keeps accumulating, but it keeps the stream active for
+  a very long time, like 15 minutes"*). Nothing here had a long timeout. A
+  powered-off radio sends no FIN, so the connection stays `ESTABLISHED` from
+  the kernel's point of view and TCP retransmits into the void until
+  `tcp_retries2` gives up - fifteen attempts, **about 15 minutes**. That is a
+  system-wide kernel figure, and the per-socket alternative (`TCP_USER_TIMEOUT`)
+  can only be set on a socket ASGI never hands to the application.
+
+  The reason it went unnoticed is narrower, and is the actual defect: the stall
+  watchdog runs **between** writes, so it catches a listener with an empty buffer
+  but can never fire while the write itself is what is stuck - which is exactly
+  what happens once the socket's send buffer fills. So the response generator sat
+  in one `await` until the kernel gave up, holding a listener and a capacity
+  slot, while the audio produced for it piled into a bounded queue and overflowed
+  it: the `dropped` counter climbing, second after second, on behalf of a radio
+  that was off.
+
+  The application can bound its own write, so it now does. `_ListenerStream`
+  puts a deadline (`listener_write_timeout`, 30 s by default, 0 = off) on each
+  socket write; when one expires the listener is unsubscribed immediately and the
+  response ends, which makes the server close the socket. 30 s is deliberately
+  far above the measured 2.8 s of stall a congested Wi-Fi link absorbs inside the
+  kernel before the application sees a blocked write at all, so a slow-but-alive
+  radio is unaffected - and it is thirty times shorter than waiting for the
+  kernel. The one visible cost is the server's own
+  `ASGI callable returned without completing response` line, which is how an
+  ASGI response asks for its connection to be closed: it is preceded by this
+  service's explanation, and a guard pins that the response does *not* claim to
+  be complete, because that would keep a dead connection alive instead.
+
+  Verified against a real socket - a client that requests the stream and then
+  never reads, which is what a power cut looks like: the listener disappeared at
+  exactly the deadline (6 s in the test configuration) instead of at the kernel's
+  15 minutes.
+
+- **FFmpeg is no longer a hard requirement** - it stays *required by default*,
+  and can now be switched off with `radioconv serve --no-ffmpeg` (or
+  `ffmpeg_enabled = false`). Plenty of radios decode AAC, and for those a
+  re-encode is pure waste: CPU, memory and a child process per station, to
+  produce a stream that is worse than the one the station already broadcasts.
+  With it off, no child process is ever started and the binary is not even
+  looked for, so the service also runs where FFmpeg cannot be installed at all.
+
+  What changes is not the same service with fewer features, it is a service with
+  one engine. `output_codec` and `?codec=` are ignored, because there is nothing
+  to encode with: every stream is served in whatever codec the station uses,
+  which is exactly the same thing as appending `?codec=auto` to every URL. That
+  translation lives in one property (`Settings.effective_output_codec`) rather
+  than at each decision site, because there are six of them - the engine, the
+  `Content-Type`, the probe report, the two pages, the session key - and a site
+  that forgot it would contradict the rest. The session key is included on
+  purpose: keying a pipeline on a `?codec=` that cannot change anything would
+  give two radios on one station two downloads of byte-identical audio.
+
+  The honest cost is a smaller set of playable stations, so the failure is
+  explicit rather than audible. A station that cannot be forwarded (fMP4, or a
+  transport stream with no MP3/ADTS audio) is refused with a `503`, a sentence
+  naming the reason, and a `Retry-After` - not the `200 audio/mpeg` followed by
+  silence this project has shipped before. The refusal is possible because the
+  effective codec is `auto` there, so the response already waits for the
+  pipeline's verdict before its headers go out; the listener is unsubscribed
+  explicitly, since a request refused before the response exists has no response
+  generator to run its cleanup. The generic "all 1 source URL(s) failed" wrapper
+  now carries the reason with it; it used to replace the one sentence anybody
+  could act on.
+
+  The UI reports it in the places it matters. The converter page carries a
+  standing notice whenever FFmpeg is off - above the form, outside the opt-in
+  diagnostics, because it changes what every URL on that page means and the
+  person most likely to be confused never ticks the checkbox. A station's
+  verdict says *"This stream needs re-encoding and FFmpeg is disabled"* with the
+  reason, rather than claiming a transcode that cannot happen. The dashboard's
+  encoder rows report the effective values, since "Output codec: mp3" over a
+  stream that is all forwarded AAC is the figure somebody would quote when the
+  audio sounds wrong. `/probe` gained `ffmpeg_enabled`, its `audio` row falls
+  back to the container the demuxer already identified instead of running a
+  binary that is off, and `radioconv check` reports FFmpeg as *disabled* rather
+  than failing - it exits 1 on any failed row, and it is the command somebody
+  runs precisely when something is wrong.
+
+  A contradictory configuration (`--no-ffmpeg` with `--no-passthrough`) is
+  refused at startup rather than discovered as silence on a radio, and the
+  engine decision does not depend on that validator having run: it is reachable
+  without validation through `model_copy`, which is how per-request overrides
+  are applied.
+
+### Repo
+
+- `scripts/verify-playback-guards.py` had a stale mutation pattern for the
+  pacer (`if delay <= 0:` gained a comment when the last-delivery stamp was
+  added in 2.3.2), so the script aborted before checking anything. Fixed; it
+  catches all 35 reintroduced defects again, including the two that produced the
+  2.4.0 pacing fix, the one that reintroduces whole-chunk writes, the three that
+  let a powered-off radio be waited on, the two that send an AAC station to an
+  engine that does not exist, and the two that serve an unproducible stream as a
+  silent `200` or leak its listener.
+- `scripts/verify-web-guards.py` gained three cases for the converter page's
+  check - believing `passthrough_possible` instead of `passthrough_engine`,
+  offering a codec override that cannot remove FFmpeg, and running the
+  inspection when it was not asked for - and two for the FFmpeg-disabled
+  install: promising a transcode that cannot happen, and making the standing
+  notice opt-in. It catches all 25 now. A third case there - refusing the
+  `codec=` offer on an FFmpeg-free install - was written, went green, and was
+  deleted: `_engine` only ever reports a codec to override when a *transcode*
+  could be turned into a forward, so the guard was protecting a clause that
+  could not be reached. The guard script is what found that, which is the
+  reason it exists.
+- README and CONTRIBUTING explain the two forwardable source shapes and why the
+  page reports the engine rather than the source. README gained a *Running
+  without FFmpeg* section with the enabled/disabled comparison, since the
+  trade-off is the whole decision.
+- `scripts/verify-web-guards.py` gained eight cases for the settings page -
+  accepting a submit while the page is locked, accepting a body it cannot parse,
+  reading an unbounded body, overwriting a pinned value, reporting a restart it
+  did not perform, writing the file in place, and re-rendering a rejected submit
+  from the stored settings instead of from what was typed - and now names the
+  test module per case, so a settings test cannot be "proved" by a page test
+  that happens to fail. Thirty-three guards, all of which go red on demand. Two
+  of the first drafts guarded nothing: one mutated `_pinned` in a line that the
+  next line immediately rebuilt from `_env_pins()`, and one asserted `0` only
+  after still calling `retire_all`, so a reply-only test could not tell the
+  difference. Both were retargeted, and the restart case gained an in-process
+  test that registers a real session and checks the manager, since that is the
+  half a socket-level test cannot see.
+- README was rewritten around what this release is actually for: *Most radios
+  need no transcoding*, with the DAB+ argument (a set that receives DAB+ already
+  has an AAC decoder, so the network player usually needs no help), the measured
+  cost of the two engines side by side, and the firmware caveats that are the
+  real risk. It gained a *Who this is for* section, because "turn HLS into MP3"
+  reads as a media server to people who want a media server, and is not one.
+  The two old sections that both explained the FFmpeg-free path were merged into
+  one, which is what kept it inside its 400-line budget - the length guard is a
+  test, so trimming rather than raising it was the point.
+- `docs/dashboard.png`, `docs/landing-page.png` and a new `docs/settings.png`
+  were recaptured on the Pi against 2.4.0. The old pair dated from 2.0.0 and
+  showed the read-only configuration table, the *"fixed for the life of the
+  process"* note, and a transcoded station - every one of which this release
+  changed.
+- `tests/test_session.py`'s `fast_settings` whitelists its overrides, so a
+  setting it does not name is silently dropped - which made the new
+  `ffmpeg_enabled` test pass while exercising the default install. Fixed, and
+  the helper now says so.
+
 ## [2.3.2] - 2026-10-22
 
 2.3.1 fixed the self-repair, and the repair worked. It also introduced a

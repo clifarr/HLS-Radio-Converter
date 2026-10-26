@@ -74,6 +74,10 @@ def test_every_serve_flag_is_actually_read():
         "max_sessions": 3,
         "max_listeners_per_session": 5,
         "ffmpeg_path": "/usr/bin/ffmpeg",
+        # Not given in FULL_SERVE_ARGV: `--no-ffmpeg` contradicts
+        # `--no-passthrough` (see Settings._check_engine_combination), so the
+        # two cannot appear on one command line. It is covered on its own below.
+        "ffmpeg_enabled": None,
         "user_agent": "test-agent",
         "referer": "https://example.com/",
         "linger_seconds": 12.5,
@@ -89,12 +93,42 @@ def test_every_serve_flag_is_actually_read():
 
     # ...and every one of those names must be a real Settings field, so a typo
     # cannot hide behind pydantic's "ignore extra" behaviour.
-    settings = Settings(**overrides)
+    #
+    # Through `Settings.load`, exactly as `cmd_serve` does it: the overrides
+    # table legitimately carries `None` for every flag that was not given (that
+    # is what lets a config file or an environment variable win), and `load`
+    # is the thing that drops them. Constructing `Settings(**overrides)` here
+    # would test a path the service never takes - and now fails on it, because
+    # `ffmpeg_enabled` is a plain bool and cannot accept `None`.
+    settings = Settings.load(None, **overrides)
     assert settings.output_codec == "adts"
     assert settings.prefer_passthrough is False
     assert settings.mime_override == "audio/mpeg3"
     assert settings.sample_rate == 44100
     assert settings.cors_list == ["http://a", "http://b"]
+
+
+def test_no_ffmpeg_is_opt_in_and_absence_changes_nothing():
+    """FFmpeg stays required unless somebody says otherwise, and then it is off.
+
+    ``default=None`` rather than ``True`` is what lets a config file or
+    ``RADIOCONV_FFMPEG_ENABLED`` decide: a ``store_false`` whose default was
+    ``True`` would silently overrule both, and the flag would appear to work
+    while quietly resetting a deliberate configuration every time the service
+    started from the command line.
+    """
+    bare = cli._serve_overrides(cli.build_parser().parse_args(["serve"]))
+    assert bare["ffmpeg_enabled"] is None, "a bare serve must not decide this"
+    assert Settings().ffmpeg_enabled is True, "FFmpeg must stay required by default"
+
+    off = cli._serve_overrides(cli.build_parser().parse_args(["serve", "--no-ffmpeg"]))
+    assert off["ffmpeg_enabled"] is False
+
+    settings = Settings.load(None, **off)
+    assert settings.ffmpeg_enabled is False
+    # ...and the whole point: the codec becomes "whatever the station sends".
+    assert settings.effective_output_codec == "auto"
+    assert settings.output_codec == "mp3", "the configured value is kept, not rewritten"
 
 
 def test_defaults_do_not_override_anything():

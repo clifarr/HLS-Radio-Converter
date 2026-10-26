@@ -186,13 +186,35 @@ def test_readme_documents_the_api_control_parameters():
     assert "/docs" in readme, "the generated reference should be discoverable"
 
 
-def test_readme_does_not_advertise_the_removed_post_endpoint():
-    """`POST /` was removed: it needed python-multipart and contradicted its label."""
+def test_no_page_needs_a_multipart_parser():
+    """A form POST must not cost a dependency, and the converter must stay a GET.
+
+    `POST /` was removed once already: it contradicted its own label (the page
+    explains that no request body is parsed) and it needed ``python-multipart``.
+    The settings page is the one place a body is now read, and it reads it with
+    ``parse_qsl`` so the dependency is still not required - which matters on a
+    Raspberry Pi, and matters more on 32-bit ARM where every extra package is a
+    wheel that may not exist.
+
+    Asserted as the *dependency* rather than as "no @app.post anywhere": the
+    latter was how this was written, and it would forbid the settings page for a
+    reason that no longer applies. The premise that still holds is that a form
+    must not drag in a parser.
+    """
+    pyproject = _read("pyproject.toml")
+    assert "python-multipart" not in pyproject, (
+        "a multipart parser is not needed: the only form is urlencoded"
+    )
     readme = _read("README.md")
     assert "POST /" not in readme
-    assert 'method="post"' not in readme
-    api = _read("src/radioconv/api.py")
-    assert "@app.post" not in api, "the POST form handler should be gone, not dormant"
+    assert 'method="post"' not in readme, "the converter page is still a plain GET form"
+
+    # No textual check for the call: the module explains *why* it avoids that
+    # helper, so the string appears in a comment and a grep would fail on the
+    # explanation rather than on the code. What replaces it is a test that
+    # actually submits the settings form with nothing but a urlencoded body
+    # installed (tests/test_settings.py), which fails if the parser is ever
+    # needed.
 
 
 def test_docs_have_no_broken_internal_links():

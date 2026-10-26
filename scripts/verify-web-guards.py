@@ -33,6 +33,10 @@ class Case(NamedTuple):
     find: Optional[str]
     replace: str
     test: str
+    #: Which test module holds ``test``. The page tests live in one file and the
+    #: settings-page tests in another; naming the wrong one would silently look
+    #: like a guard that fires for the wrong reason, so it is explicit.
+    test_file: str = "tests/test_web_ui.py"
 
 
 CASES: List[Case] = [
@@ -232,10 +236,176 @@ CASES: List[Case] = [
         'document.addEventListener("scroll", hideAll, { passive: true, capture: true });',
         "test_the_description_follows_its_trigger_when_the_page_scrolls",
     ),
+    # ---- the converter page's stream check. The whole feature is a judgement
+    # call about which of two similar fields to believe, and the wrong one reads
+    # perfectly plausibly - so each way of getting it wrong is reintroduced.
+    Case(
+        # `passthrough_possible` says "no FFmpeg needed" about the *source*, and
+        # that is false whenever the output codec differs - which is exactly the
+        # case where a reader needs the truth. Believing it is the confusion the
+        # page exists to remove, so the page must not be able to have it.
+        "the verdict believes the source instead of the engine",
+        PKG / "web.py",
+        'if result.get("passthrough_engine") and kind:',
+        'if result.get("passthrough_possible") and kind:',
+        "test_the_verdict_reports_the_engine_not_the_source",
+    ),
+    Case(
+        # A dead end: a codec override cannot help a stream with nothing
+        # forwardable in it, so offering one wastes the reader's time and makes
+        # the advice untrustworthy where it does work.
+        "the page suggests a codec override that cannot help",
+        PKG / "web.py",
+        '    if not engine or not engine.get("kind") or not encoded:',
+        "    if not engine or not encoded:",
+        "test_the_verdict_says_when_ffmpeg_is_simply_required",
+    ),
+    Case(
+        # The check costs a segment download and an FFmpeg probe. Making it
+        # implicit would slow down the page every radio owner bookmarks and
+        # reach out to a third party's CDN for a URL that was only being
+        # converted.
+        "the page inspects the stream without being asked",
+        PKG / "api.py",
+        'if probe and target.startswith(("http://", "https://")):',
+        'if target.startswith(("http://", "https://")):',
+        "test_a_bare_url_never_touches_the_network",
+    ),
+    # ---- ffmpeg is optional. Three ways the pages can lie about it.
+    Case(
+        # With FFmpeg disabled there is no second engine, so "FFmpeg re-encodes
+        # it" describes a process that cannot start. Guarding the disabled branch
+        # itself is the point: an edit that dropped it would fall through to the
+        # transcode verdict, which is the sentence that was wrong before.
+        "the page promises a transcode on an installation that has no ffmpeg",
+        PKG / "web.py",
+        "    if not settings.ffmpeg_enabled:\n        # No second engine exists here",
+        "    if False:\n        # No second engine exists here",
+        "test_with_ffmpeg_disabled_an_unplayable_stream_says_exactly_that",
+    ),
+    Case(
+        # The notice has to be outside the opt-in diagnostics block: it changes
+        # what every URL on the page means, including for somebody who never
+        # ticks the checkbox - the person most likely to be baffled by a station
+        # that will not play.
+        "the ffmpeg-disabled notice becomes opt-in with the check",
+        PKG / "templates" / "index.html",
+        "{% if not ffmpeg_enabled %}",
+        "{% if not ffmpeg_enabled and probe %}",
+        "test_the_notice_about_ffmpeg_appears_without_asking_for_a_check",
+    ),
+    # ---- the settings page. One case per promise it makes.
+    Case(
+        # The page is a write endpoint on a service that anyone on the LAN can
+        # reach. `allow_ui_settings` is the only thing standing between a
+        # dashboard the owner trusts and one anybody can reconfigure, so the
+        # guard must bite at the route and not merely grey out the inputs: a
+        # disabled input is a hint to a browser, not a rule.
+        "the locked settings page still accepts a submit",
+        PKG / "api.py",
+        "    if not current.allow_ui_settings:",
+        "    if False:",
+        "test_the_write_is_refused_when_the_page_is_locked",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # `request.form()` would need python-multipart, which this project
+        # deliberately does not depend on. Accepting any content type is how you
+        # end up reaching for it: a multipart body parsed as urlencoded yields
+        # field names like '------WebKitFormBoundary...' and nothing else.
+        "the settings form accepts a body it cannot parse",
+        PKG / "api.py",
+        '    if not content_type.startswith("application/x-www-form-urlencoded"):',
+        "    if False:",
+        "test_the_form_accepts_nothing_but_a_urlencoded_body",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # Called out because the alternative is reading an unbounded body into
+        # memory on a 512MB Pi. The declared length is a hint from the client, so
+        # the byte count is checked again after reading - breaking the constant
+        # removes both checks at once, which is the point.
+        "an unbounded form body is read anyway",
+        PKG / "api.py",
+        "MAX_FORM_BYTES = 16 * 1024",
+        "MAX_FORM_BYTES = 16 * 1024 * 1024",
+        "test_an_oversized_body_is_refused_rather_than_read",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # A value pinned by the command line or the environment wins over the
+        # page. Forgetting that is not a cosmetic bug: the page would report a
+        # change that the next restart silently reverts, which is the sort of
+        # thing discovered weeks later as "the setting keeps going back".
+        #
+        # The break is in `apply`, not in the constructor: emptying `_pinned`
+        # there would be undone by the `_env_pins()` line under it, which is a
+        # mutation that changes nothing and would guard nothing.
+        "a value pinned by the environment is quietly overwritten",
+        PKG / "config.py",
+        "        merged = {**self._settings.model_dump(), **clean, **self._pinned}",
+        "        merged = {**self._settings.model_dump(), **clean}",
+        "test_a_value_pinned_by_the_environment_is_reported_rather_than_claimed",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # "Apply to the stations playing now" is the only part of a save that
+        # touches a live radio, and it is the radio that suffers if it is skipped:
+        # the page says the change took effect while every existing listener keeps
+        # the old settings for the life of its session.
+        #
+        # Aimed at the *count*, not the call: `restarted = 0` still calls
+        # `retire_all`, so a test that only looks at the reply could not tell the
+        # difference. The page must report the manager's number, not its own.
+        "applying a change leaves the running stations on the old settings",
+        PKG / "api.py",
+        '            restarted = manager.retire_all("settings changed from the web page")',
+        "            restarted = 0",
+        "test_restart_ends_the_stations_that_are_playing",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # A half-written file is a service that will not start, so the write goes
+        # to a sibling and is renamed over the target. The observable promise is
+        # the one a power cut tests: the file on disk is either the old content or
+        # the new one, never a truncated JSON document. Breaking the *rename* is
+        # what makes that visible; the test reads the file back through
+        # `Settings.load()`, which is what the next process does.
+        "the settings file is written in place",
+        PKG / "config.py",
+        "        temporary.replace(path)",
+        '        path.write_text(temporary.read_text(encoding="utf-8")[:5], encoding="utf-8")',
+        "test_the_change_survives_a_restart",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # The dashboard's old read-only table claimed settings were "fixed for the
+        # life of the process". That sentence is still true of a running station
+        # and false of the service, and the page must not repeat it now that the
+        # settings are editable - it is the single line that made the table
+        # useless.
+        "the dashboard claims settings cannot be changed",
+        PKG / "templates" / "dashboard.html",
+        "Runtime settings can be changed on the",
+        "These are fixed for the life of the process. Runtime settings can be changed on the",
+        "test_the_dashboard_points_at_the_settings_page_instead_of_claiming_immutability",
+    ),
+    Case(
+        # Re-rendering a rejected submit from the *stored* settings throws away
+        # every other edit in the form, which is how one bad number costs twenty
+        # good ones. It also makes the red message look like it condemns values
+        # that were never the problem.
+        "a rejected submit is re-rendered from the stored settings",
+        PKG / "api.py",
+        "                problems=problems,\n                submitted=form,",
+        "                problems=problems,",
+        "test_a_rejected_submit_keeps_what_was_typed",
+        "tests/test_settings.py",
+    ),
 ]
 
 
-def run(test: str) -> Tuple[str, int]:
+def run(case: Case) -> Tuple[str, int]:
     """Run one test; return pytest's summary line *and* its exit code.
 
     The exit code is the verdict; the summary is only for the log. It is
@@ -249,7 +419,7 @@ def run(test: str) -> Tuple[str, int]:
     # external input - which is the same justification as verify-linters-work.py.
     uv = shutil.which("uv") or "uv"
     proc = subprocess.run(  # noqa: S603
-        [uv, "run", "pytest", "-q", f"tests/test_web_ui.py::{test}"],
+        [uv, "run", "pytest", "-q", f"{case.test_file}::{case.test}"],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -297,7 +467,7 @@ def main() -> int:
             print(f"ERROR: {exc}")
             return 2
         try:
-            result, code = run(case.test)
+            result, code = run(case)
             went_red = code != 0
         finally:
             restore(case, existed, original)

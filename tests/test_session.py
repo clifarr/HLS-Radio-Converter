@@ -66,7 +66,13 @@ def fake_pipeline(monkeypatch):
 
 
 def fast_settings(**overrides) -> Settings:
-    """Short timeouts keep the session tests quick and deterministic."""
+    """Short timeouts keep the session tests quick and deterministic.
+
+    This list is a whitelist, so a setting that is not named here is silently
+    *dropped* - which is how the ``ffmpeg_enabled`` case below first appeared to
+    pass: the override never reached `Settings`, so the test exercised the
+    default install while claiming to test the other one.
+    """
     return Settings(
         linger_seconds=overrides.get("linger_seconds", 0.3),
         queue_chunks=overrides.get("queue_chunks", 4),
@@ -75,6 +81,7 @@ def fast_settings(**overrides) -> Settings:
         max_sessions=overrides.get("max_sessions", 2),
         handoff_overlap_seconds=overrides.get("handoff_overlap_seconds", 1.5),
         max_listeners_per_session=overrides.get("max_listeners_per_session", 2),
+        ffmpeg_enabled=overrides.get("ffmpeg_enabled", True),
     )
 
 
@@ -226,6 +233,30 @@ async def test_bitrate_override_makes_a_separate_session():
             "http://x/one.m3u8", ["http://x/one.m3u8"], overrides={"bitrate": 96_000}
         )
         assert len(manager.sessions) == 2
+    finally:
+        await manager.aclose()
+
+
+async def test_with_ffmpeg_disabled_a_codec_override_does_not_split_the_pipeline():
+    """Every stream is the source's own codec, so the key must say so.
+
+    Two radios on one station, one with ``?codec=mp3`` and one without: with
+    FFmpeg off they receive byte-identical audio. Keying the session on the
+    override would give them two pipelines - two upstream downloads, two
+    buffers, double the CPU - which is precisely what a shared session exists to
+    avoid.
+    """
+    settings = fast_settings(max_sessions=4, ffmpeg_enabled=False)
+    manager = SessionManager(settings)
+    await manager.start()
+    try:
+        first, _ = await manager.subscribe("http://x/one.m3u8", ["http://x/one.m3u8"])
+        second, _ = await manager.subscribe(
+            "http://x/one.m3u8", ["http://x/one.m3u8"], overrides={"output_codec": "mp3"}
+        )
+        assert first is second, "the codec override split a shared pipeline"
+        assert len(manager.sessions) == 1
+        assert first.key.endswith("|auto|192000"), first.key
     finally:
         await manager.aclose()
 

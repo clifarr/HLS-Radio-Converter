@@ -240,7 +240,17 @@ def build_command(settings: Settings, input_format: str, *, copy_audio: bool = F
     So ``-acodec copy`` is only used when the source really is the codec
     being asked for. An MP3 source going to an ADTS output is *encoded* to
     AAC, which is the only way to produce a valid ADTS stream from MP3.
+
+    Raises :class:`FFmpegNotFound` when the installation has FFmpeg switched off
+    entirely. That is not a redundant check: the pipeline is supposed to have
+    decided not to come here, and this is the gate that makes "no child process
+    was started" a property of the code rather than a promise about its callers.
     """
+    if not settings.ffmpeg_enabled:
+        raise FFmpegNotFound(
+            "FFmpeg is disabled on this installation (ffmpeg_enabled = false), so no "
+            "command can be built - the stream has to be forwarded untouched instead"
+        )
     binary = locate_ffmpeg(settings.ffmpeg_path)
     fmt = INPUT_FORMATS.get(input_format)
     want_adts = settings.output_codec == "adts"

@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import time
 from html.parser import HTMLParser
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -508,6 +509,7 @@ def test_the_header_marks_which_page_you_are_on(live_server):
     pages = {
         "/": "Converter",
         web.DASHBOARD_URL: "Dashboard",
+        web.SETTINGS_URL: "Settings",
     }
     for path, label in pages.items():
         body = httpx.get(live_server + path, timeout=10).text
@@ -1148,6 +1150,35 @@ def test_index_page_links_to_the_dashboard(live_server):
     assert f'href="{web.DASHBOARD_URL}"' in body
 
 
+def test_the_dashboard_points_at_the_settings_page_instead_of_claiming_immutability(
+    live_server,
+):
+    """The old Configuration table was read-only, and said so as if that were normal.
+
+    It listed every setting with the note "these are fixed for the life of the
+    process" - true at the time, and the reason it was useless: the one question
+    somebody has while staring at a live figure is whether they can change it, and
+    the answer was always no. The figures that matter *while watching* stay; the
+    claim of immutability does not.
+    """
+    body = httpx.get(live_server + web.DASHBOARD_URL, timeout=10).text
+
+    assert f'href="{web.SETTINGS_URL}"' in body, "the settings page is not reachable from here"
+    assert "fixed for the life of the process" not in body, (
+        "the dashboard still claims settings cannot be changed"
+    )
+    # The eight-settings table is gone; what remains is the handful of figures a
+    # reader actually needs beside the live numbers.
+    assert body.count("<tr><th>") <= 6, "the full configuration table came back"
+
+
+def test_the_settings_page_is_not_the_legacy_wildcard_route(live_server):
+    """``/{encoded_url:path}`` matches everything, so /settings must be claimed."""
+    response = httpx.get(live_server + web.SETTINGS_URL, timeout=10)
+    assert response.status_code == 200
+    assert "expected /<percent-encoded m3u8 URL>" not in response.text
+
+
 def test_both_pages_ask_the_script_for_the_same_endpoint(live_server):
     """One endpoint, two views of it - not two endpoints that can disagree."""
     for path in ("/", web.DASHBOARD_URL):
@@ -1166,6 +1197,185 @@ def test_the_pages_escape_what_the_user_typed(live_server):
     body = httpx.get(live_server + "/", params={"url": nasty}, timeout=10).text
     assert "<script>alert(1)</script>" not in body, "the echoed URL was not escaped"
     assert "&lt;script&gt;" in body, "expected the escaped form of the input"
+
+
+# -------------------------------------------------- the page's engine verdict
+def _engine(*, ok=True, kind=None, engine=None, container="ts"):
+    """A minimal ``hls.inspect()`` result, as the route hands it to the page."""
+    return {
+        "url": "https://example.com/x.m3u8",
+        "ok": ok,
+        "container": container,
+        "segment_container": container,
+        "passthrough_possible": kind is not None,
+        "passthrough_kind": kind,
+        "passthrough_engine": engine if engine is not None else False,
+        "error": None if ok else "connection refused",
+        "is_master": False,
+        "encrypted": False,
+        "segment_count": 3,
+        "target_duration": 2.0,
+        "audio": {"codec": "aac", "profile": "LC", "sample_rate": 48000, "channels": 2},
+    }
+
+
+def test_the_verdict_reports_the_engine_not_the_source():
+    """`passthrough_possible` is not the answer to "is FFmpeg running?".
+
+    Reported confusion, twice: the CLI prints "passthrough : True (adts)" for a
+    station that the service is busy re-encoding, because forwarding an AAC
+    source cannot produce the MP3 that ``output_codec = "mp3"`` asks for. A page
+    that repeated that would be worse than no page, so the verdict is built from
+    ``passthrough_engine`` and the source codec decides only what to *suggest*.
+    """
+    mp3 = Settings(output_codec="mp3")
+
+    forwarded = _page_body(mp3, _engine(kind="adts", engine=True))
+    assert "pass-through" in forwarded
+    assert "FFmpeg is not needed" in forwarded
+
+    re_encoded = _page_body(mp3, _engine(kind="adts", engine=False))
+    assert "FFmpeg is not needed" not in re_encoded, "the page claimed no FFmpeg while using it"
+    assert "codec=adts" in re_encoded.replace("&amp;", "&"), (
+        "the one actionable case - a stream that could be forwarded - must "
+        "offer the URL that does it"
+    )
+
+
+def test_the_verdict_says_when_ffmpeg_is_simply_required():
+    """No forwarding is possible: say so plainly, and suggest nothing."""
+    body = _page_body(Settings(), _engine(kind=None, engine=False, container="mp4"))
+
+    assert "fMP4" in body, "it should name the reason, not just the outcome"
+    assert "avoids FFmpeg" not in body, (
+        "a codec override cannot remove FFmpeg for a stream it cannot forward, "
+        "so offering one is a dead end"
+    )
+
+
+def test_with_ffmpeg_disabled_an_unplayable_stream_says_exactly_that():
+    """No second engine exists, so the verdict must not promise one.
+
+    On an installation started with ``--no-ffmpeg`` there is nothing to
+    re-encode *with*. A page that said "FFmpeg re-encodes it" would describe a
+    process that cannot start, and one that offered a ``?codec=`` URL would
+    point at the only behaviour the service already has - a dead end dressed up
+    as a fix. The honest answer is that this station cannot be played here, why,
+    and which switch turns it back on.
+    """
+    off = Settings(ffmpeg_enabled=False)
+
+    body = _page_body(off, _engine(kind=None, engine=False, container="mp4"))
+
+    assert "FFmpeg is disabled" in body, "the page must name the real cause"
+    assert "fMP4" in body, "and the reason this particular stream cannot be forwarded"
+    # The *verdict* phrasings, not any mention of transcoding: the table's
+    # hover text explains what "transcode" means in general, which is correct
+    # on any installation.
+    assert "FFmpeg has to be used" not in body, (
+        "the page claimed a transcode on an installation that cannot transcode"
+    )
+    assert "is set to output" not in body, (
+        "the page suggested changing output_codec, which cannot help here"
+    )
+    assert "codec=adts" not in body and "codec=mp3" not in body, (
+        "a ?codec= URL cannot help here: every request already behaves that way"
+    )
+
+
+def test_with_ffmpeg_disabled_a_playable_stream_is_reported_as_good():
+    """The point of the feature: this station costs nothing and the page says so."""
+    off = Settings(ffmpeg_enabled=False)
+    body = _page_body(off, _engine(kind="adts", engine=True))
+
+    assert "pass-through" in body
+    assert "FFmpeg is not needed" in body
+    assert "FFmpeg is off on this installation" in body, (
+        "the standing notice about the installation must still be shown"
+    )
+
+
+def test_the_notice_about_ffmpeg_appears_without_asking_for_a_check():
+    """It changes what every URL on the page means, so it cannot be opt-in.
+
+    The diagnostics are opt-in because they download a segment; this sentence
+    costs nothing and applies to somebody who never ticks the box - the person
+    most likely to be confused when a station turns out to be unplayable.
+    """
+    request = SimpleNamespace(headers={}, url=SimpleNamespace(query=""))
+    off = bytes(
+        web.index_page(Settings(ffmpeg_enabled=False), request).body  # ty: ignore[invalid-argument-type]
+    ).decode()
+    on = bytes(web.index_page(Settings(), request).body).decode()  # ty: ignore[invalid-argument-type]
+
+    assert "FFmpeg is off on this installation" in off
+    assert "FFmpeg is off on this installation" not in on, (
+        "a normal install must not carry a warning about a setting it does not have"
+    )
+
+
+def test_a_failed_check_is_a_sentence_and_no_table():
+    """Nothing was measured, so there is nothing to tabulate."""
+    body = _page_body(Settings(), _engine(ok=False))
+
+    assert "Could not check this stream" in body
+    assert "<table" not in body, "an empty table under an error reads as a broken page"
+
+
+def _page_body(settings: Settings, probe: dict) -> str:
+    """The converter page, rendered with *probe* as if the route had fetched it.
+
+    A stand-in request rather than a live one: the point under test is the
+    verdict and the rows, and a real request would need a running server plus a
+    station. ``web.base_url`` reads exactly ``headers`` and ``url.query``, so
+    that is what the double provides - and it is typed loosely because it is
+    deliberately not a Starlette ``Request``.
+    """
+    request = SimpleNamespace(headers={}, url=SimpleNamespace(query=""))
+    response = web.index_page(
+        settings,
+        request,  # ty: ignore[invalid-argument-type]
+        "https://example.com/x.m3u8",
+        probe=probe,
+    )
+    return bytes(response.body).decode()
+
+
+def test_a_bare_url_never_touches_the_network(live_server, monkeypatch):
+    """`?url=` alone must stay instant: it converts, it does not investigate.
+
+    The check downloads a segment and runs FFmpeg, so making it implicit would
+    turn the page every radio owner bookmarks into a multi-second request that
+    reaches out to somebody else's CDN - and it would do so for a URL that was
+    only being converted. It is opt-in, and this is the guard that keeps it that
+    way: the page must render with the inspector broken outright.
+    """
+    from radioconv import hls as hls_mod
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("the converter page inspected the stream without being asked")
+
+    monkeypatch.setattr(hls_mod, "inspect", _boom)
+
+    response = httpx.get(
+        live_server + "/", params={"url": "https://example.com/live/index.m3u8"}, timeout=10
+    )
+    assert response.status_code == 200
+    assert "Stream check" not in response.text
+
+
+def test_probe_does_not_run_for_a_url_that_is_not_http(live_server, monkeypatch):
+    """Garbage in the box is answered instantly, without a request upstream."""
+    from radioconv import hls as hls_mod
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("inspected something that is not an http(s) URL")
+
+    monkeypatch.setattr(hls_mod, "inspect", _boom)
+
+    body = httpx.get(live_server + "/", params={"url": "not-a-url", "probe": "1"}, timeout=10).text
+    assert "does not look like a stream URL" in body
+    assert "Stream check" not in body
 
 
 # -------------------------------------------------------------------- metrics

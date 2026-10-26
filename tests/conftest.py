@@ -18,10 +18,11 @@ import socketserver
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, ClassVar, Tuple
 
 import pytest
 import uvicorn
@@ -250,6 +251,85 @@ def _free_port() -> int:
     port = probe.getsockname()[1]
     probe.close()
     return port
+
+
+@contextmanager
+def serving(settings: Settings) -> Generator[str, None, None]:
+    """Run the real app under a real uvicorn on a free port; yield its base URL.
+
+    A context manager rather than a fixture because the settings are the thing
+    under test: ``live_server`` deliberately uses one configuration for the whole
+    module, and a test about *configuration* needs its own instance. Written once
+    here so the third such test does not hand-roll a fourth copy of the uvicorn
+    dance - and gets the free port, the readiness wait and the shutdown wrong.
+    """
+    port = _free_port()
+    configured = settings.model_copy(
+        update={"port": port, "host": "127.0.0.1", "log_level": "WARNING"}
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_app(configured),
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+            loop="asyncio",
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 20
+    while time.time() < deadline and not server.started:
+        time.sleep(0.05)
+    if not server.started:  # pragma: no cover - only on a broken environment
+        raise AssertionError("uvicorn did not start")
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=15)
+
+
+class _CannedHandler(http.server.BaseHTTPRequestHandler):
+    """Serves fixed bytes per path, so a container can be offered without ffmpeg.
+
+    ``routes`` is a class attribute rather than a constructor argument because
+    ``http.server`` builds the handler itself; ``partial`` cannot reach a keyword
+    the handler does not accept.
+    """
+
+    routes: ClassVar[dict] = {}
+
+    def do_GET(self) -> None:
+        body = self.routes.get(self.path)
+        if body is None:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        """Silence it: the access log of a test fixture is pure noise."""
+
+
+@contextmanager
+def canned_station(routes: dict) -> Generator[str, None, None]:
+    """Serve *routes* over HTTP and yield the base URL of the station."""
+
+    class Handler(_CannedHandler):
+        pass
+
+    Handler.routes = routes
+    server = _Server(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 @pytest.fixture(scope="module")

@@ -77,6 +77,14 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--max-sessions", type=int, help="concurrent pipelines")
     serve.add_argument("--max-listeners", type=int, help="radios per station")
     serve.add_argument("--ffmpeg", help="explicit ffmpeg binary")
+    serve.add_argument(
+        "--no-ffmpeg",
+        action="store_false",
+        dest="ffmpeg_enabled",
+        default=None,
+        help="never run ffmpeg: only the FFmpeg-free path (forward the station's "
+        "own audio), so only MP3/ADTS stations can be played",
+    )
     serve.add_argument("--user-agent", help="HTTP User-Agent sent upstream")
     serve.add_argument("--referer", help="HTTP Referer sent upstream")
     serve.add_argument("--linger", type=float, help="seconds to keep an idle stream warm")
@@ -142,6 +150,7 @@ def _serve_overrides(args: argparse.Namespace) -> Dict[str, Any]:
         "max_sessions": "max_sessions",
         "max_listeners": "max_listeners_per_session",
         "ffmpeg": "ffmpeg_path",
+        "ffmpeg_enabled": "ffmpeg_enabled",
         "user_agent": "user_agent",
         "referer": "referer",
         "linger": "linger_seconds",
@@ -164,7 +173,8 @@ def _serve_overrides(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    settings = Settings.load(args.config, **_serve_overrides(args))
+    overrides = _serve_overrides(args)
+    settings = Settings.load(args.config, **overrides)
     setup_logging(settings.log_level, settings.log_json)
 
     import logging
@@ -176,17 +186,31 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     from .api import create_app
 
-    app = create_app(settings)
+    # A flag on the command line outranks anything the settings page can save, so
+    # the page has to be told which ones were given - otherwise it would accept a
+    # change, apply it in memory, and quietly lose it on the next restart. Only
+    # the values actually passed are pins: an unset flag is ``None`` in the table
+    # and must stay overrideable.
+    pinned = {k: v for k, v in overrides.items() if v is not None}
+    app = create_app(settings, pinned=pinned)
 
     log.info("radioconv %s", __version__)
     log.info("listening on http://%s:%d", settings.host, settings.port)
     log.info(
         "output=%s @ %d kbit/s, passthrough=%s, max %d stream(s)",
-        settings.output_codec,
+        settings.effective_output_codec,
         settings.bitrate // 1000,
         "on" if settings.prefer_passthrough else "off",
         settings.max_sessions,
     )
+    if not settings.ffmpeg_enabled:
+        # Worth its own line: it changes which stations can be played at all, and
+        # an operator reading the journal after a "this station is silent" report
+        # should not have to infer it from the absence of child processes.
+        log.warning(
+            "FFmpeg is disabled (--no-ffmpeg): nothing is re-encoded, so only "
+            "stations whose audio is already MP3 or ADTS AAC can be played"
+        )
     log.info("config dir: %s", default_config_dir())
 
     config = uvicorn.Config(
@@ -242,6 +266,31 @@ def cmd_probe(args: argparse.Namespace, settings: Settings) -> int:
         f"audio codec  : {audio.get('codec')} {audio.get('profile') or ''} {audio.get('sample_rate') or '?'} Hz"
     )
     print(f"passthrough  : {result.get('passthrough_possible')} ({result.get('passthrough_kind')})")
+    print(f"ffmpeg       : {'disabled' if not settings.ffmpeg_enabled else 'enabled'}")
+    if result.get("passthrough_possible") and not result.get("passthrough_engine"):
+        if not settings.ffmpeg_enabled:
+            # Not actionable by changing a codec: this install has no second
+            # engine. Name the real reason so nobody goes looking for a URL fix.
+            print(
+                "               ...but passthrough is off or unavailable, and FFmpeg "
+                "is disabled, so this station cannot be played here"
+            )
+        else:
+            # The two answers are different questions, and this is where a reader
+            # would otherwise conclude "no FFmpeg needed" from a "True" above while
+            # the service is in fact re-encoding: forwarding an AAC source cannot
+            # produce the MP3 the settings ask for.
+            print(
+                "               the source can be forwarded, but output_codec is "
+                f"{settings.output_codec!r}; set output_codec = "
+                f'"{result.get("passthrough_kind")}" to drop FFmpeg entirely'
+            )
+    elif not result.get("passthrough_possible") and not settings.ffmpeg_enabled:
+        print(
+            "               FFmpeg is disabled on this installation, so this station "
+            "cannot be played: its audio cannot be forwarded and nothing else can "
+            "produce audio from it"
+        )
     if result.get("ts_streams"):
         print(
             "TS streams   : "
