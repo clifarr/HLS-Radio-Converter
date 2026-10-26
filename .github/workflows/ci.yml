@@ -81,7 +81,12 @@ jobs:
         #      through different Ubuntu mirrors, repointing the sources first.
         #      The image's own mirror is tried first (it is the fastest when it
         #      works), then the Ubuntu archive, then kernel.org's mirror.
-        timeout-minutes: 20
+        #
+        # The cap is sized above the loop's own budget - 6 attempts x (180 s
+        # update + 180 s install) is 36 minutes - because a cap that bites first
+        # turns "the retries were unlucky" into the same red build as "nothing
+        # was retried", which is the failure this step exists to avoid.
+        timeout-minutes: 40
         run: |
           set -euo pipefail
           sudo systemctl stop unattended-upgrades.service 2>/dev/null || true
@@ -90,10 +95,21 @@ jobs:
           # sources (packages.microsoft.com) alone. The hosts are matched, not
           # the whole URI, so the suite paths survive and any of our own
           # previous changes can be overwritten again on the next attempt.
+          #
+          # /etc/apt/apt-mirrors.txt is the one that actually matters on current
+          # runners, and it is why this loop used to rotate nothing: the 24.04
+          # image points ubuntu.sources at `mirror+file:/etc/apt/apt-mirrors.txt`,
+          # so the host lives in that file and neither sources.list nor
+          # /etc/apt/sources.list.d/*.sources contains it. Run 40370775712 showed
+          # the result - six attempts, and every single `Get:` line still saying
+          # azure.archive.ubuntu.com, so three "different" mirrors were the same
+          # host six times. The sed is silent when a file is absent (`2>/dev/null
+          # || true`), so this stays correct on an image that has no mirrorlist.
           repoint() {
             sudo sed -i -E \
               "s#(azure\.archive\.ubuntu\.com|archive\.ubuntu\.com|security\.ubuntu\.com|mirrors\.edge\.kernel\.org)#$1#g" \
-              /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+              /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+              /etc/apt/apt-mirrors.txt 2>/dev/null || true
           }
 
           opts=(-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
