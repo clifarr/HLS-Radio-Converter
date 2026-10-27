@@ -140,21 +140,33 @@ code { font-size: .88em; background: #fff; border: 1px solid var(--line); border
 .card.result code.block { background: #fff; }
 
 /* ----------------------------------------------------------- settings page */
-/* A row per setting: label and control on one line, the explanation under it.
-   The help text is the reason this page exists at all - a settings form without
-   it is a list of names whose effects you have to guess - so it is always
-   visible rather than hidden behind the tooltip convention the figures use. */
+/* A row per setting: the name in a fixed left column, the control and its
+   explanation to the right of it. The help text is the reason this page exists
+   at all - a settings form without it is a list of names whose effects you have
+   to guess - so it is always visible rather than hidden behind the tooltip
+   convention the figures use.
+ *
+ * Two columns rather than three stacked lines because that is most of the page's
+ * length: a label, an input and a sentence per setting, all full width, is a
+ * screen and a half of scrolling for twenty settings whose values are all short.
+ * The left column is sized to the longest name (`Radios per station`), so the
+ * controls line up and the eye can run down the values. */
 .setting {
-  padding: .6rem 0;
+  display: grid;
+  grid-template-columns: 13.5rem minmax(0, 1fr);
+  column-gap: 1rem;
+  align-items: baseline;
+  padding: .4rem 0;
   border-top: 1px solid var(--line);
 }
 .setting:first-of-type { border-top: 0; }
 .setting > label {
+  grid-column: 1;
   font-weight: 600;
   font-size: .92rem;
-  margin-bottom: .3rem;
 }
 .setting .control {
+  grid-column: 2;
   display: flex;
   align-items: center;
   gap: .5rem;
@@ -175,10 +187,23 @@ code { font-size: .88em; background: #fff; border: 1px solid var(--line); border
 }
 .setting .unit { color: var(--muted); font-size: .82rem; }
 .setting .help {
-  margin: .3rem 0 0;
+  grid-column: 2;
+  margin: .15rem 0 0;
   font-size: .82rem;
   color: var(--muted);
   max-width: 46rem;
+}
+/* The result of the settings above it, not another setting. Set apart with a
+   leading rule so it reads as a consequence of the choices rather than as one
+   more item in the list, and prefixed with "In short:" in the text itself -
+   a hint nobody reads is not a hint. Full card width on purpose: a tinted box
+   that stops halfway across looks like a rendering fault rather than a note. */
+.outcome {
+  margin: .6rem 0 0;
+  padding: .45rem .75rem;
+  border-left: .2rem solid var(--line);
+  background: #fafafa;
+  font-size: .88rem;
 }
 /* Locked on purpose (allow_ui_settings = false): still readable, and visibly
    not clickable. Disabled is the browser's own affordance, so nothing extra is
@@ -192,22 +217,22 @@ code { font-size: .88em; background: #fff; border: 1px solid var(--line); border
 .setting.invalid input,
 .setting.invalid select { border-color: var(--bad); }
 .setting .problem {
-  margin: .2rem 0 0;
+  grid-column: 2;
+  margin: .15rem 0 0;
   font-size: .82rem;
   color: var(--bad);
 }
-/* "new streams" - a claim about *when* a value takes effect, which is the one
-   thing a settings form cannot show by itself. */
-.tag {
-  font-size: .7rem;
-  text-transform: uppercase;
-  letter-spacing: .03em;
-  color: var(--muted);
-  border: 1px solid var(--line);
-  border-radius: .8rem;
-  padding: .05rem .45rem;
-  background: #fff;
-  white-space: nowrap;
+/* On a narrow screen the two columns would leave the control squeezed into a
+   strip, so the row goes back to stacked: name, control, explanation. */
+@media (max-width: 40rem) {
+  .setting {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: .25rem;
+  }
+  .setting > label,
+  .setting .control,
+  .setting .help,
+  .setting .problem { grid-column: 1; }
 }
 /* The banner above the form: green for "saved", amber for "saved but...". */
 .notice {

@@ -719,9 +719,14 @@ class Settings(BaseSettings):
         to discover a typo.
         """
         if not self.ffmpeg_enabled and not self.prefer_passthrough:
+            # Worded so it reads as a sentence on the settings page *and* names
+            # the two keys, since the other place it can be hit is a hand-edited
+            # config file, where the keys are all the reader has.
             raise ValueError(
-                "ffmpeg_enabled = false needs prefer_passthrough = true: with FFmpeg "
-                "disabled, forwarding is the only engine there is"
+                "with FFmpeg turned off, forwarding is the only engine there is, so "
+                "'prefer forwarding' cannot be off as well - nothing would be left "
+                "to produce any audio (ffmpeg_enabled = false needs "
+                "prefer_passthrough = true)"
             )
         return self
 

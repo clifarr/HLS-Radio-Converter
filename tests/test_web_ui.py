@@ -171,7 +171,7 @@ def test_the_engine_column_reports_only_the_engine(tmp_path):
         (
             "forwarded without ffmpeg",
             "{ mode: 'passthrough', detected_kind: 'mp3', detected_codec: 'mp3' }",
-            "passthrough",
+            "pass-through",
         ),
         (
             "ADTS source, re-encoded to mp3",
@@ -332,6 +332,30 @@ def test_the_status_pill_tells_idle_from_live(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_a_zero_is_a_reading_not_a_missing_value():
+    """The Dropped column printed "–" for 0, and a dash means "not measured".
+
+    Every other figure in the table prints its zero - restarts 0, failures 0,
+    starved 0s - and this column's own tooltip says "anything other than 0 means
+    a radio is not keeping up". So the one column that explains a problem was the
+    one column that could not be read: a healthy station and a station that had
+    not reported yet looked identical, which is the same shape of mistake as the
+    status pill calling an idle service "live".
+
+    Asserted on the shipped source rather than through a browser: ``streamRow``
+    builds DOM nodes, and the suite has no DOM. The pattern being forbidden is
+    narrow and specific, so a text check is enough here.
+    """
+    script = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.js").read_text(encoding="utf-8"),
+        language="javascript",
+    )
+    assert "count(dropped)" in script, "the Dropped column no longer counts anything"
+    assert "dropped ?" not in script, (
+        "the Dropped column treats its zero as a missing reading again"
+    )
 
 
 def test_assets_must_be_revalidated_before_reuse(live_server):
@@ -523,6 +547,35 @@ def test_the_header_marks_which_page_you_are_on(live_server):
     assert '.head nav a[aria-current="page"]' in css, (
         "the current page is marked in the markup but not styled"
     )
+
+
+def test_the_settings_rows_stack_on_a_phone():
+    """The two-column settings grid must collapse, not squeeze.
+
+    A label column and a control column is what keeps twenty settings scannable
+    on a desktop: the names line up, so the eye can run down the values. At 390px
+    the same grid leaves the control a strip too narrow to read, so the row goes
+    back to label / control / explanation. That is a media query, and nothing in
+    a test can run a browser, so what is pinned here is that the rule exists and
+    that it collapses the *grid* rather than only shrinking the font.
+    """
+    css = code_only(
+        (web.resource_dir(web.STATIC) / "dashboard.css").read_text(encoding="utf-8"),
+        language="css",
+    )
+    assert "grid-template-columns: 13.5rem minmax(0, 1fr)" in css, (
+        "the settings rows are not the two-column layout any more"
+    )
+    mobile = re.search(r"@media \(max-width: 40rem\) \{(.*?)\n\}", css, re.S)
+    assert mobile, "the settings grid never collapses, so a phone gets two narrow columns"
+    block = mobile.group(1)
+    assert "grid-template-columns: minmax(0, 1fr)" in block, (
+        "the narrow-screen rule does not make the row a single column"
+    )
+    # Every part of the row has to be pinned to that column, or the help text
+    # keeps trying to sit beside the label and overflows instead.
+    for part in ("label", ".control", ".help", ".problem"):
+        assert part in block, f"{part} is not moved into the single column"
 
 
 def test_the_station_table_becomes_cards_on_a_phone(live_server):
@@ -1528,9 +1581,17 @@ def test_the_dashboard_only_asks_for_metrics_that_exist(live_server):
 
 
 def test_configured_limits_are_visible_on_the_dashboard(live_server):
-    """ "Why did it say 503?" is answered by the page, not by the config file."""
+    """ "Why did it say 503?" is answered by the page, not by the config file.
+
+    The names are the settings page's own (`Stations at once`, not `Max
+    stations`), because the dashboard is where a reader notices the problem and
+    the settings page is where they fix it - see
+    `test_the_dashboard_names_settings_the_way_the_settings_page_does` in
+    tests/test_settings.py, which is the guard for that pairing.
+    """
     body = httpx.get(live_server + web.DASHBOARD_URL, timeout=10).text
-    assert "Max stations" in body
+    assert "Stations at once" in body
+    assert "Max stations" not in body
     assert "kbit/s" in body
 
 

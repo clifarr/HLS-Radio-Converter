@@ -204,11 +204,16 @@
    * same station with an ADTS-in-TS source read `transcode \u00b7 adts`, while
    * one serving a bare `.aac` segment read `transcode \u00b7 mp3`, and neither
    * said what was actually happening. A listener only needs the engine.
+   *
+   * The one translation is the hyphen: the snapshot's `mode` is the token
+   * `passthrough`, and the converter page spells the same engine `pass-through`.
+   * Two spellings of one word across two pages is a reader wondering whether
+   * they are two things.
    */
   function engineLabel(pipeline) {
     const mode = pipeline.mode || "starting";
     if (mode === "unknown") return "starting\u2026";
-    return mode;
+    return mode === "passthrough" ? "pass-through" : mode;
   }
 
   /* Seconds of audio buffered for this station's listeners.
@@ -268,7 +273,13 @@
     row.appendChild(station);
 
     row.appendChild(cell(1, "num", count(detail.listeners), key ? "cell:" + key + ":1" : null));
-    row.appendChild(cell(2, "num", dropped ? count(dropped) : "\u2013", key ? "cell:" + key + ":2" : null));
+    // `0` here, not the placeholder dash: five other columns print their zero,
+    // and the tooltip's own rule is "anything other than 0 means a radio is not
+    // keeping up" - which a dash makes unreadable, because on this page a dash
+    // means *no reading yet*.
+    row.appendChild(
+      cell(2, "num", count(dropped), key ? "cell:" + key + ":2" : null)
+    );
     row.appendChild(cell(3, null, engineLabel(pipeline), key ? "cell:" + key + ":3" : null));
     row.appendChild(cell(4, "num", bufferedSeconds(detail), key ? "cell:" + key + ":4" : null));
     // `bytes_sent`, not `bytes_out`: the latter counts what the pipeline

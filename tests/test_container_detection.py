@@ -331,26 +331,30 @@ def test_the_mp3_output_carries_no_id3_tag():
 def test_the_adts_output_is_not_affected_by_the_id3_suppression():
     """The suppression is for MP3 only; ADTS has no ID3 tag to begin with.
 
-    The container follows the *output codec*, which is the user-visible
-    contract (and what the ``Content-Type`` says). ``copy_audio`` is a
-    separate question - it means "the source is already the codec being
-    asked for" - and it must not be able to change the container. The old
-    code let it: ``copy_audio=True`` with an MP3 output produced
-    ``-acodec copy -f adts``, which is the bug this project just fixed.
+    The container follows the *output codec*, which is the user-visible contract
+    (and what the ``Content-Type`` says). It used to be possible to override it
+    from outside with a copy flag - ``copy_audio=True`` with an MP3 output
+    produced ``-acodec copy -f adts`` - so the stream's container depended on a
+    second setting. That flag is gone (see `tests/test_ffmpeg_command.py`); the
+    container is now a function of the output codec and nothing else.
     """
-    command = ffmpeg_mod.build_command(Settings(output_codec="adts"), "adts", copy_audio=True)
+    command = ffmpeg_mod.build_command(Settings(output_codec="adts"), "adts")
     assert "-id3v2_version" not in command
     assert command[-3:] == ["-f", "adts", "-"]
 
 
-def test_the_container_follows_the_output_codec_not_the_copy_flag():
-    """The container is the output codec, whatever the copy flag says."""
-    # An MP3 output with a copy flag is still an MP3 stream.
-    command = ffmpeg_mod.build_command(Settings(output_codec="mp3"), "mpegts", copy_audio=True)
-    assert command[-3:] == ["-f", "mp3", "-"]
-    # An ADTS output is still an ADTS stream.
-    command = ffmpeg_mod.build_command(Settings(output_codec="adts"), "mpegts", copy_audio=True)
-    assert command[-3:] == ["-f", "adts", "-"]
+def test_the_container_follows_the_output_codec():
+    """The container is the output codec, and there is nothing else to set."""
+    assert ffmpeg_mod.build_command(Settings(output_codec="mp3"), "mpegts")[-3:] == [
+        "-f",
+        "mp3",
+        "-",
+    ]
+    assert ffmpeg_mod.build_command(Settings(output_codec="adts"), "mpegts")[-3:] == [
+        "-f",
+        "adts",
+        "-",
+    ]
 
 
 def test_the_default_container_is_honest_when_the_playlist_does_not_say():

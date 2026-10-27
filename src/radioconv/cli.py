@@ -196,10 +196,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     log.info("radioconv %s", __version__)
     log.info("listening on http://%s:%d", settings.host, settings.port)
+    # The bitrate is named only where it applies, for the same reason the
+    # settings page does it: with FFmpeg off nothing is encoded, so "output=auto
+    # @ 192 kbit/s" advertised a rate that is never produced.
+    output = (
+        f"{settings.effective_output_codec} @ {settings.bitrate // 1000} kbit/s"
+        if settings.ffmpeg_enabled
+        else "the station's own"
+    )
     log.info(
-        "output=%s @ %d kbit/s, passthrough=%s, max %d stream(s)",
-        settings.effective_output_codec,
-        settings.bitrate // 1000,
+        "output=%s, forwarding=%s, max %d station(s)",
+        output,
         "on" if settings.prefer_passthrough else "off",
         settings.max_sessions,
     )

@@ -1,9 +1,9 @@
 # HLS Radio Converter
 
 Turn an **HLS** (`.m3u8`) Internet radio stream into a plain, continuous HTTP
-audio stream that an Internet radio can actually play - the station's own AAC
-forwarded untouched when the radio decodes it (most DAB+ sets do), or MP3 when it
-does not. Frontier Silicon sets, which understand `audio/mpeg` but not HLS, are
+audio stream that an Internet radio can actually play: **MP3 by default**, or the
+station's own audio **forwarded untouched** when the radio can take it and you ask
+for that. Frontier Silicon sets, which understand `audio/mpeg` but not HLS, are
 the usual reason to need this at all.
 
 ```
@@ -12,14 +12,13 @@ radio ──► http://pi:8123/https%3A%2F%2F… ──► radioconv ──► H
                  station's own AAC)    many radios per stream)
 ```
 
-There is **nothing to configure**. You give each radio the encoded URL of the
-station you want it to play, and that is the whole setup - no playlist file, no
-station list, nothing to edit on the Pi.
+**Nothing has to be configured.** Give each radio the encoded URL of the station
+it should play - that is the whole setup: no playlist file, no station list.
+[Settings](#settings) only tunes the defaults.
 
-**Requirements:** Python 3.9+, and FFmpeg **only if** a station has to be
-re-encoded - which, for most radios and most stations, it does not: see
-[Most radios need no transcoding](#most-radios-need-no-transcoding). The
-installer handles both; see [Quick start](#quick-start).
+**Requirements:** Python 3.9+ and FFmpeg, both of which the installer brings -
+though FFmpeg is only needed to *re-encode*, and a radio that plays AAC can be
+served without it at all: see [Running without FFmpeg](#running-without-ffmpeg).
 
 <a href="docs/dashboard.png"><img src="docs/dashboard.png" alt="The live dashboard: stations, listeners, CPU and memory for the whole process tree, bytes received and audio sent over the last hour, and a row per station showing its engine, jitter buffer, restarts and idle time." width="780"></a>
 
@@ -34,10 +33,14 @@ A small, single-purpose appliance for one problem: **an internet radio whose
 stations stopped playing.** You probably own a physical Wi-Fi radio - a Roberts,
 Ruark, Revo, Pure, Ocean Digital, Majority, TechniSat or similar set, usually one
 that also does DAB+ and FM - whose internet presets have gone dead or silent,
-because the broadcaster moved to HLS, the vendor's radio portal was switched off,
-or the station was never in that directory anyway. You have an always-on Linux
-box on the same network (a Raspberry Pi is the target, and the machine every
-figure here was measured on), and you can paste one URL into the radio.
+because the broadcaster moved to HLS or the vendor's directory was switched off.
+You have an always-on Linux box on the same network (a Raspberry Pi is the target,
+and the machine every figure here was measured on), and the set lets you **enter a
+URL by hand**.
+
+**It cannot restore a dead directory.** Nothing here brings a vendor portal back;
+it hands the radio one working address at a time. So a set with no way to add a
+custom URL is out of scope, however good the converter is at the other end.
 
 It is not a media server, a station directory, or something to expose to the
 internet: there is no authentication anywhere and no account to create. If you
@@ -50,13 +53,12 @@ and it will look needlessly awkward.
 
 * **Your radios keep working.** The URL format is byte-for-byte the same as
   version 1, so anything already configured needs no changes.
-* **Most stations are not re-encoded at all.** The source's own audio is
-  forwarded untouched - ~1% of one core per station instead of ~165%, no child
-  process, and no second round of lossy encoding. That is what this release is
-  mostly about; see
-  [Most radios need no transcoding](#most-radios-need-no-transcoding).
-* **192 kbit/s MP3 by default**, matching version 1 - unless the station's own
-audio can be forwarded, which is cheap enough to make the Pi irrelevant.
+* **Cheap when your radio plays AAC.** Choose `output_codec = "adts"` (or `auto`)
+  and a station whose audio is already playable is forwarded untouched - ~1% of
+  one core per station instead of ~165%, no child process, and no second round of
+  lossy encoding. MP3 stays the default, so this is a choice, not a surprise; see
+  [Many radios need no transcoding](#many-radios-need-no-transcoding).
+* **192 kbit/s MP3 by default**, matching version 1.
 * **One stream per station, shared by every listener.** Ten radios on one
   station costs one decode, not ten.
 * **Encrypted HLS works** (`EXT-X-KEY:AES-128`), including key rotation.
@@ -100,7 +102,7 @@ sudo apt install -y python3-venv ffmpeg build-essential python3-dev libffi-dev
 `python3-venv` makes the virtualenv; `build-essential`, `python3-dev` and
 `libffi-dev` are there because two dependencies have no 32-bit ARM build and
 compile from source. `ffmpeg` is **required by default** but only for
-re-encoding, which [most radios do not need](#most-radios-need-no-transcoding).
+re-encoding, which [many radios do not need](#many-radios-need-no-transcoding).
 
 ### Without the installer
 
@@ -112,9 +114,8 @@ uv sync              # or: python3 -m venv .venv && .venv/bin/pip install .
 uv run radioconv     # starts the server on port 8123
 ```
 
-There is also a PyInstaller spec for a machine with no Python at all
-(`pyinstaller packaging/radioconv.spec`) - see [CONTRIBUTING.md](CONTRIBUTING.md)
-for that, and for why it runs directly rather than in a container.
+There is also a PyInstaller spec for a machine with no Python at all - see
+[CONTRIBUTING.md](CONTRIBUTING.md) for that, and why it does not use a container.
 
 ---
 
@@ -131,8 +132,9 @@ http://192.168.1.50:8123/https%3A%2F%2Fexample.com%2Flive%2Findex.m3u8
 http://192.168.1.50:8123/stream?url=https://example.com/live/index.m3u8
 ```
 
-That is the entire configuration story. You do not register the station
-anywhere first: paste the URL into the radio and it works.
+**`192.168.1.50` is a placeholder** for this machine's address (the installer
+prints the real one); **`8123` is the default port**, changeable with `port` in
+`config.toml` or `--port`.
 
 Get the exact string to paste with:
 
@@ -159,9 +161,11 @@ Append these to either URL shape:
 | Parameter | Effect |
 |---|---|
 | `?name=BBC+Radio+6` | The station name shown on the radio's display. Without it the display shows the source URL. |
-| `?br=128000` (or `128k`) | Output bitrate. Default is 192 kbit/s. |
+| `?br=128000` (or `128k`) | Bitrate for a station that gets **converted**. Default is 192 kbit/s. A forwarded one plays at its own rate and ignores this. |
 | `?codec=adts` | Forward the station's AAC as ADTS instead of re-encoding to MP3 - much cheaper and no quality loss, if your radio plays AAC. |
 
+`br` and `codec` are *encoder* settings, so a forwarded station ignores them - as
+it does the bitrate, channels and sample rate on the [settings page](#settings).
 `codec` accepts only `mp3` and `adts`. **`aac` is a synonym for `adts` and means
 exactly the same thing** - the same engine, the same bytes, the same header - so
 it does not matter which one you type. `adts` is the spelling used by
@@ -171,7 +175,7 @@ stream is.
 
 Choosing it flips the `Content-Type` from `audio/mpeg` to `audio/aac`, which is
 what matters on older hardware - see
-[Most radios need no transcoding](#most-radios-need-no-transcoding) for which
+[Many radios need no transcoding](#many-radios-need-no-transcoding) for which
 sets that catches out, and `mime_override` for the firmware that wants
 `audio/aacp`.
 
@@ -198,19 +202,18 @@ bitrate`) rather than pretending. `host`, `port`, `log_level`, `ffmpeg_path` and
 one you lose. `allow_ui_settings = false` makes the installation read-only: the
 values still show, and a `POST` is refused with `403`.
 
-<a href="docs/settings.png"><img src="docs/settings.png" alt="The settings page: an Encoding card with FFmpeg transcode, bitrate, output codec, forwarding, channels and sample rate, each with an explanation and a 'new streams' tag." width="700"></a>
+<a href="docs/settings.png"><img src="docs/settings.png" alt="The settings page: Encoding, Limits and Streaming cards, each setting a short name beside its control with a one-line explanation, a box above the Encoding fields stating which stations are forwarded and which are converted, and the bitrate marked as applying to converted stations only." width="700"></a>
 
 *`/settings`: every value the service reads at runtime, and when it takes effect.*
 
 ---
 
-## Most radios need no transcoding
+## Many radios need no transcoding
 
-**Any radio that receives DAB+ already contains an AAC decoder.** DAB+ broadcasts
-are HE-AAC, so the hardware decodes AAC because it has to - and on most sets the
-network player sits on the same audio path. HLS radio streams are overwhelmingly
-AAC too, usually HE-AAC at 64-128 kbit/s. For that radio and that station the
-honest answer is not *"decode and re-encode"* but **"forward the bytes"**:
+DAB+ broadcasts are HE-AAC, so **a set that receives DAB+ has an AAC decoder in
+it** - the hardware is already there. HLS radio streams are overwhelmingly AAC
+too, usually HE-AAC at 64-128 kbit/s. When such a radio's *network player* also
+accepts AAC over HTTP, the station's bytes can be passed through untouched:
 
 | | Re-encode (`output_codec = "mp3"`, the default) | Forward (`adts`, or `auto`) |
 |---|---|---|
@@ -219,27 +222,22 @@ honest answer is not *"decode and re-encode"* but **"forward the bytes"**:
 | Child processes | one FFmpeg per station | none |
 | Quality | decoded to PCM and encoded again - lossy twice, and the second loss is ours | the station's own bytes, untouched |
 
-That is what version 2.4 is mostly about. Only MPEG-TS segments used to be
-forwardable, so a station serving bare `.aac` segments behind an ID3 tag was
-decoded and re-encoded even when the output was already the same codec. Those now
-take the pass-through path too, with the tag read for the song title and the
-frames kept whole across segment boundaries.
+**It does not happen by default.** `output_codec` ships as `mp3`, so an AAC
+station is re-encoded even when it did not have to be - that is the price of
+"every station plays on every radio". Choose `adts` or `auto` to forward instead,
+for the whole service on the [settings page](#settings) or for one radio with
+`?codec=adts` on its URL.
 
-**What can still go wrong is the firmware, not the decoder.** The radio has to
-*accept* `audio/aac` over HTTP from its network player: most do, a few older
-Frontier Silicon builds want it spelled `audio/aacp` (`mime_override` fixes that
-for every stream), and a small number decode AAC from DAB but only MP3 over the
-network - rare, and exactly what this check is for:
-
-```bash
-radioconv probe 'https://example.com/live/index.m3u8'
-```
-
-Or open `http://<pi>:8123/`, paste the `.m3u8` URL and tick **Check the stream**.
-The verdict names the engine that will be used, and when the station *could* be
-forwarded but this service's `output_codec` prevents it, the page prints the
-`?codec=` URL that avoids FFmpeg for that one station - which changes nothing for
-anybody else listening.
+The decoder in the set is only half of it: what matters is whether its **network
+player** accepts `audio/aac` over HTTP, which is separate firmware from the DAB+
+path and not something a specification sheet promises. Most do; some older
+Frontier Silicon builds want it spelled `audio/aacp` (`mime_override`), and a few
+decode AAC from DAB+ but only MP3 over the network. Worth checking before
+switching - `radioconv probe <url>`, or paste the URL into `http://<pi>:8123/`
+and tick **also check the stream**. The verdict names the engine that will be used,
+and when the station *could* be forwarded but this service's `output_codec`
+prevents it, the page prints the `?codec=` URL that avoids FFmpeg for that one
+station alone.
 
 ### Running without FFmpeg
 
@@ -256,10 +254,10 @@ radioconv serve --no-ffmpeg          # for one run
 ffmpeg_enabled = false
 ```
 
-or the **FFmpeg transcode** switch on the [settings page](#settings), which also
-offers to restart the stations that are playing so the change arrives at once.
-What changes is not the same service with fewer features - it is a service with
-one engine:
+or the **FFmpeg** switch on the [settings page](#settings), which also offers to
+restart the stations that are playing so the change arrives at once. What
+changes is not the same service with fewer features - it is a service with one
+engine:
 
 | | FFmpeg enabled (default) | `--no-ffmpeg` |
 |---|---|---|
@@ -328,6 +326,7 @@ container    : ts (segment: ts)
 encrypted    : False
 audio codec  : aac LC 44100 Hz
 passthrough  : True (adts)
+ffmpeg       : enabled
 TS streams   : 0x0f pid 0x100 -> adts
 ```
 

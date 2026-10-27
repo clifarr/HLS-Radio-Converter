@@ -3,6 +3,161 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.4.1] - 2026-10-27
+
+A settings page that is shorter and finally says what each engine does, a README
+that stops overstating what the pass-through path gives you, and a sweep through
+the code, both pages and the docs for every claim that had drifted away from
+what the service actually does.
+
+### Changed
+
+- **README: two claims were corrected after review, both of which overpromised.**
+  The section is now *Many radios need no transcoding*, not *Most*: a DAB+
+  receiver certainly contains an AAC decoder, but that says nothing about whether
+  its **network player** accepts `audio/aac` over HTTP, which is separate
+  firmware. The section also now says plainly that **pass-through is not the
+  default**: `output_codec` ships as `mp3`, so an AAC station is re-encoded out
+  of the box, and skipping it means choosing `adts`/`auto` (or `?codec=adts` for
+  one radio). The *What you get* bullets had claimed "most stations are not
+  re-encoded at all", which was simply not true of a default install.
+  *Who this is for* now states the directory limitation where a reader meets it -
+  this cannot restore a dead vendor portal, it hands a radio one working URL at a
+  time, so a set that cannot take a custom URL is out of scope - instead of
+  leaving that to be inferred further down.
+- **The settings page is shorter and says more.** Every label is now a name
+  rather than a sentence (`Re-encode with FFmpeg` -> `FFmpeg`, `Audio ready on
+  connect` -> `Preroll`, `Restart a silent station after` -> `Silence timeout`),
+  and every explanation is one line instead of a paragraph. The long version of
+  each still exists where it belongs - the README's *Many radios need no
+  transcoding* and *Running without FFmpeg* sections, and `CONTRIBUTING.md` for
+  the internals - because a form is read while looking for one thing, and
+  twenty paragraphs is not a form. Every one of the 22 explanations is still on
+  screen rather than behind a tooltip. Each setting is a row with the name in a
+  fixed left column,
+  so the values line up and the eye can run down them; on a phone the row stacks
+  again rather than squeezing the control into a strip.
+- **The "new streams" pills are gone.** Fifteen fields carried an uppercase pill
+  meaning "this value only reaches a station when its pipeline restarts", with
+  the explanation behind a tooltip. Read as a page it said the same thing fifteen
+  times, and read as a page of controls it looked like a second kind of setting.
+  When a value takes effect is a property of a *group*, so it is now stated once
+  per group in its blurb, which is the same information at a fifteenth of the
+  pressure.
+- The Encoding group's outcome sentence is one line now - *"In short: MP3
+  stations are forwarded at their own bitrate; AAC stations are converted to MP3
+  at 192 kbit/s."*
+- **The page says what it is changing.** These values are *defaults for every
+  radio*, and a URL can still choose for one of them: `?codec=adts` and
+  `?br=128k` on a station's link beat the configured values for that listener
+  alone. Two short lines - one at the top, one in the Encoding blurb - because
+  the opposite mistake is easy to make and looks like a bug when it is not
+  ("I set mp3 here, so why is that radio getting AAC?").
+- **The Encoding fields are described by engine, not by codec.** "If I choose
+  AAC, does the bitrate do anything?" had no answer on the page that asked it.
+  It now does: the blurb names the two engines (forwarding plays a station
+  exactly as it arrives, at its own rate; converting re-encodes it with FFmpeg),
+  `bitrate`, `channels` and `sample_rate` each begin with *Converted stations
+  only.*, and the outcome sentence names where the rate applies - *"MP3 stations
+  are forwarded at their own bitrate; AAC stations are converted to MP3 at 192
+  kbit/s"* - instead of stating a target bitrate for every configuration. On a
+  forwarding-only installation it names no rate at all, because no conversion
+  can happen there. The README's `?br=` row and the `docs/settings.png`
+  screenshot say the same.
+- **The screenshots showed a different address from the text.** The captures
+  were taken from a machine at `192.168.1.82` while every example in the prose
+  said `192.168.1.50`, which invites the reader to guess which of the two is
+  theirs. They now agree on the placeholder, and the README says so explicitly:
+  `192.168.1.50` is an example (the installer prints the real one) and `8123` is
+  only the default port, changeable with `port` in `config.toml` or `--port`.
+- **One vocabulary and one name per setting, across both pages.** A sweep for
+  leftovers after the engine work found the same fact stated two ways: the
+  session-count tile said *"stations being **converted** right now"* on the
+  converter page and the dashboard, which is simply false for a forwarded
+  station; the dashboard's configuration table still used pre-2.4.1 names
+  (`Stations allowed`, `Restart a silent station after`) while the settings page
+  had shortened them, so a reader told to raise `Stations at once` found no such
+  row anywhere; and the converter page justified re-encoding with *"costs the Pi
+  CPU, not you any quality"*, contradicting the README's own "lossy twice". The
+  tile says *served* now, which is true of either engine, and the dashboard looks
+  each setting name up in the settings page's field list (`_field_label`) so the
+  two cannot drift apart again. An unused template variable (`config_path`, passed
+  to the settings page and rendered nowhere) went with it.
+- **The docs stop describing a different build.** `CONTRIBUTING.md`'s precedence
+  line listed four of the five levels (no `ui-settings.json`), and its module
+  table said "the two HTML pages" while naming three - with `settings.html`
+  missing altogether. The shipped `packaging/config.toml.example` was the last
+  file still calling version 1 "the original project", and its `bitrate` and
+  `sample_rate` did not say they apply to converted stations only. The README's
+  `radioconv probe` sample was missing the `ffmpeg` line the command prints, its
+  `?br=` row did not say the value only reaches a converted station, `Most do`
+  about network players became `Many do` (the same overclaim as *Most radios need
+  no transcoding*), "there is nothing to configure" became "nothing has to be
+  configured" now that a settings page exists, and the opt-in checkbox it tells
+  you to tick is named as the page names it (`also check the stream`).
+
+### Fixed
+
+- **A rejected settings change now says why when the error belongs to no field.**
+  The one cross-field rule here is that disabling FFmpeg while also disabling
+  forwarding is a contradiction - it would leave a service with no engine at all,
+  so it is refused rather than saved. Pydantic files such an error under an empty
+  location, and the template rendered only per-field ones: the page said *"Nothing
+  was changed: a value was rejected"*, marked nothing and named nothing, in a form
+  of twenty inputs. The message is now shown, and it is attached to both settings
+  its sentence names, so the two boxes go red and carry the sentence themselves.
+- **A failure notice was rendered in the success colour.** "Nothing was changed"
+  appeared on the same green background as "Settings saved and applied".
+- **A checkbox the reader had just unticked came back ticked** on a re-rendered
+  form. An unticked box is absent from a form post, and the code treated "absent"
+  as "not submitted" before falling back to the stored value - so the rejected
+  submit showed a form that disagreed with what had been typed, which is exactly
+  what re-rendering from the submission exists to avoid.
+- **Two conditional attributes could be emitted glued together.** `trim_blocks`
+  deletes the newline after a block tag, so `checked` and `aria-invalid="true"`
+  separated only by a newline became one unknown attribute,
+  `checkedaria-invalid="true"`: a control that was neither ticked nor marked
+  invalid. Each conditional attribute now carries its own leading space. A test
+  for this reads the *parsed* attributes rather than the markup, because a regex
+  finds both names in the broken output and reports success.
+- **`sample_rate` did nothing when the output codec was AAC.** `-ar` was only
+  added to the MP3 command, so the field labelled "Converted stations only.
+  Empty keeps the source rate." was silently ignored for ADTS output even though
+  the station was being re-encoded. Both encoders take `-ar` now; a copied stream
+  still gets neither `-ar` nor `-b:a`, because there is no encoder to configure.
+- **Restarting the stations was reported twice, in two colours.** The template
+  renders a green *"N stations restarted with the new settings"* from the count;
+  the route also pushed an amber *"N station(s) were ended so they rebuild"* onto
+  the warnings. One event, two sentences, and the warning colour for something
+  that worked.
+- **The settings page stated a timing it did not keep.** The Streaming blurb
+  claimed "the three timeouts apply immediately"; a session copies its settings
+  when it is built, and two of the three are read from that copy. Each group's
+  blurb now describes what actually happens: the limits are re-read for the next
+  radio that connects, and a session's own behaviour waits for a restart.
+- **The startup log advertised a bitrate that is never produced.** With FFmpeg
+  disabled it printed `output=auto @ 192 kbit/s` (the codec is *effected* as
+  `auto`, and the rate is only what a radio is told). It now says
+  `output=the station's own`, and `passthrough=on` became `forwarding=on` to
+  match the page's wording.
+- **The Dropped column printed a dash for zero.** On that page a dash means "no
+  reading yet" - it is the placeholder the tiles show before the first poll - so
+  a healthy station and one that had not reported yet looked identical, in the
+  one column whose tooltip says "anything other than 0 means a radio is not
+  keeping up". Every other figure prints its zero; this one does now too.
+- **Dead code removed: the `-acodec copy` path.** `ffmpeg.build_command` took a
+  `copy_audio` flag and `StreamPipeline` computed it, with three tests asserting
+  its behaviour - and it could never be true. A stream reaches the transcoder
+  only when its source is *not* what the output codec asks for, and the case
+  where it is (AAC wanted, AAC sent) is forwarded with no child process at all;
+  enumerating every combination of `output_codec`, `prefer_passthrough` and
+  source kind confirms `copy_audio` is false in every transcoding row. It also
+  made three documents claim a remux that never happened (the `/stream` `codec=`
+  description in the OpenAPI page, the dashboard's Engine tooltip, and the
+  `output_bitrate` docstring). The flag is gone, and the regression it guarded -
+  MP3 copied into an ADTS container, which ffmpeg accepts and which produces a
+  stream no radio can decode - is now unpinnable rather than merely pinned.
+
 ## [2.4.0] - 2026-10-26
 
 This release is mostly about **not re-encoding**. The FFmpeg-free path now covers
@@ -1434,6 +1589,8 @@ for the FFmpeg-free pass-through path, per-listener pacing with drop
 isolation, a dashboard with health metrics, and a systemd installer for the
 Raspberry Pi.
 
+[2.4.1]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.4.1
+[2.4.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.4.0
 [2.3.2]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.3.2
 [2.3.1]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.3.1
 [2.3.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.3.0

@@ -1250,7 +1250,14 @@ def test_the_forwarded_rate_ignores_what_the_playlist_claims():
 
 
 def test_the_rate_falls_back_to_the_playlist_before_any_frames_are_counted():
-    """A ``-c:a copy`` remux produces no counted frames: use what we have."""
+    """With no counted frames yet, use the bytes we have over the declared time.
+
+    This is the first moments of a forwarded stream (a whole segment has to
+    arrive before its frame headers can be counted), and the last resort of
+    ``output_bitrate``. It used to also be the path for a ``-c:a copy`` remux;
+    that branch is gone - nothing copies any more - but the fallback still has
+    to answer something rather than ``None``, because ``None`` means "no pacing".
+    """
     pipeline = _pipeline_with(
         PipelineStats(mode="transcode", seconds_in=10.0, bytes_out=240_000),
         Settings(bitrate=192_000, output_codec="adts"),

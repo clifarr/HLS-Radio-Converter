@@ -23,6 +23,7 @@ import signal
 import sys
 
 import pytest
+from pydantic import ValidationError
 
 from radioconv import pipeline
 from radioconv.config import Settings
@@ -436,6 +437,44 @@ def test_passthrough_can_still_be_switched_off():
     segment = _id3_tag(b"PRIV" + b"\x00" * 40) + _adts_frame(b"\x40" * 60) * 3
     settings = Settings(output_codec="adts", prefer_passthrough=False)
     assert pipeline.decide_mode(segment, settings) == ("transcode", None)
+
+
+def test_the_two_engine_settings_answer_different_questions():
+    """`ffmpeg_enabled` is a capability; `prefer_passthrough` is a priority.
+
+    On a settings page they sit next to each other and read like one switch and
+    its negation, so this is the table that says otherwise - the same source
+    bytes, three configurations, three different answers:
+
+    * with a second engine available, the *preference* decides: the same ADTS
+      station is a copy when forwarding is preferred and a re-encode when it is
+      not, and nothing about the station changed.
+    * with no second engine, the preference has nothing to prefer forwarding
+      *over*, so the station is forwarded whichever way `output_codec` is set -
+      asking for MP3 cannot conjure a re-encode that is unavailable.
+    * "both off" is therefore not a third behaviour but a contradiction: it says
+      "never forward" *and* "there is nothing else". The validator refuses it
+      rather than leaving a service that answers every request with nothing.
+    """
+    segment = _id3_tag(b"PRIV" + b"\x00" * 40) + _adts_frame(b"\x40" * 60) * 3
+
+    # A second engine exists, so the preference is the thing that decides. Off,
+    # the source is not even inspected - there is nothing left to decide.
+    assert pipeline.decide_mode(segment, Settings(output_codec="adts")) == ("passthrough", "adts")
+    assert pipeline.decide_mode(
+        segment, Settings(output_codec="adts", prefer_passthrough=False)
+    ) == (
+        "transcode",
+        None,
+    )
+
+    # No second engine: `output_codec` is translated to "auto" and the source wins.
+    only_forward = Settings(ffmpeg_enabled=False, output_codec="mp3")
+    assert only_forward.effective_output_codec == "auto"
+    assert pipeline.decide_mode(segment, only_forward) == ("passthrough", "adts")
+
+    with pytest.raises(ValidationError):
+        Settings(ffmpeg_enabled=False, prefer_passthrough=False)
 
 
 def test_a_container_we_cannot_forward_still_goes_to_ffmpeg():

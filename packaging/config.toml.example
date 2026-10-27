@@ -28,13 +28,16 @@ port = 8123
 allow_ui_settings = true
 
 # ------------------------------------------------------------------ encoding
-bitrate = 192000          # 8000..320000 bit/s. The default, and the value the
-                          # original project used: 192 kbit/s MP3 is the
-                          # quality bar radios were set up against.
-                          # Lower it only if the machine struggles (128000
-                          # cuts the CPU noticeably, at a real cost in quality).
-# sample_rate = 44100     # omit to keep the source rate (saves a resample step)
-channels = 2
+bitrate = 192000          # 8000..320000 bit/s. Applies to a station that is
+                          # CONVERTED: a forwarded one plays at its own rate.
+                          # The default, and the value version 1 used: 192
+                          # kbit/s MP3 is the quality bar radios were set up
+                          # against. Lower it only if the machine struggles
+                          # (128000 cuts the CPU noticeably, at a real cost in
+                          # quality).
+# sample_rate = 44100     # converted stations only; omit to keep the source
+                          # rate (saves a resample step)
+channels = 2              # converted stations only
 
 # mp3   - always hand the radio MP3. Widest compatibility; the safe default.
 # adts  - leave AAC as raw ADTS. *No re-encoding at all*: best quality and the

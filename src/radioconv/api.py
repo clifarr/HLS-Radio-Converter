@@ -528,12 +528,12 @@ def create_app(
 
         restarted = 0
         if str(form.get("restart", "")).lower() in ("1", "on", "true", "yes"):
+            # Reported by the template as its own green notice, from the count
+            # itself. It used to *also* be pushed onto `warnings`, so a restart
+            # produced an amber "N station(s) were ended" beside the green
+            # "N stations restarted" - two sentences for one event, in the two
+            # colours that mean opposite things.
             restarted = manager.retire_all("settings changed from the web page")
-            if restarted:
-                warnings.append(
-                    f"{restarted} station(s) were ended so they rebuild with the new "
-                    "settings. Radios reconnect by themselves."
-                )
 
         return web.settings_page(
             updated,
@@ -700,11 +700,16 @@ def create_app(
             "headers (`icy-name`, `icy-br`) which radios display.\n\n"
             "Optional overrides:\n\n"
             "* `br` / `bitrate` - output bitrate, e.g. `br=128k` or `br=128000`. "
-            "Accepted range 8000-320000.\n"
-            "* `codec` / `output_codec` - `mp3` (default) or `aac`/`adts` to remux "
-            "instead of re-encoding. `aac` and `adts` are the **same request**, "
-            "not two codecs: the output is ADTS-framed AAC either way, and the "
-            "response is announced as `audio/aac`. On an installation running "
+            "Accepted range 8000-320000. It is the *encoder's* rate, so it reaches "
+            "only a stream that is being converted: a forwarded one keeps the "
+            "station's own bitrate, and `br` then changes nothing but the figure "
+            "reported in `icy-br`.\n"
+            "* `codec` / `output_codec` - `mp3` (default) or `aac`/`adts` to ask for "
+            "AAC instead. `aac` and `adts` are the **same request**, not two "
+            "codecs: the output is ADTS-framed AAC either way, and the response is "
+            "announced as `audio/aac`. A station that already sends AAC is then "
+            "forwarded untouched, with no FFmpeg at all; one that does not is "
+            "decoded and re-encoded to AAC. On an installation running "
             "with FFmpeg disabled (`--no-ffmpeg`) this parameter has no effect: "
             "nothing can be re-encoded there, so every stream is already served "
             "in whatever codec the station uses.\n"
@@ -1258,7 +1263,7 @@ def _pace_rate(settings: Settings, session: StreamSession) -> float:
 
     Prefers the pipeline's **measured** bitrate, because the correct value
     differs by engine: a re-encode such as AAC to MP3 runs at the bitrate we
-    configured, while a remux or the FFmpeg-free forward runs at whatever the
+    configured, while the FFmpeg-free forward runs at whatever the
     station's own bitrate is. Pacing a 256 kbit/s forwarding stream at the
     configured 192 kbit/s would make the listener fall permanently behind, which
     the queue resolves by dropping audio - the very symptom being fixed here.
@@ -1740,9 +1745,11 @@ def _field_errors(exc: ValidationError) -> Dict[str, str]:
     name is a puzzle rather than a correction. So the location pydantic already
     provides is mapped back onto the input it came from.
 
-    A cross-field failure has no single field, so it is attached to every field
-    the error names - and to ``__all__`` when it names none, which the template
-    shows above the form.
+    A cross-field failure has no single field. Pydantic files it under an empty
+    location, so it is matched to the settings its own sentence names and marked
+    on each of them - two red boxes plus a sentence is a far better correction
+    than either alone. ``__all__`` is set as well for a rule that names no field
+    at all, which the template renders above the form.
     """
     problems: Dict[str, str] = {}
     for error in exc.errors():
@@ -1751,8 +1758,11 @@ def _field_errors(exc: ValidationError) -> Dict[str, str]:
         message = message.removeprefix("Value error, ")
         locations = [str(part) for part in error.get("loc", ()) if isinstance(part, str)]
         if not locations:
-            problems["__all__"] = message
-            continue
+            named = [name for name in Settings.model_fields if name in message]
+            if not named:
+                problems["__all__"] = message
+                continue
+            locations = named
         for name in locations:
             problems.setdefault(name, message)
     return problems

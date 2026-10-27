@@ -4,21 +4,31 @@
 
 {% block main %}
 <p class="muted">
-  These are the settings this service reads at runtime. A change is applied
-  immediately and saved, so it survives a restart - but a <em>running</em>
-  station keeps the settings it started with, because its buffer, bitrate and
-  jitter grid already describe audio that is playing.
-  {% if editable %}Tick <strong>restart the stations playing now</strong> to apply
-  a change to them at once; the radios reconnect by themselves.
-  {% endif %}
+  <strong>These are the defaults for every radio.</strong> Changes are saved and
+  applied straight away, so they survive a restart - but a station that is
+  <em>already playing</em> keeps the settings it started with. Tick
+  <strong>Restart playing stations</strong> below to change it now.
 </p>
 
 {% if message %}
-<p class="notice" data-state="good">{{ message }}</p>
+{# Green means "done". A message that arrives with problems attached is the
+   opposite of done - it is the sentence explaining why nothing was saved - so it
+   must not wear the success colour. #}
+<p class="notice" data-state="{{ 'bad' if problems else 'good' }}">{{ message }}</p>
 {% endif %}
 {% for warning in warnings %}
 <p class="notice" data-state="warn">{{ warning }}</p>
 {% endfor %}
+
+{# A failure that belongs to a *combination* has no field to sit next to, so
+   pydantic files it under `__all__`. Without this it was reported as nothing at
+   all: the page said "a value was rejected" and marked no field, leaving the
+   reader to guess which of twenty inputs it meant - which is exactly what
+   happened to the two engine switches, whose contradiction is the only
+   cross-field rule here. #}
+{% if problems.get("__all__") %}
+<p class="notice" data-state="bad">{{ problems["__all__"] }}</p>
+{% endif %}
 
 {% if not editable %}
 <p class="notice" data-state="warn">
@@ -33,6 +43,12 @@
   <section class="card">
     <h2>{{ group.name }}</h2>
     <p class="muted small">{{ group.blurb }}</p>
+    {% if group.note %}
+    {# What these settings add up to. The engine fields are a capability and a
+       priority, which a flat list makes look like one setting and its negation;
+       stating the outcome is more use than another sentence of explanation. #}
+    <p class="outcome">{{ group.note }}</p>
+    {% endif %}
     {% for field in group.fields %}
     {# A rejected value is marked on the wrapper for the colour, and on the
        control itself with `aria-invalid`/`aria-describedby`, so the reader that
@@ -41,15 +57,16 @@
     <div class="setting{% if bad %} invalid{% endif %}">
       <label for="f-{{ field.name }}">{{ field.label }}</label>
       <div class="control">
+        {# Each conditional attribute starts with its own space and they are
+           written on one line. Relying on the newline between two `{% if %}`
+           blocks does not work: `trim_blocks` deletes the newline after a block
+           tag, so `checked` and `aria-invalid="true"` were emitted glued
+           together as `checkedaria-invalid="true"` - one unknown attribute, and
+           therefore a box that was neither ticked nor marked invalid. #}
         {% if field.kind == "bool" %}
-        <input type="checkbox" id="f-{{ field.name }}" name="{{ field.name }}"
-               value="1" {% if field.checked %}checked{% endif %}
-               {% if bad %}aria-invalid="true" aria-describedby="p-{{ field.name }}"{% endif %}
-               {% if not editable %}disabled{% endif %}>
+        <input type="checkbox" id="f-{{ field.name }}" name="{{ field.name }}" value="1"{% if field.checked %} checked{% endif %}{% if bad %} aria-invalid="true" aria-describedby="p-{{ field.name }}"{% endif %}{% if not editable %} disabled{% endif %}>
         {% elif field.kind in ("choice", "choice-int") %}
-        <select id="f-{{ field.name }}" name="{{ field.name }}"
-                {% if bad %}aria-invalid="true" aria-describedby="p-{{ field.name }}"{% endif %}
-                {% if not editable %}disabled{% endif %}>
+        <select id="f-{{ field.name }}" name="{{ field.name }}"{% if bad %} aria-invalid="true" aria-describedby="p-{{ field.name }}"{% endif %}{% if not editable %} disabled{% endif %}>
           {% for choice in field.choices %}
           {# An empty choice is a real choice for an optional field ("keep the
              source rate"), so it gets a name of its own rather than a blank
@@ -59,21 +76,11 @@
           {% endfor %}
         </select>
         {% elif field.kind == "text" %}
-        <input type="text" id="f-{{ field.name }}" name="{{ field.name }}"
-               value="{{ field.value }}"
-               {% if bad %}aria-invalid="true" aria-describedby="p-{{ field.name }}"{% endif %}
-               {% if not editable %}disabled{% endif %}>
+        <input type="text" id="f-{{ field.name }}" name="{{ field.name }}" value="{{ field.value }}"{% if bad %} aria-invalid="true" aria-describedby="p-{{ field.name }}"{% endif %}{% if not editable %} disabled{% endif %}>
         {% else %}
-        <input type="number" id="f-{{ field.name }}" name="{{ field.name }}"
-               value="{{ field.value }}" step="{{ 'any' if field.kind == 'float' else '1' }}"
-               {% if bad %}aria-invalid="true" aria-describedby="p-{{ field.name }}"{% endif %}
-               {% if not editable %}disabled{% endif %}>
+        <input type="number" id="f-{{ field.name }}" name="{{ field.name }}" value="{{ field.value }}" step="{{ 'any' if field.kind == 'float' else '1' }}"{% if bad %} aria-invalid="true" aria-describedby="p-{{ field.name }}"{% endif %}{% if not editable %} disabled{% endif %}>
         {% endif %}
         {% if field.unit %}<span class="unit">{{ field.unit }}</span>{% endif %}
-        {% if field.new_streams_only %}
-        <span class="tag" tabindex="0"
-              data-tooltip="Reaches a station when its pipeline next starts. Tick 'restart the stations playing now' to apply it immediately.">new streams</span>
-        {% endif %}
       </div>
       {% if bad %}
       <p class="problem" id="p-{{ field.name }}">{{ bad }}</p>
@@ -88,16 +95,14 @@
   <section class="card">
     <h2>Apply</h2>
     <div class="setting">
-      <label for="f-restart">Restart the stations playing now</label>
+      <label for="f-restart">Restart playing stations</label>
       <div class="control">
         <input type="checkbox" id="f-restart" name="restart" value="1">
       </div>
       <p class="help">
-        Ends every pipeline so it is rebuilt with the new settings. Radios
-        reconnect on their own, and each one is given recent audio
-        immediately - so this is a moment of silence, not a dropped stream.
-        Leave it unticked and the change reaches a station the next time it
-        restarts anyway.
+        Rebuilds each pipeline with the new settings. Radios reconnect by
+        themselves and are given recent audio at once, so it is a moment of
+        silence rather than a dropped stream.
       </p>
     </div>
     <button type="submit">Save settings</button>
@@ -117,9 +122,8 @@
 
 <h2>Not changeable here</h2>
 <p class="muted small">
-  These are fixed when the process starts, so this page does not pretend
-  otherwise. Set them in <code>config.toml</code>, with a
-  <code>RADIOCONV_*</code> environment variable, or on the command line.
+  Fixed when the process starts. Set them in <code>config.toml</code>, with a
+  <code>RADIOCONV_*</code> variable, or on the command line.
 </p>
 <div class="scroll">
 <table class="kv">

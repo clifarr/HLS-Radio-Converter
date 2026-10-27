@@ -221,25 +221,25 @@ def encoders(path: str = "") -> set:
     return found
 
 
-def build_command(settings: Settings, input_format: str, *, copy_audio: bool = False) -> List[str]:
+def build_command(settings: Settings, input_format: str) -> List[str]:
     """Build the ffmpeg command for one stream.
 
     ``input_format`` is one of :data:`INPUT_FORMATS`' keys, or anything else (in
     which case ffmpeg probes the input).
 
-    ``copy_audio`` performs a *remux only* (no re-encode) which is essentially
-    free - used when the radio understands the source codec.
+    **There is no ``-acodec copy`` here, deliberately.** A copy would be the
+    cheapest thing FFmpeg can do, but this service never needs it: asking for the
+    codec the station already sends is what the FFmpeg-free path is for, and
+    that path forwards the bytes with no child process at all. So every stream
+    that reaches this function really is being decoded and encoded.
 
-    The output codec and the *copy* decision are separate questions, and
-    conflating them was a real bug: asking for ``output_codec="adts"`` used
-    to force ``-acodec copy`` for **every** source, so an MP3 source was
-    copied straight into an ADTS container. ffmpeg accepts the command and
-    then emits nothing usable: an ADTS muxer expects AAC frames and gets
-    MP3 ones, so the radio is sent silence.
-
-    So ``-acodec copy`` is only used when the source really is the codec
-    being asked for. An MP3 source going to an ADTS output is *encoded* to
-    AAC, which is the only way to produce a valid ADTS stream from MP3.
+    It used to be reachable, and it was a bug: ``output_codec="adts"`` forced
+    ``-acodec copy`` for **every** source, so an MP3 source was copied straight
+    into an ADTS container. ffmpeg accepts that command and then emits nothing
+    usable - an ADTS muxer expects AAC frames and gets MP3 ones - so the radio
+    was sent silence. The copy branch has since become unreachable twice over
+    (``decide_mode`` forwards whenever the source already matches the output),
+    and it is gone rather than left waiting to be re-enabled.
 
     Raises :class:`FFmpegNotFound` when the installation has FFmpeg switched off
     entirely. That is not a redundant check: the pipeline is supposed to have
@@ -254,9 +254,6 @@ def build_command(settings: Settings, input_format: str, *, copy_audio: bool = F
     binary = locate_ffmpeg(settings.ffmpeg_path)
     fmt = INPUT_FORMATS.get(input_format)
     want_adts = settings.output_codec == "adts"
-    # ``copy_audio`` means "the source is already what we are outputting".
-    # The caller decides that; the output codec alone must never imply it.
-    copying = copy_audio
 
     cmd: List[str] = [
         binary,
@@ -287,9 +284,7 @@ def build_command(settings: Settings, input_format: str, *, copy_audio: bool = F
 
     cmd += ["-vn", "-sn", "-dn", "-map", "0:a:0"]
 
-    if copying:
-        cmd += ["-acodec", "copy"]
-    elif want_adts:
+    if want_adts:
         # The source is not AAC, so it has to be *encoded* to AAC. Copying
         # an MP3 into an ADTS container produces a stream no radio can
         # decode. ffmpeg's native "aac" encoder is in every build, including
@@ -297,6 +292,12 @@ def build_command(settings: Settings, input_format: str, *, copy_audio: bool = F
         cmd += ["-acodec", "aac", "-b:a", str(settings.bitrate)]
         if settings.channels:
             cmd += ["-ac", str(settings.channels)]
+        # ``sample_rate`` used to be applied on the MP3 path only, so the field
+        # on the settings page - whose help says "re-encoded audio" - silently
+        # did nothing whenever the output codec was AAC. A setting that applies
+        # to one codec and not the other is a footgun; both encoders take `-ar`.
+        if settings.sample_rate:
+            cmd += ["-ar", str(settings.sample_rate)]
     else:
         # libmp3lame is present in the bundled wheel and in every distro build.
         encoder = "libmp3lame" if "libmp3lame" in encoders(settings.ffmpeg_path) else "mp3"

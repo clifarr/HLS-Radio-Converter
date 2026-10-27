@@ -295,9 +295,8 @@ class StreamPipeline:
         * **re-encoded** (the default: AAC in, MP3 out at ``settings.bitrate``) -
           FFmpeg is encoding to a bitrate we chose, so that bitrate *is* the
           answer.
-        * **everything else** - a ``-c:a copy`` remux, or either FFmpeg-free
-          forward - where the rate is whatever the *produced* bytes work out to
-          over the audio they carry.
+        * **everything else** - either FFmpeg-free forward - where the rate is
+          whatever the *produced* bytes work out to over the audio they carry.
 
         Why it is ``bytes_out`` and not ``bytes_in``
         --------------------------------------------
@@ -343,8 +342,9 @@ class StreamPipeline:
             # decoder consumes at, so it is the rate to release at.
             return self.stats.forwarded_bytes * 8.0 / self.stats.forwarded_seconds
         if self.stats.seconds_in > 0 and self.stats.bytes_out > 0:
-            # A `-c:a copy` remux (no frames counted), or the first moments of a
-            # forwarded stream before a whole segment has been measured.
+            # The first moments of a forwarded stream, before a whole segment has
+            # been measured. Downloaded bytes over declared duration is the
+            # roughest of the three, which is why it is only the last resort.
             return self.stats.bytes_out * 8.0 / self.stats.seconds_in
         return None
 
@@ -537,7 +537,7 @@ class StreamPipeline:
                 container = detected
             iterator = self._run_passthrough(tracker, pending, container=container)
         else:
-            iterator = self._run_transcode(tracker, input_format, pending, init_segments, kind)
+            iterator = self._run_transcode(tracker, input_format, pending, init_segments)
 
         async for chunk in iterator:
             self.stats.bytes_out += len(chunk)
@@ -674,14 +674,13 @@ class StreamPipeline:
         input_format: str,
         pending: List[WorkItem],
         init_segments: Sequence[Segment],
-        source_kind: Optional[str] = None,
     ) -> AsyncGenerator[bytes, None]:
-        # ``copy_audio`` is only true when the source really is the codec
-        # we are outputting. An MP3 source going to an ADTS output has to be
-        # *encoded*, not copied: ffmpeg accepts ``-acodec copy -f adts`` for
-        # MP3 input and then produces nothing a radio can decode.
-        copy_audio = self.settings.effective_output_codec == "adts" and source_kind == "adts"
-        command = ffmpeg_mod.build_command(self.settings, input_format, copy_audio=copy_audio)
+        # No ``copy_audio`` here: a stream reaches this method only when its
+        # source is *not* what the output codec asks for. The case where it is -
+        # AAC asked for while the station sends AAC - is forwarded by
+        # ``_run_passthrough`` with no child process at all, so there is nothing
+        # left for ``-acodec copy`` to do. See `ffmpeg.build_command`.
+        command = ffmpeg_mod.build_command(self.settings, input_format)
         self.stats.detected_codec = (
             "aac" if self.settings.effective_output_codec == "adts" else "mp3"
         )

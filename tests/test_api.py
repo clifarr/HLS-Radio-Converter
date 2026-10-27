@@ -76,6 +76,29 @@ def test_parse_controls(query, expected):
     assert parse_controls(_Request(query).query_params) == expected
 
 
+def test_a_url_override_beats_the_configured_default():
+    """`?codec=` and `?br=` are per-radio overrides, not suggestions.
+
+    The settings page calls its values *defaults for every radio*, and that
+    sentence is only true while the override still wins - which it does by
+    replacing the stored value in the settings a session is built from. This pins
+    the precedence the page promises, using the real parser, so neither half can
+    drift: if `parse_controls` kept the value but the route stopped applying it,
+    every radio would silently get the default.
+    """
+    configured = Settings(output_codec="mp3", bitrate=192_000)
+    overrides = parse_controls(_Request("codec=adts&br=96k").query_params)
+    assert overrides == {"output_codec": "adts", "bitrate": 96_000}
+
+    used = configured.model_copy(update=overrides)
+    assert used.output_codec == "adts"
+    assert used.bitrate == 96_000
+    # And the configured values are untouched: one radio's choice is not a
+    # change to the service, which is what makes the page's "defaults" true.
+    assert configured.output_codec == "mp3"
+    assert configured.bitrate == 192_000
+
+
 def test_aac_and_adts_are_the_same_request():
     """Two spellings, one meaning - so neither can be "the better one".
 

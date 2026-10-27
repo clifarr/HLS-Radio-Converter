@@ -231,18 +231,18 @@ Architecture, in the order data flows:
 
 | Module | Responsibility |
 |---|---|
-| `config.py` | Settings: defaults < config file < `RADIOCONV_*` env < CLI flags. |
+| `config.py` | Settings, and the five-level precedence: defaults < `config.toml` < `ui-settings.json` < `RADIOCONV_*` env < CLI flags. |
 | `hls.py` | Fetching, master/variant selection, AES-128, byte ranges, live-edge tracking. |
 | `tsdemux.py` | Dependency-free demuxer: MPEG-TS/PSI extraction, and frame-exact forwarding of a bare elementary stream - the FFmpeg-free path. |
 | `pipeline.py` | One station: pass-through or FFmpeg, bounded queues, failover, restart. |
 | `session.py` | Fan-out to many radios, capacity limits, linger, stall watchdog. |
 | `throughput.py` | Cumulative byte counters, and the rolling last-hour view of them. |
 | `metrics.py` | The one snapshot every numbers endpoint is rendered from. |
-| `web.py` | Locating `templates/` and `static/`, and building each page's context. |
-| `api.py` | FastAPI app: routes only. v1-compatible paths, `/health`, `/probe`, pages. |
+| `web.py` | Each page's context, and the settings form: the field list is the one place a setting's label, help and type live. |
+| `api.py` | FastAPI app: routes, and the per-request streaming machinery they hand off to. v1-compatible paths, `/health`, `/probe`, pages. |
 | `monitor.py` | Process watchdog: memory and event-loop-lag based clean restart. |
 | `check.py` | `radioconv check`, including the generated end-to-end stream test. |
-| `templates/` | The two HTML pages (`base.html`, `index.html`, `dashboard.html`). |
+| `templates/` | The three HTML pages (`index`, `dashboard`, `settings`) on a shared `base.html`. |
 | `static/` | `dashboard.css` and `dashboard.js`: not rendered, not templated. |
 | `packaging/` | systemd unit, installer script, PyInstaller spec, example configs. |
 

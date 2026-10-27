@@ -186,6 +186,71 @@ def test_readme_documents_the_api_control_parameters():
     assert "/docs" in readme, "the generated reference should be discoverable"
 
 
+def test_readme_does_not_promise_passthrough_by_default():
+    """The README has overpromised this twice, so both halves are pinned.
+
+    Pass-through is genuinely the best thing this service does, which is why the
+    temptation is always to describe it as what *happens*. It is not: `bitrate`
+    and `output_codec` ship at `192000`/`"mp3"` (both pinned in
+    tests/test_config.py), so an AAC station is re-encoded unless somebody
+    chooses `adts` or `auto`. A README claiming otherwise sends a reader away
+    expecting 1% CPU and delivers 165%.
+
+    The second half is the DAB+ argument, which is true but easy to overstate: a
+    DAB+ receiver has an AAC decoder *for DAB+*. Whether its network player
+    accepts `audio/aac` over HTTP is separate firmware, so "most radios need no
+    transcoding" is not a claim this project can make - "many, if their network
+    player supports AAC" is.
+    """
+    readme = _read("README.md")
+
+    # The section is honest about the condition, and says which switch to flip.
+    assert "Many radios need no transcoding" in readme
+    assert "Most radios need no transcoding" not in readme, (
+        "the README is claiming more than the DAB+ decoder argument supports"
+    )
+    assert "does not happen by default" in readme, (
+        "the README does not say that pass-through is opt-in"
+    )
+    assert "network player" in readme, "the README conflates the DAB+ decoder with HTTP AAC support"
+
+    # And the two facts it is conditional on are still the shipped defaults.
+    from radioconv.config import Settings
+
+    shipped = Settings()
+    assert shipped.output_codec == "mp3"
+    assert shipped.bitrate == 192_000
+
+
+def test_readme_uses_one_explained_example_address():
+    """A reader copies whichever string is nearest, so there must be one of it.
+
+    Two different addresses in the prose invites the reader to work out which
+    one is theirs, and an unexplained address reads as *their* address right up
+    until it does not answer. So: one placeholder, called a placeholder, next to
+    a port called a default - and both still the shipped values, since a
+    document that drifts from `Settings()` sends people to a dead URL.
+    """
+    readme = _read("README.md")
+    placeholder = "192.168.1.50"
+
+    found = set(re.findall(r"\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\b", readme))
+    assert {host for host, _ in found} == {placeholder}, (
+        f"the README uses more than one example address: {sorted({h for h, _ in found})}"
+    )
+
+    from radioconv.config import Settings
+
+    assert {port for _, port in found} == {str(Settings().port)}, (
+        "the README's example port and the shipped default disagree"
+    )
+    assert "is a placeholder" in readme, "the README does not say the address is only an example"
+    assert "default port" in readme, "the README does not say the port is only the default"
+    assert "config.toml" in readme and "--port" in readme, (
+        "the README does not say how to change the port"
+    )
+
+
 def test_no_page_needs_a_multipart_parser():
     """A form POST must not cost a dependency, and the converter must stay a GET.
 
@@ -291,7 +356,7 @@ def test_docs_do_not_refer_to_a_mysterious_original():
     list of the three bad phrases used to miss `# 1. Original: the whole …`,
     which is exactly the sort of label somebody would write next time.
     """
-    for name in ("README.md", "CONTRIBUTING.md"):
+    for name in ("README.md", "CONTRIBUTING.md", "packaging/config.toml.example"):
         text = _read(name)
         found = re.findall(r"\b[Oo]riginal\w*", text)
         assert not found, (

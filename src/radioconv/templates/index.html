@@ -86,8 +86,9 @@ can play.</p>
   <p class="muted small">
     Only use it if the radio decodes AAC itself: this URL makes the service
     announce <code>audio/aac</code> instead of <code>audio/mpeg</code>. A radio
-    that plays MP3 only needs the URL above; re-encoding costs the Pi CPU, not
-    you any quality.
+    that plays MP3 only needs the URL above - forwarding would leave it silent,
+    and re-encoding, though it costs the Pi CPU and a second lossy encode, is
+    what plays there.
   </p>
   {% endif %}
 </section>
@@ -97,7 +98,7 @@ can play.</p>
   <h2>Right now</h2>
   <div class="tiles">
     <div class="tile" tabindex="0"
-         data-tooltip="Stations being converted right now - one per distinct stream URL. Radios listening to the same station share a single pipeline.">
+         data-tooltip="Stations being served right now - one per distinct stream URL, whether the audio is forwarded or converted. Radios listening to the same station share a single pipeline.">
       <span class="value" data-metric="gauges.sessions" data-format="count">&ndash;</span>
       <span class="label">stations</span>
     </div>

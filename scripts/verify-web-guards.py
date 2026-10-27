@@ -402,6 +402,174 @@ CASES: List[Case] = [
         "test_a_rejected_submit_keeps_what_was_typed",
         "tests/test_settings.py",
     ),
+    Case(
+        # A rule about a *combination* has no field of its own, so pydantic files
+        # it under `__all__` and the template has to render that. Dropping it
+        # leaves the page saying "a value was rejected" while naming nothing -
+        # a dead end in a form with twenty inputs. (Found by asking what happens
+        # when the two engine switches are both off.)
+        #
+        # Aimed at the template block, not at `_field_errors`: a cross-field error
+        # is *also* attached to the fields its sentence names, so removing the
+        # attachment still shows the sentence and would leave this case green.
+        "a message about no particular field is dropped",
+        PKG / "templates" / "settings.html",
+        '{% if problems.get("__all__") %}',
+        "{% if False %}",
+        "test_a_message_about_no_particular_field_is_still_shown",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # A checkbox is absent from a form post when it is unticked, so "absent"
+        # means unticked only when the render follows a post at all. Testing for
+        # the key instead let a box the reader had just unticked fall through to
+        # the stored value and come back ticked - the opposite of the promise a
+        # re-rendered form makes.
+        "a checkbox the reader unticked comes back ticked",
+        PKG / "web.py",
+        '                    checked = str(submitted.get(field.name, "")).lower() in _TRUE',
+        "                    checked = bool(raw)",
+        "test_both_engine_switches_off_is_refused_and_the_page_says_why",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # `trim_blocks` deletes the newline after a block tag, so two conditional
+        # attributes separated only by a newline are emitted glued together:
+        # `checkedaria-invalid="true"` is one unknown attribute, and the control
+        # ends up neither ticked nor marked. Each attribute carries its own
+        # leading space for that reason, and this case removes one.
+        "two conditional attributes are glued together",
+        PKG / "templates" / "settings.html",
+        ' checked{% endif %}{% if bad %} aria-invalid="true"',
+        ' checked{% endif %}{% if bad %}aria-invalid="true"',
+        "test_a_marked_field_keeps_its_other_attributes_apart",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # The settings rows are a two-column grid so the names line up. Left as
+        # two columns on a phone, the control is squeezed into a strip; the media
+        # query is what prevents that, and it is invisible to any test that does
+        # not run a browser - so it is asserted from the stylesheet.
+        "the settings grid stops collapsing on a phone",
+        PKG / "static" / "dashboard.css",
+        "  .setting {\n    grid-template-columns: minmax(0, 1fr);",
+        "  .setting {\n    grid-template-columns: 13.5rem minmax(0, 1fr);",
+        "test_the_settings_rows_stack_on_a_phone",
+    ),
+    Case(
+        # The settings page changes the *service*. `?codec=` and `?br=` on a
+        # station's URL still win for that one radio, and a reader who does not
+        # know that reads "I set mp3 here, so why is that radio getting AAC?" as
+        # a bug. Dropping the sentence is how the page stops saying it.
+        "the page stops mentioning the per-URL override",
+        PKG / "web.py",
+        '"?codec=adts and ?br=128k override it for one radio.",',
+        '"they stay until the station restarts.",',
+        "test_the_page_says_the_settings_are_defaults_a_url_can_override",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # "Defaults" is the word that makes the override sentence mean anything.
+        # Without it the page reads as a description of what every radio gets.
+        "the page stops calling the settings defaults",
+        PKG / "templates" / "settings.html",
+        "<strong>These are the defaults for every radio.</strong> Changes are saved and",
+        "Changes are saved and",
+        "test_the_page_says_the_settings_are_defaults_a_url_can_override",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # The README overpromised pass-through twice, and both times it was a
+        # sentence that *read* well: pass-through is the best thing this service
+        # does, so describing it as what happens is the natural mistake. It is
+        # not what happens - `output_codec` ships as mp3 - and a reader who
+        # believes it expects 1% CPU and gets 165%.
+        "the README promises pass-through by default",
+        ROOT / "README.md",
+        "**It does not happen by default.**",
+        "It happens by default.",
+        "test_readme_does_not_promise_passthrough_by_default",
+        "tests/test_metadata.py",
+    ),
+    Case(
+        # The DAB+ argument is true but says nothing about the network player's
+        # HTTP support, which is separate firmware. "Most" is the word that
+        # turns a fair claim into an unsupported one.
+        "the README claims most radios need no transcoding",
+        ROOT / "README.md",
+        "## Many radios need no transcoding",
+        "## Most radios need no transcoding",
+        "test_readme_does_not_promise_passthrough_by_default",
+        "tests/test_metadata.py",
+    ),
+    Case(
+        # A reader copies whichever string is nearest, so a second address in
+        # the prose is a wrong URL waiting to be pasted. The screenshots were
+        # taken from a machine at .82 while the text said .50, which is exactly
+        # how this happens: the document is edited in one place and rendered in
+        # another.
+        "the README uses two different example addresses",
+        ROOT / "README.md",
+        "http://192.168.1.50:8123/https%3A%2F%2Fexample.com%2Flive%2Findex.m3u8",
+        "http://192.168.1.82:8123/https%3A%2F%2Fexample.com%2Flive%2Findex.m3u8",
+        "test_readme_uses_one_explained_example_address",
+        "tests/test_metadata.py",
+    ),
+    Case(
+        # The page has to say that a forwarded station ignores the encoder
+        # fields. "Re-encoded audio only" was the old wording: true, and useless
+        # to a reader who does not already know which stations are re-encoded.
+        "the bitrate stops saying forwarded stations ignore it",
+        PKG / "web.py",
+        '"Converted stations only. A forwarded station keeps its own rate.",',
+        '"Output bitrate for re-encoded audio.",',
+        "test_the_page_says_which_fields_only_affect_converted_stations",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # The summary must not name a rate on a forwarding-only installation:
+        # there is no encoder, so the number would promise a conversion that
+        # cannot happen.
+        "the forwarding-only summary promises a bitrate",
+        PKG / "web.py",
+        '"In short: forwarding only. Every station plays exactly as it arrives, at "',
+        '"In short: forwarding only at 192 kbit/s. Every station plays as it arrives, at "',
+        "test_the_outcome_sentence_says_where_the_bitrate_applies",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # The dashboard quotes settings beside live figures, and the settings page
+        # is where they are changed. Restating a name instead of looking it up is
+        # exactly how "Stations allowed" outlived the page's rename.
+        "the dashboard renames a setting the settings page has",
+        PKG / "web.py",
+        '_field_label("stall_timeout")',
+        '"Restart a silent station after"',
+        "test_the_dashboard_names_settings_the_way_the_settings_page_does",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # One event, one sentence. The restart was announced twice: green from
+        # the template's count, amber from a warning - and amber means trouble.
+        "the restart is announced twice again",
+        PKG / "api.py",
+        '            restarted = manager.retire_all("settings changed from the web page")',
+        '            warnings.append("1 station(s) were ended so they rebuild.")\n'
+        '            restarted = manager.retire_all("settings changed from the web page")',
+        "test_restart_ends_the_stations_that_are_playing",
+        "tests/test_settings.py",
+    ),
+    Case(
+        # A dash on this page means "no reading yet". Using it for 0 made a
+        # healthy station and an unreported one look the same, in the column
+        # that exists to show a bad one.
+        "a zero becomes a missing reading again",
+        PKG / "static" / "dashboard.js",
+        'cell(2, "num", count(dropped),',
+        'cell(2, "num", dropped ? count(dropped) : "\\u2013",',
+        "test_a_zero_is_a_reading_not_a_missing_value",
+        "tests/test_web_ui.py",
+    ),
 ]
 
 

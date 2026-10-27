@@ -13,7 +13,7 @@
 
 <div class="tiles wide">
   <div class="tile" tabindex="0"
-       data-tooltip="Stations being converted right now - one per distinct stream URL. Radios listening to the same station share a single pipeline.">
+       data-tooltip="Stations being served right now - one per distinct stream URL, whether the audio is forwarded or converted. Radios listening to the same station share a single pipeline.">
     <span class="value" data-metric="gauges.sessions" data-format="count">&ndash;</span>
     <span class="label">stations of <span data-metric="gauges.max_sessions"
       data-format="count">&ndash;</span></span>
@@ -24,7 +24,7 @@
     <span class="label">radios listening</span>
   </div>
   <div class="tile" tabindex="0"
-       data-tooltip="Stations with a radio attached whose listeners have had nothing to play for longer than {{ config['Restart a silent station after'] }}. Measured from the radio's side - an empty buffer - and not from the station's, because a station is silent between segments by design without anyone hearing it. A radio hears this as nothing at all, so any station in this state makes the service report itself as degraded.">
+       data-tooltip="Stations with a radio attached whose listeners have had nothing to play for longer than {{ config['Silence timeout'] }}. Measured from the radio's side - an empty buffer - and not from the station's, because a station is silent between segments by design without anyone hearing it. A radio hears this as nothing at all, so any station in this state makes the service report itself as degraded.">
     <span class="value" data-metric="gauges.silent_sessions" data-format="count">&ndash;</span>
     <span class="label">silent stations</span>
   </div>
@@ -81,7 +81,7 @@
     <span class="label">restarts</span>
   </div>
   <div class="tile" tabindex="0"
-       data-tooltip="Requests refused because the service was already at its station limit. The radio is told to retry shortly; raise 'Max stations' if you see this often.">
+       data-tooltip="Requests refused because the service was already at its station limit. The radio is told to retry shortly; raise 'Stations at once' on the settings page if you see this often.">
     <span class="value" data-metric="counters.capacity_rejections_total"
       data-format="count">&ndash;</span>
     <span class="label">refused as full</span>
@@ -101,7 +101,7 @@
       <th role="columnheader" tabindex="0" data-tooltip="The name the radio gave with its &amp;name= parameter, or the source URL when it gave none. Radios asking for the same URL share one row.">Station</th>
       <th role="columnheader" class="num" tabindex="0" data-tooltip="Radio connections attached to this station right now.">Radios</th>
       <th role="columnheader" class="num" tabindex="0" data-tooltip="Chunks of audio discarded for a listener on this station that fell too far behind. Anything other than 0 means a radio is not keeping up.">Dropped</th>
-      <th role="columnheader" tabindex="0" data-tooltip="How the audio is produced: 'passthrough' means it is forwarded without FFmpeg running at all, 'transcode' means FFmpeg is producing it (re-encoding, or remuxing the source codec), 'starting' means the first segment has not arrived yet.">Engine</th>
+      <th role="columnheader" tabindex="0" data-tooltip="How the audio is produced: 'pass-through' means it is forwarded without FFmpeg running at all, 'transcode' means FFmpeg decodes and re-encodes it, 'starting' means the first segment has not arrived yet. The JSON at /metrics.json calls the first one 'passthrough'.">Engine</th>
       <th role="columnheader" class="num" tabindex="0" data-tooltip="Seconds of audio currently held for this station's listeners - the least-buffered listener, since a station is only as safe as its worst-served radio. This is the jitter buffer that covers the gap between one HLS segment arriving and the next. A new listener is given recent audio immediately, so this does not start at 0.">Buffered</th>
       <th role="columnheader" class="num" tabindex="0" data-tooltip="Audio bytes handed to radios for this station since it started. Excludes audio that was produced while nobody was listening.">Sent</th>
       <th role="columnheader" class="num" tabindex="0" data-tooltip="Times this station's pipeline was torn down and rebuilt, because fetching kept failing or because it went quiet for too long.">Restarts</th>
@@ -122,7 +122,7 @@
   <strong>Starved</strong> is how long the least-buffered listener has had
   nothing to play, which is what silence means to a radio. It stays at 0 while
   audio is flowing; past
-  <code>{{ config["Restart a silent station after"] }}</code> the station is
+  <code>{{ config["Silence timeout"] }}</code> the station is
   counted as silent, the row turns amber, and the service reports
   <code>degraded</code>.
   <strong>Upstream idle</strong> is different and much less alarming: it counts

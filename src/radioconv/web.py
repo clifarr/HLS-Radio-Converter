@@ -27,7 +27,7 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse
 
 from . import __version__
-from .config import Settings, ui_settings_path
+from .config import Settings
 
 if TYPE_CHECKING:  # pragma: no cover - import time only
     # Annotated, never imported at runtime: see environment() below.
@@ -486,6 +486,11 @@ def _config(settings: Settings) -> Dict[str, str]:
     and the limits that make a "refused as full" count or a silent-station row
     explicable.
 
+    Keys are the settings page's own labels (see :func:`_field_label`), because
+    the two pages quote the same figures: a row called "Stations allowed" here
+    and "Stations at once" there is one setting wearing two names, and the reader
+    who goes looking for the second on the first page finds neither.
+
     Built from the **effective** values, because on an installation with FFmpeg
     disabled the configured ones describe a conversion that never happens. A
     dashboard saying "Output codec: mp3" while every byte it handles is the
@@ -502,12 +507,14 @@ def _config(settings: Settings) -> Dict[str, str]:
     else:
         output = f"{settings.output_codec} @ {settings.bitrate // 1000} kbit/s"
     return {
-        "FFmpeg": "enabled" if settings.ffmpeg_enabled else "disabled (audio is forwarded)",
+        _field_label("ffmpeg_enabled"): (
+            "enabled" if settings.ffmpeg_enabled else "disabled (audio is forwarded)"
+        ),
         "Output": output,
-        "Stations allowed": str(settings.max_sessions),
-        "Radios per station": str(settings.max_listeners_per_session),
-        "Restart a silent station after": f"{settings.stall_timeout:g}s",
-        "Drop a dead radio after": (
+        _field_label("max_sessions"): str(settings.max_sessions),
+        _field_label("max_listeners_per_session"): str(settings.max_listeners_per_session),
+        _field_label("stall_timeout"): f"{settings.stall_timeout:g}s",
+        _field_label("listener_write_timeout"): (
             f"{settings.listener_write_timeout:g}s"
             if settings.listener_write_timeout
             else "never (left to the kernel)"
@@ -531,6 +538,16 @@ def _config(settings: Settings) -> Dict[str, str]:
 #: read-only instead, with the reason.
 @dataclass(frozen=True)
 class Field:
+    """One editable setting, and the *only* place its wording lives.
+
+    ``label`` is the short name the page shows; ``help`` is one sentence, because
+    a settings form is read while looking for one thing, and a paragraph per
+    field turns a page of twenty into something nobody scans. What needs more
+    than a sentence belongs in the group blurb (when a value applies) or in
+    :func:`engine_summary` (what a combination of settings adds up to), both of
+    which are stated once for a group rather than repeated per field.
+    """
+
     name: str
     label: str
     group: str
@@ -539,9 +556,6 @@ class Field:
     choices: Tuple[str, ...] = ()
     unit: str = ""
     optional: bool = False
-    #: True for a value that only reaches *new* pipelines - the page offers to
-    #: restart the running stations so a change is not left half-applied.
-    new_streams_only: bool = False
 
 
 #: What a browser actually submits for a ticked checkbox. Every radio button,
@@ -553,61 +567,48 @@ _TRUE = ("1", "on", "true", "yes")
 SETTINGS_FIELDS: Tuple[Field, ...] = (
     Field(
         "ffmpeg_enabled",
-        "FFmpeg transcode",
+        "FFmpeg",
         "Encoding",
         "bool",
-        "Leave on to allow re-encoding, which is what lets any station play. "
-        "Turning it off makes the station's own audio the only possible output: "
-        "no child process, almost no CPU, and a station that needs converting "
-        "can no longer be played at all.",
-        new_streams_only=True,
+        "On: converting is possible. Off: only stations a radio can already play.",
     ),
     Field(
         "bitrate",
         "Bitrate",
         "Encoding",
         "int",
-        "Target bitrate for re-encoded audio, in bit/s (8000-320000). Ignored "
-        "when a stream is forwarded, and when FFmpeg is off.",
+        "Converted stations only. A forwarded station keeps its own rate.",
         unit="bit/s",
-        new_streams_only=True,
     ),
     Field(
         "output_codec",
         "Output codec",
         "Encoding",
         "choice",
-        "mp3 plays on every radio. adts forwards the station's AAC untouched - "
-        "no re-encode, best quality - if your radio decodes AAC. auto forwards "
-        "whatever the station already sends.",
+        "What a converted station is encoded to. mp3 plays anywhere; adts keeps AAC "
+        "as AAC; auto keeps the station's own codec when it can.",
         choices=("mp3", "adts", "auto"),
-        new_streams_only=True,
     ),
     Field(
         "prefer_passthrough",
-        "Forward when possible",
+        "Prefer forwarding",
         "Encoding",
         "bool",
-        "Forward the source untouched for any stream that is already playable, "
-        "instead of decoding and re-encoding it. This is what makes modern HLS "
-        "radio cheap on a Pi; off means FFmpeg always runs.",
-        new_streams_only=True,
+        "Forward audio that already plays instead of converting it. No effect when FFmpeg is off.",
     ),
     Field(
         "channels",
         "Channels",
         "Encoding",
         "int",
-        "Output channel count for re-encoded audio. 2 keeps stereo.",
-        new_streams_only=True,
+        "Converted stations only. 2 is stereo, 1 is mono.",
     ),
     Field(
         "sample_rate",
         "Sample rate",
         "Encoding",
         "choice-int",
-        "Resample re-encoded audio. Leave empty to keep the source rate, which "
-        "avoids a resampling step.",
+        "Converted stations only. Empty keeps the source rate.",
         choices=(
             "",
             "8000",
@@ -622,158 +623,128 @@ SETTINGS_FIELDS: Tuple[Field, ...] = (
         ),
         unit="Hz",
         optional=True,
-        new_streams_only=True,
     ),
     Field(
         "mime_override",
-        "Content-Type override",
+        "Content-Type",
         "Encoding",
         "text",
-        "Force the Content-Type sent to radios, for firmware that insists on a "
-        "particular spelling (e.g. audio/mpeg3 or audio/aacp). Empty = derived "
-        "from the output codec.",
+        "Header sent to radios, e.g. audio/aacp. Empty follows the output codec.",
         optional=True,
-        new_streams_only=True,
     ),
     Field(
         "max_sessions",
         "Stations at once",
         "Limits",
         "int",
-        "How many different stations can be converted simultaneously. Each one "
-        "is a pipeline: cheap for a forwarded stream, roughly a core for a "
-        "re-encode.",
+        "Different stations at the same time. Forwarding one is nearly free.",
     ),
     Field(
         "max_listeners_per_session",
         "Radios per station",
         "Limits",
         "int",
-        "Listeners allowed to share one station's pipeline.",
+        "Listeners that may share one station's pipeline.",
     ),
     Field(
         "share_sessions",
-        "Share one pipeline per station",
+        "Share one pipeline",
         "Limits",
         "bool",
-        "Radios on the same URL share a single decode. Off gives every listener "
-        "its own pipeline, which multiplies the cost.",
+        "Radios on one URL share a decode. Off multiplies the cost.",
     ),
     Field(
         "chunk_size",
-        "Audio chunk size",
+        "Chunk size",
         "Streaming",
         "int",
-        "Bytes per queue item - the unit the per-listener jitter buffer is counted in.",
+        "Bytes per queue item, the unit the jitter buffer counts in.",
         unit="bytes",
-        new_streams_only=True,
     ),
     Field(
         "queue_chunks",
         "Jitter buffer",
         "Streaming",
         "int",
-        "Chunks held per listener. 128 x 8 KiB is about 43 seconds of 192 "
-        "kbit/s audio, which has to cover the gap between one HLS segment and "
-        "the next. Too small is heard as stutter.",
+        "Chunks buffered per radio. Too small is heard as stutter.",
         unit="chunks",
-        new_streams_only=True,
     ),
     Field(
         "preroll_seconds",
-        "Audio ready on connect",
+        "Preroll",
         "Streaming",
         "float",
-        "Recent audio handed to a radio the moment it connects, in seconds. 0 "
-        "makes every listener start in silence.",
+        "Seconds of recent audio a radio gets as it connects; 0 starts silent.",
         unit="s",
-        new_streams_only=True,
     ),
     Field(
         "handoff_overlap_seconds",
-        "Handoff overlap",
+        "Rejoin overlap",
         "Streaming",
         "float",
-        "How much already-delivered audio a rejoining radio may be sent again, "
-        "in seconds. Bridges the gap when a radio reconnects; too much is heard "
-        "as a repeat.",
+        "Audio re-sent to a rejoining radio. Too much is heard as a repeat.",
         unit="s",
-        new_streams_only=True,
     ),
     Field(
         "pace_output",
-        "Pace the output",
+        "Pace output",
         "Streaming",
         "bool",
-        "Hand each radio its audio at the rate it plays, rather than as fast as "
-        "it is produced. Only turn this off to diagnose the pacer itself: radio "
-        "buffers underrun without it.",
-        new_streams_only=True,
+        "Send at playing speed. Off is only for diagnosing the pacer.",
     ),
     Field(
         "initial_burst_seconds",
         "Initial burst",
         "Streaming",
         "float",
-        "Seconds of audio released immediately at the start of a connection, so "
-        "a radio can fill its own buffer.",
+        "Released at once on connect, so a radio can fill its own buffer.",
         unit="s",
-        new_streams_only=True,
     ),
     Field(
         "icy_song_metadata",
         "Song titles",
         "Streaming",
         "bool",
-        "Send now-playing titles as ICY metadata, to radios that ask for it. "
-        "This is what puts the song name on the radio's display.",
-        new_streams_only=True,
+        "Send titles as ICY metadata - this is what shows on the display.",
     ),
     Field(
         "linger_seconds",
-        "Keep a station warm",
+        "Keep warm",
         "Streaming",
         "float",
-        "Keep a pipeline running this long after the last radio leaves, so a "
-        "radio that reconnects does not pay a cold start.",
+        "Keep a station running this long after its last radio leaves.",
         unit="s",
     ),
     Field(
         "stall_timeout",
-        "Restart a silent station after",
+        "Silence timeout",
         "Streaming",
         "float",
-        "No audio for this long means the pipeline is killed and rebuilt, and "
-        "the station counts as silent (the service reports degraded).",
+        "Rebuild a station that has produced no audio for this long.",
         unit="s",
     ),
     Field(
         "listener_write_timeout",
-        "Drop a dead radio after",
+        "Dead radio timeout",
         "Streaming",
         "float",
-        "How long a single write to a radio may block before that listener is "
-        "dropped. A radio that loses power sends no goodbye: without this the "
-        "kernel holds the connection for about 15 minutes. 0 disables it.",
+        "Drop a radio whose socket blocks this long. 0 never drops it.",
         unit="s",
-        new_streams_only=True,
     ),
     Field(
         "public_host",
-        "Address shown to radios",
+        "Public address",
         "Management",
         "text",
-        "host:port used when the page prints a URL for a radio. Empty = derived "
-        "from the request, which is right unless the service is behind NAT.",
+        "host:port used in radio URLs. Empty uses the request's own address.",
         optional=True,
     ),
     Field(
         "allow_ui_settings",
-        "Allow changes from this page",
+        "Allow changes here",
         "Management",
         "bool",
-        "Turn off to make this page read-only. Worth doing if the service is "
-        "reachable from somewhere you do not control, because it has no login.",
+        "Off makes this page read-only. There is no login.",
     ),
 )
 
@@ -788,18 +759,101 @@ READ_ONLY_SETTINGS: Tuple[Tuple[str, str], ...] = (
     ("cors_origins", "The CORS middleware is built once, at startup."),
 )
 
+
+def _field_label(name: str) -> str:
+    """The settings page's label for a setting, so the two pages agree.
+
+    The dashboard quotes a few settings beside live figures; the settings page is
+    where they are changed. One setting under two names ("Stations allowed" on
+    one page, "Stations at once" on the other) is a reader's problem, and it
+    happened - the dashboard kept the pre-2.4.1 wording after the page was
+    shortened. Looking the name up rather than restating it makes the drift
+    impossible; a name that is not on the settings page raises here rather than
+    rendering a table with a row nobody can act on.
+    """
+    for field in SETTINGS_FIELDS:
+        if field.name == name:
+            return field.label
+    raise KeyError(f"{name} is not a settings-page field")
+
+
 #: The order the groups appear in, and the sentence above each one.
+#:
+#: "When does this take effect?" is answered once per *group*, because it is a
+#: property of the group: a session copies its settings when it is built, so
+#: anything a session owns waits for a restart, while the limits are re-read for
+#: every radio that connects. The old wording said the Streaming timeouts applied
+#: immediately, which two of the three do not - they are captured per connection,
+#: like the rest of a session's behaviour.
 SETTINGS_GROUPS: Tuple[Tuple[str, str], ...] = (
     (
         "Encoding",
-        "What the audio becomes. These reach a station when its pipeline next "
-        "starts - tick 'restart the stations playing now' below to apply them "
-        "immediately.",
+        "Two engines. Forwarding plays a station exactly as it arrives - its own "
+        "codec and bitrate, no FFmpeg. Converting re-encodes it at the bitrate, "
+        "channels and sample rate here. Applies when a station restarts; "
+        "?codec=adts and ?br=128k override it for one radio.",
     ),
-    ("Limits", "How much the service is allowed to do at once."),
-    ("Streaming", "How the output is shaped for a radio."),
-    ("Management", "The service's own administrative settings."),
+    (
+        "Limits",
+        "How much the service may do at once. A change applies to the next radio that connects.",
+    ),
+    (
+        "Streaming",
+        "How the output is shaped for a radio. Applies when a station restarts, or "
+        "to a radio that connects afterwards.",
+    ),
+    ("Management", "The service's own administration. Applies immediately."),
 )
+
+
+def engine_summary(settings: Settings) -> str:
+    """One sentence for what the engine settings *add up to*.
+
+    "May this installation run FFmpeg?" and "which engine wins a tie?" are two
+    different questions - one is a property of the machine, the other a
+    priority - but a form shows settings as a flat list, and read that way the
+    pair looks like one control and its negation, stated twice. The honest fix
+    is not a longer label: it is to print the result, so the reader can see the
+    combination they have chosen instead of assembling it in their head.
+
+    The result is stated per *engine*, not per codec, and each sentence names
+    where the bitrate applies, because that is the question the fields raise
+    and cannot answer themselves: a forwarded station is played at its own rate,
+    so `bitrate` does nothing to it. Naming "192 kbit/s" only for the converted
+    path - and never on the forwarding-only installation, where no conversion
+    can happen - is what makes the sentence trustworthy rather than decorative.
+
+    Every branch is reachable, and refuses to describe an engine that cannot
+    run: on an installation with FFmpeg off there is nothing to prefer, and the
+    sentence says so rather than repeating the checkbox above it.
+    """
+    rate = f"{settings.bitrate // 1000} kbit/s"
+    if not settings.ffmpeg_enabled:
+        return (
+            "In short: forwarding only. Every station plays exactly as it arrives, at "
+            "its own bitrate; one that would have to be converted cannot be played, "
+            "and says so instead of going silent."
+        )
+    if not settings.prefer_passthrough:
+        # "Every station is converted", with no exception, and that is exact: the
+        # source is only classified when forwarding is enabled, so with this
+        # switch off every stream is decoded and encoded - AAC to AAC included.
+        target = "AAC" if settings.output_codec == "adts" else "MP3"
+        return f"In short: no forwarding. Every station is converted to {target} at {rate}."
+    if settings.output_codec == "mp3":
+        return (
+            "In short: MP3 stations are forwarded at their own bitrate; AAC stations "
+            f"are converted to MP3 at {rate}."
+        )
+    if settings.output_codec == "adts":
+        return (
+            "In short: AAC stations are forwarded at their own bitrate; MP3 stations "
+            f"are converted to AAC at {rate}."
+        )
+    return (
+        "In short: whatever already plays is forwarded at the station's own bitrate; "
+        f"anything else is converted to MP3 at {rate}."
+    )
 
 
 def settings_form(
@@ -827,10 +881,14 @@ def settings_form(
             raw = getattr(settings, field.name, None)
             if field.kind == "bool":
                 value = ""
-                if submitted is not None and field.name in submitted:
-                    # An unchecked box is simply absent, so "was it submitted"
-                    # and "was it ticked" are the same bit for a checkbox.
-                    checked = str(submitted[field.name]).lower() in _TRUE
+                if submitted is not None:
+                    # A checkbox only exists in a form post when it is ticked, so
+                    # "absent" *is* "unticked" - and that is only true when this
+                    # render follows a post at all. Testing for the key instead
+                    # was the bug: on a rejected submit a box the reader had just
+                    # unticked came back ticked, because a missing key fell
+                    # through to the stored value.
+                    checked = str(submitted.get(field.name, "")).lower() in _TRUE
                 else:
                     checked = bool(raw)
             else:
@@ -847,13 +905,23 @@ def settings_form(
                     "choices": field.choices,
                     "unit": field.unit,
                     "optional": field.optional,
-                    "new_streams_only": field.new_streams_only,
                     "value": value,
                     "checked": checked,
                 }
             )
         if fields:
-            groups.append({"name": group_name, "blurb": blurb, "fields": fields})
+            groups.append(
+                {
+                    "name": group_name,
+                    "blurb": blurb,
+                    # Only the encoding group derives a result from more than one
+                    # field. Rendered from the settings *in force*, not from the
+                    # submitted form: after a rejected submit the useful thing to
+                    # state is what the service is actually doing right now.
+                    "note": engine_summary(settings) if group_name == "Encoding" else "",
+                    "fields": fields,
+                }
+            )
     return groups
 
 
@@ -933,7 +1001,7 @@ def settings_page(
         current="settings",
         base=base_url(settings, request),
         groups=settings_form(settings, submitted),
-        read_only=[(name, why) for name, why in READ_ONLY_SETTINGS],
+        read_only=READ_ONLY_SETTINGS,
         read_only_values={
             name: _shown(getattr(settings, name, None)) for name, _ in READ_ONLY_SETTINGS
         },
@@ -943,7 +1011,6 @@ def settings_page(
         warnings=warnings or [],
         saved_to=saved_to,
         restarted=restarted,
-        config_path=str(ui_settings_path()),
     )
 
 
