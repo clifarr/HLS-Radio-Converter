@@ -146,6 +146,14 @@ class PipelineStats:
     #: ``EXTINF`` is the packager's claim (radiom2o declares 10 s for 10.32 s).
     forwarded_bytes: int = 0
     forwarded_seconds: float = 0.0
+    #: Seconds of audio in the start-up batch - every segment the playlist
+    #: already held when this pipeline started, which is fed in one burst far
+    #: faster than realtime. It is reported because it is *older* audio than
+    #: the steady state ever produces: a radio served from it is playing tens
+    #: of seconds behind the live edge, and the session has to keep that audio
+    #: in its reserve or the radio's next connection cannot resume from it -
+    #: see ``StreamSession._reserve_limit_bytes``.
+    startup_seconds: float = 0.0
     failures: int = 0
     failovers: int = 0
     started_at: float = field(default_factory=time.time)
@@ -164,6 +172,7 @@ class PipelineStats:
             "source_index": self.source_index,
             "segments": self.segments,
             "seconds_in": round(self.seconds_in, 1),
+            "startup_seconds": round(self.startup_seconds, 1),
             "bytes_in": self.bytes_in,
             "bytes_out": self.bytes_out,
             "failures": self.failures,
@@ -463,6 +472,16 @@ class StreamPipeline:
 
         #: Work items; ``None`` as the payload means "still to be downloaded".
         pending: List[WorkItem] = [(segment, None) for segment in media]
+
+        #: How much audio this start-up burst is about to hand downstream, from
+        #: the playlist's own EXTINF. It is the depth of the audio every
+        #: listener will be given *before* the pipeline settles onto the live
+        #: edge, and the session needs it: without it the reserve is trimmed
+        #: to `preroll_seconds` while the radio is still working through the
+        #: burst, and its next connection is served from the reserve's oldest
+        #: piece instead of from where it stopped - heard as a jump forward of
+        #: however much older the burst is than the reserve.
+        self.stats.startup_seconds = sum((segment.duration or 0.0) for segment in media)
 
         # Fetch the first segment before anything else, because its bytes are the
         # only reliable answer to "what are we reading?". They are needed either

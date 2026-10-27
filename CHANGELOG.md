@@ -3,6 +3,42 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.4.2] - 2026-10-27
+
+A radio no longer skips or repeats audio in the first seconds after it tunes in
+to a station with long segments. The defect was in the join floor, not in the
+stream: the audio a radio is served at start-up is older than the reserve the
+rejoin is measured against, so its next connection could not resume where it
+stopped.
+
+### Fixed
+
+- **Tuning in skipped up to twenty seconds of audio.** A pipeline starts by
+  fetching every segment the playlist already held and emits them in one burst.
+  On radiom2o that is three ten-second segments - **30 s of audio produced
+  inside two seconds**, all of it older than the live edge - so the radio
+  serving it is playing tens of seconds behind production. The join reserve is
+  bounded by `preroll_seconds` (10 s), so it had already evicted everything but
+  the newest ten seconds of the burst. The radio's next connection found nothing
+  left to resume from and was primed from the oldest piece the reserve still
+  held: measured at ~20 s of audio vanishing between its first and second
+  connection. The reserve now holds the whole start-up burst while it is being
+  played out, and falls back to `preroll_seconds` afterwards so a later listener
+  still gets a short cushion rather than half a minute of latency. `PipelineStats`
+  reports the burst's depth as `startup_seconds`.
+- **Every rejoin replayed 1.5 s of audio it had already played.**
+  `handoff_overlap_seconds` exists for the client that rejoins *at the production
+  edge* and would otherwise wait for the next burst; it was applied
+  unconditionally, so a rejoin with tens of seconds of unheard audio waiting was
+  rewound as well - pure replay. It is now a top-up: the floor is only back-dated
+  by the shortfall between the window and the audio actually available. At
+  tune-in this removes the repeat from every one of the radio's first few
+  connections; at the edge nothing changes.
+- A start-up burst larger than the reserve also left a listener with a buffer
+  exactly one segment deep, which starved for 1.87 s on a 10 s-segment station
+  and was then closed by the stall watchdog - a forced reconnect, heard as the
+  same skip-and-repeat. The deeper reserve covers it.
+
 ## [2.4.1] - 2026-10-27
 
 A settings page that is shorter and finally says what each engine does, a README
@@ -1589,6 +1625,7 @@ for the FFmpeg-free pass-through path, per-listener pacing with drop
 isolation, a dashboard with health metrics, and a systemd installer for the
 Raspberry Pi.
 
+[2.4.2]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.4.2
 [2.4.1]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.4.1
 [2.4.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.4.0
 [2.3.2]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.3.2

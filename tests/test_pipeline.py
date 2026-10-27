@@ -268,6 +268,13 @@ async def test_the_pacer_is_told_the_audio_rate_not_the_download_rate(monkeypatc
 
     assert stream.stats.mode == "passthrough"
     assert received >= len(frames), "the frames must reach the output"
+    # How deep the start-up burst is, in declared audio: the session sizes the
+    # reserve from this so a radio that is still working through the burst can
+    # resume where it stopped instead of jumping to the reserve's oldest piece.
+    assert stream.stats.startup_seconds == pytest.approx(1.0), (
+        "the pipeline did not report its start-up backlog, so the session "
+        "cannot keep that audio in the reserve"
+    )
     measured = stream.output_bitrate
     assert measured is not None
     # 40 frames at 1024 samples / 48 kHz = 0.8533 s of audio.

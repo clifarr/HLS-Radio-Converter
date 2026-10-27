@@ -931,6 +931,116 @@ async def test_a_rejoin_is_never_primed_with_more_than_the_reserve_holds(
         await manager.aclose()
 
 
+async def test_a_rejoin_with_stock_to_spare_is_not_primed_with_a_replay():
+    """The handoff overlap is a top-up, never a fixed rewind.
+
+    The window exists for the join that lands on the *production edge*, where
+    nothing unheard is left to send and the client would otherwise wait for
+    the next burst.  Back-dating the floor by a flat 1.5 s there is the point.
+    Back-dating it when tens of seconds of unheard audio are already waiting is
+    not a cushion - it is audio the client has already been sent, replayed, and
+    it is audible.  Measured at tune-in on the real radio: every one of the
+    first three connections repeated 1.5 s of its predecessor.
+    """
+
+    settings = fast_settings(queue_chunks=128, handoff_overlap_seconds=1.5)
+    manager = SessionManager(settings)
+    await manager.start()
+    try:
+        session, first = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="Frontier/1",
+        )
+        heard = await _delivered(first, 3)
+        assert len(heard) == 3, "the test needs audio that was actually delivered"
+        floor = max(stamp for stamp, _ in heard)
+        await manager.unsubscribe(session, first)
+
+        # Leave more than the overlap window (1.5 s at 192 kbit/s = 36 000 bytes;
+        # the fake emits 1 KiB every 5 ms) unheard after the floor.
+        await asyncio.sleep(0.4)
+
+        _, second = await manager.subscribe(
+            "http://x/one.m3u8",
+            ["http://x/one.m3u8"],
+            client="192.168.1.65",
+            user_agent="Frontier/1",
+        )
+        offsets = [offset for offset, _ in _queued(second)]
+        assert offsets, "the rejoining client got no audio at all"
+        assert min(offsets) > floor, (
+            "the rejoin replayed audio the client had already been sent, even "
+            f"though {session._audio_bytes - floor} bytes of unheard audio were "
+            f"waiting: floor={floor}, primed={offsets}"
+        )
+    finally:
+        await manager.aclose()
+
+
+async def test_the_reserve_keeps_the_start_up_burst_until_it_has_played_out():
+    """A radio is served the whole start-up burst, so the reserve must hold it.
+
+    A pipeline starts by fetching every segment the playlist already held (up
+    to three) and emitting them far faster than realtime: on radiom2o that is
+    **30 s of audio produced inside two seconds**, all of it older than the
+    live edge.  A radio that connected before the burst gets that audio from
+    its first piece, so it is playing tens of seconds behind the production
+    edge - while a reserve bounded by ``preroll_seconds`` (10 s) had already
+    evicted everything but the newest ten seconds of it.  The next connection
+    therefore found nothing left to resume from and was primed from the
+    reserve's oldest piece: measured as ~20 s of audio vanishing between the
+    radio's first and second connection at tuning time.
+    """
+
+    settings = fast_settings(queue_chunks=128, chunk_size=8192)
+    session = session_mod.StreamSession(settings, "key", ["http://x/one.m3u8"])
+    session.pipeline.stats.startup_seconds = 30.0
+    session.pipeline.stats.started_at = time.time()
+
+    for _ in range(88):  # 88 * 8192 B = 30 s at 192 kbit/s
+        session._fan_out(b"a" * 8192)
+
+    rate = settings.bitrate / 8.0
+    held = session._reserve_bytes / rate
+    assert held > settings.preroll_seconds + 10, (
+        f"the reserve holds {held:.1f} s of a 30 s start-up burst, but "
+        f"preroll_seconds is {settings.preroll_seconds:.1f}: the radio's next "
+        "connection is primed from the oldest piece left and jumps forward"
+    )
+
+
+async def test_the_reserve_falls_back_to_preroll_after_the_start_up_burst():
+    """The extra retention is a window, not a permanent memory increase.
+
+    Once the burst has been played out a joining listener wants the usual
+    couple of seconds of cushion, not half a minute of latency - and a stale
+    join floor must never be able to pin a growing amount of audio on a
+    service that runs for months.
+    """
+
+    settings = fast_settings(queue_chunks=128, chunk_size=8192)
+    session = session_mod.StreamSession(settings, "key", ["http://x/one.m3u8"])
+    session.pipeline.stats.startup_seconds = 30.0
+    session.pipeline.stats.started_at = time.time()
+    for _ in range(88):
+        session._fan_out(b"a" * 8192)
+
+    # The burst has been playing out for longer than it is long.
+    session.pipeline.stats.started_at -= (
+        session.pipeline.stats.startup_seconds + settings.preroll_seconds + 5.0
+    )
+    session._fan_out(b"a" * 8192)
+
+    rate = settings.bitrate / 8.0
+    held = session._reserve_bytes / rate
+    assert held <= settings.preroll_seconds + 1.0, (
+        f"the reserve still holds {held:.1f} s after the start-up window "
+        f"closed, so a new listener would be served that much latency"
+    )
+
+
 async def test_a_different_client_still_gets_the_full_reserve():
     """The floor is keyed: one client's history must not blind a new one."""
     manager = SessionManager(fast_settings(queue_chunks=128))

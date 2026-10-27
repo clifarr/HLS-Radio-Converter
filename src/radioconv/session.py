@@ -925,11 +925,52 @@ class StreamSession:
         that duration at the stream's own bitrate.  The bitrate is the
         measured one when it is known - a forwarded station runs at its own
         rate, not the configured one - and the configured one otherwise.
+
+        The start-up burst is the exception, and it is the whole reason a
+        rejoin at tuning time used to jump forward.  When a pipeline starts,
+        it fetches every segment the playlist already held (up to three of
+        them) and emits them as fast as it can - for a station with ten
+        second segments that is **thirty seconds of audio produced inside two
+        seconds**, all of it older than the live edge. A radio that connected
+        before the burst began is served that audio from its first piece, so
+        it is playing tens of seconds behind the production edge; the reserve,
+        bounded by ``preroll_seconds``, had already evicted all but the newest
+        ten of them. Its next connection could therefore not resume where it
+        stopped - there was nothing left to resume *from* - and was primed
+        from the oldest piece the reserve still held, which is a jump forward
+        of the difference. Measured on the real service: a 30 s start-up burst
+        against a 10 s reserve, so ~20 s of audio disappeared between the
+        radio's first and second connection.
+
+        So while the burst is still being played out, the reserve holds all of
+        it. After that it falls back to ``preroll_seconds``: the burst has been
+        consumed by then, so a joining listener wants the usual ten seconds of
+        cushion, not half a minute of latency.
         """
         rate = self.pipeline.output_bitrate or self.settings.bitrate
         if rate <= 0:
             rate = self.settings.bitrate or 192000
-        return max(int(self.settings.preroll_seconds * rate / 8), 1)
+        seconds = self.settings.preroll_seconds
+        if self._startup_window_open():
+            seconds = max(seconds, self.pipeline.stats.startup_seconds)
+        return max(int(seconds * rate / 8), 1)
+
+    def _startup_window_open(self) -> bool:
+        """Whether the pipeline's start-up burst is still being played out.
+
+        The burst is produced in a couple of seconds but holds
+        ``startup_seconds`` of audio, so the wall-clock window that matters is
+        ``startup_seconds`` long - plus one ``preroll_seconds`` of slack, which
+        covers the listener that joined mid-burst and the poll that closes it.
+        This is deliberately *not* an open-ended retention: a stale floor must
+        never pin a growing amount of audio in memory on a service that runs
+        for months.
+        """
+        startup = self.pipeline.stats.startup_seconds
+        if startup <= 0:
+            return False
+        age = time.time() - self.pipeline.stats.started_at
+        return age <= startup + self.settings.preroll_seconds
 
     def _join_floor(self, client: str, user_agent: str) -> Optional[int]:
         """How many bytes of the session's audio *client* was already sent.
@@ -991,8 +1032,20 @@ class StreamSession:
         # handoff) is the reported "skips a second or so". Re-sending at most
         # `handoff_overlap_seconds` of already-delivered audio bridges both,
         # with the replay bounded to that window (see Settings for the tradeoff).
-        overlap_bytes = self._overlap_bytes()
-        return max(0, floor - overlap_bytes)
+        #
+        # The overlap is a *top-up*, not a fixed rewind. When the floor is
+        # further from the production edge than the window itself there is
+        # already more than enough unheard audio waiting for this client, so
+        # re-sending any is pure replay - and audible replay at that. That is
+        # the tune-in case: the start-up burst leaves tens of seconds of stock
+        # after the floor, and back-dating it by a flat 1.5 s made every one of
+        # the radio's first few connections repeat the previous one's tail for
+        # no benefit at all.
+        overlap = self._overlap_bytes()
+        stock = max(0, self._audio_bytes - floor)
+        if stock >= overlap:
+            return floor
+        return max(0, floor - (overlap - stock))
 
     def _overlap_bytes(self) -> int:
         """How many bytes of already-delivered audio the handoff may re-send.
