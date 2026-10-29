@@ -16,6 +16,10 @@ Group=@GROUP@
 WorkingDirectory=@STATE_DIR@
 ExecStart=@EXEC_START@
 Environment=RADIOCONV_CONFIG_DIR=@CONFIG_DIR@
+# Where the settings page writes ui-settings.json. It has to be a directory the
+# service can write to, which @CONFIG_DIR@ is not (see ReadOnlyPaths below) -
+# without this the page reported "saved" and lost the change on the next restart.
+Environment=RADIOCONV_STATE_DIR=@STATE_DIR@
 # Keep the journal bounded - an unbounded log is a classic way for a hobby
 # service to fill an SD card and take the whole machine down.
 LogExtraFields=RADIOCONV=1

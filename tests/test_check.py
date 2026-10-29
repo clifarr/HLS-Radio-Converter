@@ -136,3 +136,68 @@ def test_a_disabled_ffmpeg_is_a_pass_not_a_failure():
     assert not result.skipped
     assert "disabled" in result.detail
     assert "MP3/ADTS" in result.detail, "it must say what still works"
+
+
+def test_an_unwritable_settings_directory_is_a_failure(tmp_path, monkeypatch):
+    """The failure that made saving a no-op on the systemd install.
+
+    It has to be reported as a FAIL rather than skipped: the page still answers
+    "Settings saved and applied", so nothing else on the machine tells the
+    operator that every change is being thrown away at the next restart.
+    """
+    from radioconv.check import check_settings_writable
+
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("", encoding="utf-8")
+    monkeypatch.setenv("RADIOCONV_STATE_DIR", str(blocker / "state"))
+
+    result = check_settings_writable(Settings())
+
+    assert not result.ok, "an unwritable settings directory passed the check"
+    assert "not writable" in result.detail
+
+
+def test_a_writable_settings_directory_passes_and_is_named(tmp_path, monkeypatch):
+    """The detail has to carry the path: "writable" of *what* is the question."""
+    from radioconv.check import check_settings_writable
+
+    monkeypatch.setenv("RADIOCONV_STATE_DIR", str(tmp_path / "state"))
+
+    result = check_settings_writable(Settings())
+
+    assert result.ok, result.detail
+    assert str(tmp_path / "state" / "ui-settings.json") in result.detail
+    assert not list((tmp_path / "state").glob(".radioconv-probe-*")), "the probe was left behind"
+
+
+def test_the_settings_check_stands_down_when_the_page_is_locked():
+    """`allow_ui_settings = false` means the file is never written at all."""
+    from radioconv.check import check_settings_writable
+
+    result = check_settings_writable(Settings(allow_ui_settings=False))
+
+    assert result.ok
+    assert "not used" in result.detail
+
+
+def test_a_probe_that_cannot_be_deleted_is_still_a_pass(tmp_path, monkeypatch):
+    """Windows can keep a freshly created file open for a moment (antivirus).
+
+    Creating the probe *is* the answer; failing to remove it afterwards says
+    nothing about whether the settings page can save. Reporting FAIL there would
+    be the false alarm the whole check exists to avoid - ``radioconv check``
+    exits 1, and a person runs it precisely when they suspect a real fault.
+    """
+    from radioconv import check as check_mod
+
+    monkeypatch.setenv("RADIOCONV_STATE_DIR", str(tmp_path / "state"))
+
+    def refuse(path: str) -> None:
+        raise PermissionError(13, "The process cannot access the file", path)
+
+    monkeypatch.setattr(check_mod.os, "unlink", refuse)
+
+    result = check_mod.check_settings_writable(Settings())
+
+    assert result.ok, "a locked probe file was reported as an unwritable directory"
+    assert str(tmp_path / "state" / "ui-settings.json") in result.detail

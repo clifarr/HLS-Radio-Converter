@@ -231,7 +231,7 @@ Architecture, in the order data flows:
 
 | Module | Responsibility |
 |---|---|
-| `config.py` | Settings, and the five-level precedence: defaults < `config.toml` < `ui-settings.json` < `RADIOCONV_*` env < CLI flags. |
+| `config.py` | Settings, and the five-level precedence: defaults < `config.toml` < `ui-settings.json` < `RADIOCONV_*` env < CLI flags. Three directories, three answers: `default_config_dir()` (a human's TOML, may be read-only), `default_state_dir()` (files the service rewrites: `RADIOCONV_STATE_DIR`, else `$XDG_STATE_HOME`, else `~/.local/state` - `%LOCALAPPDATA%` on Windows), and `legacy_ui_settings_path()` (read-only, for values saved before the move to state). |
 | `hls.py` | Fetching, master/variant selection, AES-128, byte ranges, live-edge tracking. |
 | `tsdemux.py` | Dependency-free demuxer: MPEG-TS/PSI extraction, and frame-exact forwarding of a bare elementary stream - the FFmpeg-free path. |
 | `pipeline.py` | One station: pass-through or FFmpeg, bounded queues, failover, restart. |
@@ -486,6 +486,27 @@ administrator installed. That ordering was the other way round until it caused a
 release-blocking bug: imageio-ffmpeg's x86_64 build of FFmpeg 7.0.2 segfaults on
 any MPEG-TS input, so on a machine that had both, every transcoded station played
 silence while `/health` pointed cheerfully at the bundled binary.
+
+## Supported platforms, and what is actually tested
+
+The application is plain Python plus asyncio; only the *installer* is
+Linux-specific, because it writes a systemd unit. Anywhere else the story is
+`pip install .` and `radioconv serve`, with the platform's own supervisor if you
+want it started at boot (Task Scheduler on Windows, `launchd` on macOS).
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| CI runs the test suite | yes (3.9-3.13) | no | no |
+| Verified by hand | yes - it is the deployment target | yes: install, serve, both pages, saving settings | **no** - never run on real Windows hardware |
+| FFmpeg | system package on 32-bit ARM, wheel elsewhere | wheel | wheel |
+
+Windows support is real code, not aspiration - `pipeline.kill_child_process()`
+has a `TerminateProcess` branch (`os.killpg`/`SIGKILL` do not exist there, and
+`start_new_session` is silently ignored), `retrans.py` reads `GetTcpStatisticsEx`,
+and `default_state_dir()` uses `%LOCALAPPDATA%`. None of it has executed on
+Windows, so a first report from that platform is genuinely new information: treat
+a bug report from it as a lead, not a regression, and do not "fix" the Windows
+branches by reading them.
 
 ## Why there is no Docker image
 

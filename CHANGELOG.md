@@ -3,6 +3,51 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.4.3] - 2026-10-29
+
+Saving the settings page on the systemd install reported "read-only file
+system", because the file it writes lived next to `config.toml` - a directory
+the unit makes read-only on purpose. The saved settings moved to the writable
+state directory, and the README stopped assuming a Raspberry Pi.
+
+### Fixed
+
+- **`/settings` could not save anything on the installed service.** The saved
+  settings were written to `ui-settings.json` *beside* `config.toml`, i.e.
+  `/etc/radioconv` - and the shipped unit runs with `ProtectSystem=strict` plus
+  `ReadOnlyPaths=/etc/radioconv`, so the only writable place is
+  `/var/lib/radioconv`. Every save was refused with
+  `[Errno 30] Read-only file system: '/etc/radioconv/ui-settings.json.tmp'`;
+  the page said "Settings saved and applied" and then admitted underneath that
+  the change would be lost at the next restart, which is exactly what happened.
+  The file now lives in the service's **state directory**
+  (`RADIOCONV_STATE_DIR`, set to `/var/lib/radioconv` by the unit; otherwise
+  `$XDG_STATE_HOME/radioconv`, `~/.local/state/radioconv`, or
+  `%LOCALAPPDATA%\radioconv` on Windows). Upgrading keeps existing values: a
+  file left in the config directory is still read, below the new one, and is
+  migrated on the next save.
+- `radioconv check` now reports whether that directory is actually writable,
+  naming the path. The failure was invisible otherwise - the page still answers
+  "saved" - and it only happens under systemd, never when the service is run by
+  hand.
+
+### Changed
+
+- **The README now covers machines other than a Raspberry Pi.** It read as if the
+  Pi were a requirement; it is a suggestion. There is a short per-platform table
+  (install command, where FFmpeg comes from, how autostart is done) and a
+  `pip install` quick start for macOS, Windows and Linux without systemd, with
+  the Windows command names and the one-off firewall prompt spelled out. The
+  honest split is stated rather than implied: only the *installer* is
+  Linux-specific, because it writes a systemd unit. The saved-settings location
+  is now given for every platform, `Hardware: will my Pi cope?` became
+  `Hardware: how much CPU does it need?`, and the Pi is described as the machine
+  every figure was measured on rather than the target.
+- CONTRIBUTING.md gained *Supported platforms, and what is actually tested*:
+  Linux is what CI runs, macOS has been checked by hand, and the Windows code
+  paths (process teardown, TCP retransmit counter, `%LOCALAPPDATA%`) have never
+  executed on real Windows hardware.
+
 ## [2.4.2] - 2026-10-27
 
 A radio no longer skips or repeats audio in the first seconds after it tunes in

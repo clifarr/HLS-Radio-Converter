@@ -17,7 +17,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from . import __version__
-from .config import Settings, default_config_dir
+from .config import Settings, default_config_dir, default_state_dir
 from .log import setup_logging
 
 
@@ -219,6 +219,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             "stations whose audio is already MP3 or ADTS AAC can be played"
         )
     log.info("config dir: %s", default_config_dir())
+    log.info("settings dir: %s", default_state_dir())
 
     config = uvicorn.Config(
         app,

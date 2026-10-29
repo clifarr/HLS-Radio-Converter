@@ -22,6 +22,7 @@ import asyncio
 import http.server
 import json
 import logging
+import os
 import platform
 import socket
 import socketserver
@@ -36,7 +37,7 @@ from typing import Any, List, Optional, Tuple
 
 from . import __version__
 from . import ffmpeg as ffmpeg_mod
-from .config import Settings
+from .config import Settings, ui_settings_path
 from .pipeline import StreamPipeline
 from .tsdemux import (
     STREAM_TYPE_AAC_ADTS,
@@ -142,6 +143,42 @@ def check_port(host: str, port: int) -> Check:
         return Check("port", False, f"cannot bind {host}:{port}: {exc}")
     finally:
         probe.close()
+
+
+def check_settings_writable(settings: Settings) -> Check:
+    """Can the settings page actually keep what it is told?
+
+    Worth a check of its own because the failure is near-invisible from outside:
+    the page can answer "Settings saved and applied" with only a bracketed
+    ``EROFS`` in an amber warning saying the change is not durable, so what a
+    person reports is "my bitrate went back after a reboot". It is also
+    environment-specific - the shipped unit runs with ``ProtectSystem=strict``,
+    so the same settings file is writable when the service is run by hand and
+    read-only under systemd.
+
+    Writing a probe rather than testing permission bits, because the answer
+    depends on the mount and the ownership of the directory, not on
+    ``os.access``.
+    """
+    if not settings.allow_ui_settings:
+        return Check("settings file", True, "not used (allow_ui_settings = false)")
+    target = ui_settings_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        handle, probe = tempfile.mkstemp(prefix=".radioconv-probe-", dir=str(target.parent))
+        os.close(handle)
+    except OSError as exc:
+        return Check("settings file", False, f"{target} is not writable: {exc}")
+    else:
+        # Best effort, and deliberately not part of the verdict: creating the
+        # file already answered the question. On Windows an antivirus scanner can
+        # hold a freshly written file open for a moment, and turning that into
+        # "not writable" is the false alarm this check exists to avoid.
+        try:
+            os.unlink(probe)
+        except OSError:
+            log.debug("could not remove the settings probe %s", probe)
+    return Check("settings file", True, str(target))
 
 
 def listening_radioconv(host: str, port: int, timeout: float = 2.0) -> bool:
@@ -368,7 +405,13 @@ async def _end_to_end(settings: Settings, codec: str) -> Check:
 
 # ------------------------------------------------------------------- driver
 async def _run_async(settings: Settings, end_to_end: bool) -> List[Check]:
-    checks = [check_python(), *check_imports(), check_demuxer(), check_ffmpeg(settings)]
+    checks = [
+        check_python(),
+        *check_imports(),
+        check_demuxer(),
+        check_ffmpeg(settings),
+        check_settings_writable(settings),
+    ]
     if end_to_end:
         checks.append(await _end_to_end(settings, "mp3"))
         checks.append(await _end_to_end(settings, "aac"))

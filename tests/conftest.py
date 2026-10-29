@@ -34,6 +34,19 @@ from radioconv.config import Settings
 pytest_plugins = ()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_saved_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the settings page's saved file out of the developer's home.
+
+    It lives in the *state* directory (``RADIOCONV_STATE_DIR``, else
+    ``XDG_STATE_HOME``, else ``~/.local/state/radioconv``) rather than beside
+    ``config.toml``, which is what the systemd unit needs - but it also means a
+    test that saves without pinning that directory writes into the real home
+    and, worse, could read back whatever a previous run left there.
+    """
+    monkeypatch.setenv("RADIOCONV_STATE_DIR", str(tmp_path / "state"))
+
+
 class _QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         """Silence the test server; its access log is pure noise."""

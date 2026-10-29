@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -68,6 +69,24 @@ def ui_settings_path() -> Path:
     JSON rather than TOML because this file is *written* by the service as well
     as read, and hand-written TOML comments cannot survive a rewrite - so the
     file is the machine's, and the annotated example stays the human's.
+
+    In the *state* directory rather than beside ``config.toml``, because the two
+    files have opposite lifetimes. ``config.toml`` belongs to a person: written
+    once, commented, and - on the shipped systemd unit, which runs with
+    ``ProtectSystem=strict`` - on a filesystem the service cannot write to at
+    all. This file is rewritten by the process on every save, so putting it
+    there made saving fail with ``EROFS`` on exactly the deployment the page
+    exists for, while appearing to work for anybody running it by hand.
+    """
+    return default_state_dir() / "ui-settings.json"
+
+
+def legacy_ui_settings_path() -> Path:
+    """Where saved settings lived before they moved to the state directory.
+
+    Still read (below the current file, so a later save still wins): an
+    installation that saved settings while running from source must not lose
+    them to a path change.
     """
     return default_config_dir() / "ui-settings.json"
 
@@ -144,6 +163,49 @@ def default_config_dir() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg) if xdg else Path.home() / ".config"
     return base / "radioconv"
+
+
+def default_state_dir(platform: Optional[str] = None) -> Path:
+    """Where the service keeps files it *writes*.
+
+    Separate from :func:`default_config_dir` because the two answer different
+    questions: the config directory is where a human's annotated TOML lives and
+    may well be read-only (``/etc/radioconv`` under the shipped unit), while this
+    one has to be writable by the service's own user. On a systemd install the
+    unit pins it with ``RADIOCONV_STATE_DIR=/var/lib/radioconv``, which is also
+    its only ``ReadWritePaths`` entry.
+
+    The defaults below follow each platform's own convention, because the
+    location is one the user is expected to find in a file manager - not an
+    implementation detail. Linux and macOS both take the state half of the XDG
+    spec (``~/.local/state``), deliberately not ``~/.config``: a file the service
+    rewrites is state, not configuration, and on macOS ``~/.config`` is already
+    where ``config.toml`` lives. Windows has no XDG, and a ``.local`` directory
+    in a Windows profile is a POSIX artefact rather than a place anyone looks in,
+    so it uses ``%LOCALAPPDATA%`` - *Local* rather than *Roaming*, because this is
+    machine-specific state that must not follow a roaming profile to another PC.
+
+    ``XDG_STATE_HOME`` still wins on every platform when it is set: it is the one
+    portable way to move this file, so an explicit choice beats a default.
+
+    *platform* is only for the tests, exactly as in
+    :func:`radioconv.retrans.tcp_retransmit_counter`; production passes nothing
+    and the real ``sys.platform`` decides.
+    """
+    env = os.environ.get("RADIOCONV_STATE_DIR")
+    if env:
+        return Path(env).expanduser()
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "radioconv"
+    name = platform if platform is not None else sys.platform
+    if name.startswith("win"):
+        # Tolerate a stripped environment (a service account, a CI runner) by
+        # falling back to the same place Windows would have named.
+        local = os.environ.get("LOCALAPPDATA")
+        base = Path(local) if local else Path.home() / "AppData" / "Local"
+        return base / "radioconv"
+    return Path.home() / ".local" / "state" / "radioconv"
 
 
 class SettingsStore:
@@ -233,10 +295,15 @@ class SettingsStore:
         page that can brick the appliance is not worth having.
         """
         path = ui_settings_path()
-        existing = read_ui_settings(path)
+        # The *effective* saved values, not only this file's: that carries the
+        # values saved before the file moved out of the config directory into
+        # the state directory, so the first save after an upgrade migrates them
+        # instead of dropping them.
+        existing = read_ui_settings()
         existing.update({k: v for k, v in patch.items() if k in Settings.model_fields})
         # A key pydantic ignores, so the file explains itself to whoever finds
-        # it in /etc and wonders why the value is not in config.toml.
+        # it in the state directory and wonders why the value is not in
+        # config.toml.
         existing["__note__"] = (
             "Written by the radioconv settings page. These values override "
             "config.toml but are overridden by RADIOCONV_* and by command-line "
@@ -287,8 +354,18 @@ def read_ui_settings(path: Optional[Path] = None) -> Dict[str, Any]:
     has corrupted it - losing a preference is recoverable, refusing to boot is
     not, and the alternative would be a settings page that can take the service
     down by writing something it later cannot read.
+
+    With no explicit *path* the legacy location is read first and the current one
+    layered over it, so a value saved after the move beats one saved before it.
     """
-    target = path or ui_settings_path()
+    if path is not None:
+        return _read_settings_file(path)
+    values = _read_settings_file(legacy_ui_settings_path())
+    values.update(_read_settings_file(ui_settings_path()))
+    return values
+
+
+def _read_settings_file(target: Path) -> Dict[str, Any]:
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError):

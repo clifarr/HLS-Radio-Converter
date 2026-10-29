@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -26,6 +27,9 @@ from radioconv.config import (
     OutputCodec,
     Settings,
     SettingsStore,
+    default_config_dir,
+    default_state_dir,
+    legacy_ui_settings_path,
     read_ui_settings,
     ui_settings_path,
 )
@@ -122,7 +126,12 @@ def test_saved_values_are_loaded_below_the_environment(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("RADIOCONV_CONFIG_DIR", str(tmp_path))
     (tmp_path / "config.toml").write_text("bitrate = 96000\nchannels = 1\n", encoding="utf-8")
-    ui_settings_path().write_text(json.dumps({"bitrate": 128000}), encoding="utf-8")
+    # The state directory is created by the installer, not by hand - so a test
+    # that writes into it directly has to make it first, exactly like an operator
+    # copying a file into place would.
+    saved = ui_settings_path()
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    saved.write_text(json.dumps({"bitrate": 128000}), encoding="utf-8")
 
     # Saved beats the config file...
     loaded = Settings.load()
@@ -132,6 +141,178 @@ def test_saved_values_are_loaded_below_the_environment(tmp_path, monkeypatch):
     # ...and the environment beats both.
     monkeypatch.setenv("RADIOCONV_BITRATE", "64000")
     assert Settings.load().bitrate == 64_000
+
+
+# ------------------------------------------------- where the file is written
+def test_saved_settings_are_not_written_into_the_config_directory(tmp_path, monkeypatch):
+    """The regression that made the settings page useless on the systemd install.
+
+    The shipped unit runs with ``ProtectSystem=strict`` and lists only the state
+    directory in ``ReadWritePaths``, while ``config.toml`` lives in
+    ``/etc/radioconv``. Keeping ``ui-settings.json`` "beside the config file"
+    meant every save on the Pi was refused with ``EROFS`` - the page showed the
+    green "saved and applied" notice with an amber warning underneath it, and
+    the value was gone at the next restart.
+    """
+    monkeypatch.setenv("RADIOCONV_CONFIG_DIR", str(tmp_path / "etc"))
+    monkeypatch.setenv("RADIOCONV_STATE_DIR", str(tmp_path / "var"))
+
+    assert ui_settings_path() == tmp_path / "var" / "ui-settings.json"
+
+    SettingsStore(Settings()).save({"bitrate": 128_000})
+
+    assert (tmp_path / "var" / "ui-settings.json").is_file(), (
+        "nothing was written where it is writable"
+    )
+    assert not (tmp_path / "etc").exists(), "the read-only config directory was written to"
+
+
+def test_the_default_state_directory_is_separate_from_the_config_directory(tmp_path, monkeypatch):
+    """Two directories, two lifetimes: the file is rewritten, the TOML is not.
+
+    With no ``RADIOCONV_STATE_DIR`` the state directory follows the XDG *state*
+    half of the spec, which is deliberately not ``~/.config``: configuration is
+    what a person writes, state is what the service rewrites.
+    """
+    monkeypatch.delenv("RADIOCONV_STATE_DIR", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("RADIOCONV_CONFIG_DIR", str(tmp_path / "cfg"))
+
+    assert default_state_dir("linux") == Path.home() / ".local" / "state" / "radioconv"
+    assert ui_settings_path().parent != default_config_dir()
+
+    # ...and XDG_STATE_HOME is honoured when it is set.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
+    assert ui_settings_path() == tmp_path / "xdg-state" / "radioconv" / "ui-settings.json"
+
+
+def test_the_state_directory_follows_the_platform_convention(tmp_path, monkeypatch):
+    """Windows has no XDG, and ``~/.local/state`` there is a POSIX artefact.
+
+    ``%LOCALAPPDATA%`` is where Windows puts per-user, per-machine application
+    state - *Local* rather than *Roaming*, because this file must not follow a
+    roaming profile onto another PC. macOS keeps the XDG state location on
+    purpose: ``config.toml`` already lives in ``~/.config/radioconv`` there, so
+    splitting the two across ``~/.config`` and ``~/Library/Application Support``
+    would be worse than being consistently XDG on both unices.
+
+    All three answers are asserted from one host by passing *platform*, which is
+    how ``retrans.py`` tests its Windows path too - otherwise the Windows branch
+    is only ever exercised on Windows, i.e. never.
+    """
+    monkeypatch.delenv("RADIOCONV_STATE_DIR", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    local = tmp_path / "AppData" / "Local"
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+
+    assert default_state_dir("win32") == local / "radioconv"
+
+    # A Windows environment that has lost the variable (a service account, a
+    # stripped CI runner) must still resolve somewhere usable rather than crash.
+    monkeypatch.delenv("LOCALAPPDATA")
+    assert default_state_dir("win32") == Path.home() / "AppData" / "Local" / "radioconv"
+
+    for name in ("linux", "linux2", "darwin"):
+        assert default_state_dir(name) == Path.home() / ".local" / "state" / "radioconv"
+
+    # An explicit XDG location is a real choice and still wins on Windows.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    assert default_state_dir("win32") == tmp_path / "xdg" / "radioconv"
+
+
+def test_the_saved_file_is_replaced_from_a_sibling_not_another_volume(tmp_path, monkeypatch):
+    """``os.replace`` is only atomic within one filesystem, which Windows enforces.
+
+    On Linux a rename across mounts fails with ``EXDEV``; on Windows
+    ``MoveFileEx`` fails outright. So the temporary file has to be written *next
+    to* the target, never in ``tempfile.gettempdir()`` - and the same-directory
+    sibling is also what makes a half-written file impossible to observe.
+    """
+    monkeypatch.setenv("RADIOCONV_STATE_DIR", str(tmp_path / "state"))
+
+    moves: list[tuple[Path, Path]] = []
+    original = Path.replace
+
+    def spy(self: Path, target: Any) -> Path:
+        moves.append((self, Path(target)))
+        return original(self, target)
+
+    monkeypatch.setattr(Path, "replace", spy)
+    SettingsStore(Settings()).save({"bitrate": 128_000})
+
+    assert len(moves) == 1, "the save did not go through an atomic replace"
+    source, target = moves[0]
+    assert source.parent == target.parent, "the temporary file is on another filesystem"
+    assert source.name == "ui-settings.json.tmp"
+    assert target.is_file()
+
+
+def test_a_locked_settings_directory_is_reported_not_raised(tmp_path, monkeypatch):
+    """Windows refuses the replace while another process holds the file open.
+
+    That is a ``PermissionError``, which is an ``OSError`` - the same thing the
+    route already catches and reports as "in effect but could not be saved". The
+    test pins the contract that makes that message reachable instead of a 500:
+    every failure here has to be an ``OSError`` and must leave the old file
+    intact.
+    """
+    monkeypatch.setenv("RADIOCONV_STATE_DIR", str(tmp_path / "state"))
+    store = SettingsStore(Settings())
+    store.save({"bitrate": 128_000})
+    before = ui_settings_path().read_text(encoding="utf-8")
+
+    def refuse(self: Path, target: Any) -> Path:
+        raise PermissionError(13, "The process cannot access the file", str(target))
+
+    monkeypatch.setattr(Path, "replace", refuse)
+    with pytest.raises(OSError):
+        store.save({"bitrate": 96_000})
+
+    assert ui_settings_path().read_text(encoding="utf-8") == before, "the saved file was damaged"
+
+
+def test_settings_saved_before_the_move_are_still_read(tmp_path, monkeypatch):
+    """An upgrade must not silently reset somebody's saved settings."""
+    monkeypatch.setenv("RADIOCONV_CONFIG_DIR", str(tmp_path / "etc"))
+    monkeypatch.setenv("RADIOCONV_STATE_DIR", str(tmp_path / "var"))
+
+    legacy = legacy_ui_settings_path()
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(json.dumps({"bitrate": 128000, "channels": 1}), encoding="utf-8")
+
+    assert Settings.load().bitrate == 128_000, "the old file was ignored"
+
+    # A later save goes to the new location, carrying the old values with it -
+    # and it wins over anything left behind in the old file.
+    SettingsStore(Settings.load()).save({"bitrate": 96_000})
+
+    written = json.loads(ui_settings_path().read_text(encoding="utf-8"))
+    assert written["bitrate"] == 96_000
+    assert written["channels"] == 1, "the legacy values were dropped instead of migrated"
+    assert Settings.load().bitrate == 96_000
+    assert Settings.load().channels == 1
+
+
+def test_the_service_unit_gives_the_page_a_directory_it_may_write():
+    """The unit's sandbox and the app's state directory have to be the same place.
+
+    ``ReadWritePaths`` is the only path the service can write to, so the
+    environment variable that tells the app where to save has to name exactly
+    that - and the config directory must not be in the writable set, or the next
+    person will reasonably put the settings file back beside the TOML.
+    """
+    unit = (Path(__file__).resolve().parents[1] / "packaging" / "radioconv.service").read_text(
+        encoding="utf-8"
+    )
+
+    state = re.search(r"^Environment=RADIOCONV_STATE_DIR=(.+)$", unit, re.MULTILINE)
+    writable = re.search(r"^ReadWritePaths=(.+)$", unit, re.MULTILINE)
+
+    assert state is not None, "the unit never tells the app where it may write"
+    assert writable is not None
+    assert state.group(1).strip() == writable.group(1).strip(), (
+        "the settings directory is not one of the unit's writable paths"
+    )
 
 
 # ----------------------------------------------------------------- the field list

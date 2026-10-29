@@ -5,7 +5,9 @@
 # RADIOCONV_ prefix, e.g. RADIOCONV_BITRATE=128000.
 #
 # Precedence: built-in defaults < this file < values saved from the settings
-# page (ui-settings.json, same directory as this file) < RADIOCONV_*
+# page (ui-settings.json, in the writable state directory: /var/lib/radioconv
+# for the service, $XDG_STATE_HOME/radioconv, or %LOCALAPPDATA%\radioconv on
+# Windows) < RADIOCONV_*
 # environment < command line flags. A value set by the last two cannot be
 # overridden from the browser, and the page says so rather than pretending.
 
@@ -19,8 +21,8 @@ port = 8123
 # ---------------------------------------------------------------- management
 # The settings page at /settings is a write endpoint that anything on your LAN
 # can reach, and nothing here is authenticated. Most values can be changed from
-# it - a change is validated, saved to ui-settings.json in this directory, and
-# can be applied to the stations that are playing. Set this to false to make
+# it - a change is validated, saved to ui-settings.json in the state directory,
+# and can be applied to the stations that are playing. Set this to false to make
 # the installation read-only: the page still shows every value, and a submit is
 # refused with 403. host, port, log_level, ffmpeg_path and cors_origins are
 # never editable from the page, because a page that can change its own bind
