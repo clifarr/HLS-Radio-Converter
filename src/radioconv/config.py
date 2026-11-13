@@ -641,6 +641,44 @@ class Settings(BaseSettings):
     #: re-anchors ever appear on a clean network, raise this to 16-18 rather
     #: than lowering it - there is room up to 21.
     retransmit_window_segments: int = 14
+    #: The same judgement as ``retransmit_window_segments``, expressed as a
+    #: **fraction of the traffic** rather than as a count of segments. 0
+    #: disables it.
+    #:
+    #: Why both, and why this one matters now
+    #: -------------------------------------
+    #: A count of retransmissions says nothing on its own: it depends on how many
+    #: segments were sent, which depends on the bitrate. The thresholds above
+    #: were measured through a **192 kbit/s MP3 transcode** (healthy ten-second
+    #: total 13, interference 21-29). A forwarding installation sends the
+    #: station's own audio instead, at 128 kbit/s, so it puts about two thirds as
+    #: many segments on the wire and the *same* interference produces about two
+    #: thirds the retransmissions.
+    #:
+    #: Measured on the Pi running pass-through (2026-11-13, 30 days of uptime):
+    #: ``retransmit_peak_window`` **11** against a threshold of 14, and
+    #: ``retransmit_peak_delta`` **7** against 10. Neither absolute trigger had
+    #: ever fired there, so the only trigger that can catch a wedged radio
+    #: without a blocked write was effectively switched off - which is exactly
+    #: the failure this watchdog exists for.
+    #:
+    #: The fraction does not care about the bitrate. Measured on the same
+    #: connection: **47 retransmissions in 776 s of healthy traffic** against
+    #: **21 inside one ten-second interference window**, i.e. roughly 0.4 %
+    #: healthy against roughly 12 % during interference - and the denominator
+    #: (the OS's count of segments sent) is read in the same breath as the
+    #: numerator, so both describe the same traffic.
+    #:
+    #: 5 % sits between the two with an order of magnitude of room on the healthy
+    #: side and 2.4x on the damaged one.
+    retransmit_window_ratio: float = 0.05
+    #: The fewest segments that must have been sent over the window before the
+    #: fraction above is trusted. A fraction needs a denominator, and a quiet
+    #: minute with three segments sent makes one lost packet look like 33 %.
+    #:
+    #: 50 is about four seconds of a 192 kbit/s stream and six of a 128 kbit/s
+    #: one, so the window is only judged once it holds real traffic.
+    retransmit_window_min_segments: int = 50
     #: Re-anchor every listener of a station this often, whatever the network
     #: looks like. **Off by default**; set a number of seconds to enable it.
     #:
@@ -924,6 +962,27 @@ class Settings(BaseSettings):
         # Negative has no meaning.
         if v < 0:
             raise ValueError("retransmit_window_segments must be 0 or more")
+        return v
+
+    @field_validator("retransmit_window_ratio")
+    @classmethod
+    def _check_retransmit_window_ratio(cls, v: float) -> float:
+        # Zero disables the fraction trigger, leaving the two absolute ones.
+        # Above 1.0 is not a fraction of the traffic and cannot mean anything;
+        # anything above ~0.5 is total packet loss, which no radio survives long
+        # enough for the watchdog to matter.
+        if v != 0.0 and not 0.0 < v <= 0.5:
+            raise ValueError("retransmit_window_ratio must be 0 (off) or between 0 and 0.5")
+        return v
+
+    @field_validator("retransmit_window_min_segments")
+    @classmethod
+    def _check_retransmit_window_min_segments(cls, v: int) -> int:
+        # A fraction needs a denominator. With zero required, one retransmission
+        # on a machine that sent three segments reads as 33 % of the traffic and
+        # closes a radio that is working perfectly.
+        if v < 1:
+            raise ValueError("retransmit_window_min_segments must be >= 1")
         return v
 
     @field_validator("reanchor_interval_seconds")

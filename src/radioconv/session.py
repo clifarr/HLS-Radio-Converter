@@ -1442,6 +1442,17 @@ class SessionManager:
         #: See `Settings.retransmit_window_segments`.
         self.retransmit_window_delta = 0
         self.retransmit_peak_window = 0
+        #: Segments the OS says it *sent* over the same window - the denominator
+        #: of the fraction - and that fraction itself, plus the largest seen.
+        #:
+        #: A count of retransmissions is not a measurement on its own: it scales
+        #: with how much was sent, so 21 in ten seconds is ordinary at 320
+        #: kbit/s and catastrophic at 8 kbit/s. The fraction is the number that
+        #: means the same thing at any bitrate, and it is what
+        #: `Settings.retransmit_window_ratio` is compared against.
+        self.retransmit_sent_delta = 0
+        self.retransmit_window_fraction = 0.0
+        self.retransmit_peak_window_fraction = 0.0
         self.consecutive_failures = 0
         self.capacity_rejections = 0
         #: Service-wide count of listeners closed by the stall watchdog.
@@ -1612,6 +1623,24 @@ class SessionManager:
         The per-poll threshold is kept as well, for the "one sharp burst" case
         that the window would dilute.
 
+        A third trigger, because a count is not a measurement
+        -----------------------------------------------------
+        Both absolute thresholds were measured through a 192 kbit/s MP3
+        transcode, and they do not survive a change of bitrate. A count of
+        retransmissions scales with the segments sent, so an installation that
+        *forwards* the station's own 128 kbit/s audio puts about two thirds as
+        many segments on the wire, and the same interference produces about two
+        thirds the retransmissions. Measured on the Pi running pass-through
+        (2026-11-13, 30 days up): a peak window of **11** against a threshold of
+        14 and a peak poll of **7** against 10 - so neither absolute trigger had
+        ever fired there, and the only trigger that can catch a radio wedged
+        without a blocked write was, in practice, switched off.
+
+        So the loop also compares retransmissions with the segments the OS says
+        it **sent** over the same window, which is the rate-independent form of
+        the same question: ~0.4 % healthy against ~12 % during interference,
+        measured on one connection. See `Settings.retransmit_window_ratio`.
+
         Why the window is emptied when it fires
         ---------------------------------------
         Measured, before that was done: a single interference event fired
@@ -1637,42 +1666,84 @@ class SessionManager:
         threshold = self.settings.retransmit_reconnect_segments
         window_seconds = self.settings.retransmit_window_seconds
         window_threshold = self.settings.retransmit_window_segments
+        ratio_threshold = self.settings.retransmit_window_ratio
+        ratio_minimum = self.settings.retransmit_window_min_segments
         poll_seconds = self.settings.retransmit_poll_seconds
         #: The per-poll deltas still inside the trailing window, oldest first.
         window: Deque[int] = deque()
+        #: The segments *sent* over the same polls, so the two sums are a ratio
+        #: of the same traffic. Kept alongside rather than derived later: the
+        #: denominator is a measurement, not a guess.
+        sent_window: Deque[int] = deque()
         #: How many polls the window holds: its length in seconds.
         window_polls = max(1, round(window_seconds / max(poll_seconds, 0.01)))
 
-        previous = await asyncio.to_thread(self.retransmit_counter.read)
+        previous = await asyncio.to_thread(self.retransmit_counter.read_counts)
         while True:
             await asyncio.sleep(poll_seconds)
-            total = await asyncio.to_thread(self.retransmit_counter.read)
-            if total is None or previous is None:
+            counts = await asyncio.to_thread(self.retransmit_counter.read_counts)
+            if counts is None or previous is None:
                 # No reading this tick (a transient failure, or the very first
                 # poll). Adopt whatever we have and compare from there, rather
                 # than treating a failed read as a burst of zero - or worse, as
                 # a huge negative one.
-                previous = total
+                previous = counts
                 continue
-            delta = total - previous
-            previous = total
+            total, sent = counts
+            delta = total - previous[0]
+            sent_delta = sent - previous[1]
+            previous = counts
             # A counter that went backwards means the OS restarted its stats (or
             # the figure wrapped); ignore it rather than reading it as damage.
-            if delta < 0:
+            if delta < 0 or sent_delta < 0:
                 continue
             self.retransmit_last_delta = delta
             self.retransmit_peak_delta = max(self.retransmit_peak_delta, delta)
 
             window.append(delta)
+            sent_window.append(sent_delta)
             while len(window) > window_polls:
                 window.popleft()
+            while len(sent_window) > window_polls:
+                sent_window.popleft()
             window_sum = sum(window)
+            sent_sum = sum(sent_window)
             self.retransmit_window_delta = window_sum
             self.retransmit_peak_window = max(self.retransmit_peak_window, window_sum)
+            #: The fraction of the window's traffic that had to be resent, and
+            #: the denominator it was computed over. Published because it is the
+            #: number a threshold should be set from, and it is the only one
+            #: that means the same thing at every bitrate.
+            self.retransmit_sent_delta = sent_sum
+            # A fraction needs a denominator, and so does a *peak* fraction. On a
+            # service with no radios attached the Pi sends very little, so a
+            # handful of retransmissions in its own background traffic divides by
+            # almost nothing: the first deploy of this metric published
+            # ``retransmit_peak_window_fraction = 3.0``, i.e. "300 % of the
+            # traffic was lost", on a healthy link. That is not a large reading,
+            # it is a meaningless one - and a figure whose whole purpose is to be
+            # comparable across bitrates must not be nonsense at a low traffic
+            # rate.
+            #
+            # So the fraction is only *recorded* once the window holds enough
+            # traffic for it to mean anything. Below that the last measurable
+            # value stands (0 at start-up) and ``retransmit_sent_delta`` says why.
+            if sent_sum >= ratio_minimum:
+                self.retransmit_window_fraction = window_sum / sent_sum
+                self.retransmit_peak_window_fraction = max(
+                    self.retransmit_peak_window_fraction, self.retransmit_window_fraction
+                )
+            else:
+                self.retransmit_window_fraction = 0.0
 
             burst = delta >= threshold
             sustained = window_threshold > 0 and window_sum >= window_threshold
-            if not burst and not sustained:
+            proportional = (
+                ratio_threshold > 0
+                and sent_sum >= ratio_minimum
+                and self.retransmit_window_fraction >= ratio_threshold
+            )
+            if not burst and not sustained and not proportional:
                 continue
             # Consume the evidence as soon as it is acted upon - and if there
             # is nobody to act upon, discard it anyway. A radio that attaches
@@ -1682,29 +1753,43 @@ class SessionManager:
             # was warm with no listeners, so the next radio to attach would
             # have been disconnected on its first poll.)
             window.clear()
+            sent_window.clear()
+            # The readings are kept for the log line *before* they are cleared:
+            # a message that reports the fraction it just zeroed says 0.0 % and
+            # describes the repair with the one number that is not true.
+            fired_fraction = self.retransmit_window_fraction
             self.retransmit_window_delta = 0
+            self.retransmit_window_fraction = 0.0
+            self.retransmit_sent_delta = 0
             closed = self.reanchor_stalled_sessions()
             if not closed:
                 continue
-            if sustained and not burst:
+            if sustained or burst:
                 log.warning(
-                    "the network retransmitted %d TCP segments over %.1fs: "
-                    "closing %d listener connection(s) so the radios "
-                    "re-anchor their decoders (window threshold %d)",
+                    "the network retransmitted %d TCP segments in %.1fs "
+                    "(%d over %.1fs): closing %d listener connection(s) so the "
+                    "radios re-anchor their decoders (thresholds %d per poll, "
+                    "%d per window)",
+                    delta,
+                    poll_seconds,
                     window_sum,
                     window_seconds,
                     closed,
+                    threshold,
                     window_threshold,
                 )
             else:
                 log.warning(
-                    "the network retransmitted %d TCP segments in %.1fs: "
-                    "closing %d listener connection(s) so the radios "
-                    "re-anchor their decoders (threshold %d)",
-                    delta,
-                    poll_seconds,
+                    "the network retransmitted %.1f%% of the %d TCP segments it "
+                    "sent in %.1fs (%d of %d): closing %d listener connection(s) "
+                    "so the radios re-anchor their decoders (threshold %.1f%%)",
+                    fired_fraction * 100.0,
+                    sent_sum,
+                    window_seconds,
+                    window_sum,
+                    sent_sum,
                     closed,
-                    threshold,
+                    ratio_threshold * 100.0,
                 )
 
     # ------------------------------------------------------------------ keys
@@ -1934,8 +2019,17 @@ class SessionManager:
             "retransmit_peak_delta": self.retransmit_peak_delta,
             "retransmit_window_delta": self.retransmit_window_delta,
             "retransmit_peak_window": self.retransmit_peak_window,
+            #: The fraction form: retransmitted over sent, for the same window.
+            #: This is the reading that does not change meaning with the
+            #: bitrate, and the one a reader should compare with
+            #: ``retransmit_window_ratio`` to tell "armed and quiet" from
+            #: "threshold set too high for this stream".
+            "retransmit_sent_delta": self.retransmit_sent_delta,
+            "retransmit_window_fraction": round(self.retransmit_window_fraction, 4),
+            "retransmit_peak_window_fraction": round(self.retransmit_peak_window_fraction, 4),
             "retransmit_window_seconds": self.settings.retransmit_window_seconds,
             "retransmit_window_segments": self.settings.retransmit_window_segments,
+            "retransmit_window_ratio": self.settings.retransmit_window_ratio,
             "details": [s.as_dict() for s in sessions],
         }
 

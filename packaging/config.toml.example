@@ -189,7 +189,27 @@ retransmit_reconnect_segments = 10
 retransmit_window_seconds = 10.0
 # The windowed total which counts as damage. 14 is twice the healthy maximum
 # of 7 and comfortably below the interference figure of 21.
+#
+# Careful: a count of retransmissions is not comparable across bitrates, because
+# it scales with how many segments were sent. These numbers were measured through
+# a 192 kbit/s MP3 transcode. An installation that FORWARDS the station's own
+# 128 kbit/s audio sends about two thirds as many segments, so the same
+# interference produces about two thirds the retransmissions - measured on the
+# Pi: a peak window of 11 against this threshold of 14, i.e. never fired. That is
+# what the fraction below is for; leave both in place.
 retransmit_window_segments = 14
+# The same judgement as a FRACTION of the traffic: re-anchor when this share of
+# the segments sent over the window had to be retransmitted. 0 disables it.
+#
+# This is the trigger that does not care about the bitrate. Measured on one
+# connection: roughly 0.4% healthy against roughly 12% during interference, so
+# 5% sits between the two with an order of magnitude of room on the healthy side.
+retransmit_window_ratio = 0.05
+# The fewest segments that must have been sent over the window before the
+# fraction is trusted. A fraction needs a denominator: with this at 0, one
+# retransmission on a machine that sent three segments reads as 33% and closes a
+# radio that is working perfectly.
+retransmit_window_min_segments = 50
 # How often the retransmission count is sampled, in seconds. One second bounds
 # how long a burst can go unnoticed; a whole interference burst can pass between
 # two reads if this is raised much above it.

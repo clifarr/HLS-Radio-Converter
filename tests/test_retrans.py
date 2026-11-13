@@ -24,8 +24,11 @@ from radioconv.retrans import (
     WINDOWS_TCPSTATS_SIZE,
     TcpRetransmitCounter,
     parse_mib_tcpstats,
+    parse_mib_tcpstats_counts,
     parse_netstat_tcp,
+    parse_netstat_tcp_counts,
     parse_proc_net_snmp,
+    parse_proc_net_snmp_counts,
     tcp_retransmit_counter,
 )
 from radioconv.session import SessionManager
@@ -115,6 +118,73 @@ def test_the_macos_counter_reports_nothing_when_it_cannot_be_found():
     assert parse_netstat_tcp("tcp:\n 0 retransmit timeout\n") is None
     # The substring appears, but not as the counter line.
     assert parse_netstat_tcp(" 5 packets retransmitted via RACK\n") is None
+
+
+# ------------------------------------------- the denominator (traffic sent)
+def test_the_linux_counter_reads_sent_segments_from_the_same_reading():
+    """``OutSegs`` is on the same ``Tcp:`` line, so both figures share a moment.
+
+    The watchdog compares retransmissions with the traffic they happened out of.
+    Two separate reads would describe two different moments of a link that is
+    changing, and the denominator could belong to traffic the numerator never
+    saw.
+    """
+    assert parse_proc_net_snmp_counts(PROC_NET_SNMP) == (4494, 1778862)
+
+
+def test_the_linux_denominator_survives_a_column_being_inserted():
+    header = PROC_NET_SNMP.splitlines()[0].replace("ActiveOpens", "ActiveOpens BrandNewCounter")
+    data = PROC_NET_SNMP.splitlines()[1].replace(" 8330 ", " 8330 777 ")
+    text = "\n".join([header, data]) + "\n"
+    assert parse_proc_net_snmp_counts(text) == (4494, 1778862), "a field was located by position"
+
+
+def test_the_linux_denominator_can_go_missing_without_losing_the_count():
+    """The absolute trigger must keep working where ``OutSegs`` does not exist.
+
+    The two are deliberately independent: a kernel that stops reporting traffic
+    must leave the count of damage readable, not switch the whole watchdog off.
+    """
+    header = "Tcp: A RetransSegs\n"
+    assert parse_proc_net_snmp(header + "Tcp: 1 7\n") == 7
+    assert parse_proc_net_snmp_counts(header + "Tcp: 1 7\n") is None
+
+
+def test_the_macos_counters_do_not_confuse_sent_with_retransmitted():
+    """The two lines differ only by the last word.
+
+    A pattern that matched both would count retransmissions as traffic and
+    halve the measured fraction - which is the number the whole trigger rests on.
+    """
+    text = (
+        "tcp:\n"
+        " 42 packet sent\n"
+        "    1234 data packets (56789 bytes)\n"
+        "    7 data packets (9 bytes) retransmitted\n"
+    )
+    assert parse_netstat_tcp_counts(text) == (7, 1234)
+    # The quiet case, in the singular, which is the shape a lazy parser misses.
+    assert parse_netstat_tcp_counts(NETSTAT_MACOS) == (0, 0)
+    # Without the sent line there is no denominator, and none is invented.
+    assert parse_netstat_tcp_counts("    7 data packets (9 bytes) retransmitted\n") is None
+
+
+def test_the_windows_struct_reads_both_counters_from_their_own_slots():
+    values = list(range(1, len(WINDOWS_TCPSTATS_FIELDS) + 1))
+    raw = b"".join(v.to_bytes(4, "little") for v in values)
+    # The 11th field (index 10) was given 11; the 12th (index 11) was given 12.
+    assert parse_mib_tcpstats_counts(raw) == (12, 11)
+
+
+def test_a_counter_that_only_knows_damage_leaves_the_denominator_unknown():
+    """An older reader must not be read as "no traffic was sent".
+
+    ``(5, 0)`` keeps the absolute trigger working and leaves the fraction off,
+    which is the safe reading of a number nobody measured.
+    """
+    counter = TcpRetransmitCounter("old", lambda: 5)
+    assert counter.read() == 5
+    assert counter.read_counts() == (5, 0)
 
 
 # -------------------------------------------------- choosing a supplier
@@ -237,7 +307,12 @@ def test_the_unavailable_counter_has_no_reader():
 
 # ------------------------------------------------------ the watchdog decision
 class FakeCounter:
-    """A retransmission counter fed from a script, one value per read."""
+    """A retransmission counter fed from a script, one reading per read.
+
+    A reading is either an ``int`` (retransmissions only, so the denominator is
+    unknown and the ratio trigger stays off) or a ``(retransmitted, sent)``
+    tuple, which is what the ratio needs.
+    """
 
     name = "fake"
     available = True
@@ -246,10 +321,18 @@ class FakeCounter:
         self._values = list(values)
         self._last = values[-1] if values else 0
 
-    def read(self):
+    def _next(self):
         if self._values:
             self._last = self._values.pop(0)
         return self._last
+
+    def read(self):
+        value = self._next()
+        return value[0] if isinstance(value, tuple) else value
+
+    def read_counts(self):
+        value = self._next()
+        return value if isinstance(value, tuple) else (value, 0)
 
 
 async def _manager_with_a_listener(settings: Settings):
@@ -517,6 +600,16 @@ def test_the_default_thresholds_sit_between_the_measured_distributions():
         "the window threshold must sit between the healthy maximum (7) and "
         "the interference figure (21)"
     )
+    assert settings.retransmit_window_ratio == 0.05, (
+        "the fraction threshold must sit between the healthy fraction (~0.4%) "
+        "and the interference fraction (~12%), so it works at any bitrate - "
+        "the absolute counts above were measured through a 192 kbit/s MP3 "
+        "transcode and never fire on a forwarded 128 kbit/s stream"
+    )
+    assert settings.retransmit_window_min_segments == 50, (
+        "a fraction needs a denominator: below this much traffic, one lost "
+        "segment would read as a large share of it"
+    )
 
 
 async def test_the_loop_tolerates_healthy_traffic_but_catches_interference():
@@ -605,6 +698,123 @@ async def test_the_window_is_what_catches_sustained_interference():
         assert manager.retransmit_peak_window >= 14, (
             f"the windowed total should have reached the threshold, got "
             f"{manager.retransmit_peak_window}"
+        )
+    finally:
+        await manager.aclose()
+
+
+async def test_a_small_count_of_a_small_stream_is_still_real_damage():
+    """The pass-through case, with the numbers the Pi actually reported.
+
+    A forwarding installation sends the station's own 128 kbit/s audio, so it
+    puts about two thirds as many segments on the wire as the 192 kbit/s MP3
+    transcode these thresholds were measured through. Measured on the Pi over 30
+    days of pass-through: a peak window of **11** against the absolute threshold
+    of 14, and a peak poll of 7 against 10 - so no absolute trigger had ever
+    fired, and a radio wedged without a blocked write could not be repaired.
+
+    Here the same 11 retransmissions are 9 % of the 120 segments that carried
+    them, which is damage by any standard, and the fraction is the only trigger
+    that can see it.
+    """
+    settings = _settings()
+    settings.retransmit_poll_seconds = 0.01
+    settings.retransmit_window_seconds = 0.05
+    settings.retransmit_reconnect_segments = 10  # never reached
+    settings.retransmit_window_segments = 14  # never reached
+    settings.retransmit_window_ratio = 0.05
+    settings.retransmit_window_min_segments = 50
+    manager, _session, _ = await _manager_with_a_listener(settings)
+    try:
+        manager.retransmit_counter = FakeCounter(
+            [(1000, 5000), (1003, 5070), (1006, 5140), (1011, 5210)]
+        )
+        manager._retransmit_task = asyncio.create_task(manager._retransmit_loop())
+
+        for _ in range(200):
+            if manager.retransmit_reconnects:
+                break
+            await asyncio.sleep(0.01)
+
+        assert manager.retransmit_reconnects == 1, (
+            "11 retransmissions against 120 segments sent closed nothing; the "
+            "absolute thresholds cannot see this, which is exactly why the "
+            "watchdog was quiet on a pass-through install"
+        )
+        assert manager.retransmit_peak_window == 11, (
+            f"the window should hold the measured damage, got {manager.retransmit_peak_window}"
+        )
+    finally:
+        await manager.aclose()
+
+
+async def test_the_same_count_on_a_fast_stream_is_not_damage():
+    """A count means nothing without the traffic it happened out of.
+
+    The same dozen retransmissions are a broken link on a 128 kbit/s forward and
+    ordinary noise on a 320 kbit/s transcode. Without this the fraction would
+    simply be a second, lower absolute threshold - and would false-fire on
+    radio streams running faster than the one it was tuned on.
+    """
+    settings = _settings()
+    settings.retransmit_poll_seconds = 0.01
+    settings.retransmit_window_seconds = 0.05
+    settings.retransmit_reconnect_segments = 10
+    settings.retransmit_window_segments = 14
+    settings.retransmit_window_ratio = 0.05
+    settings.retransmit_window_min_segments = 50
+    manager, _session, _ = await _manager_with_a_listener(settings)
+    try:
+        manager.retransmit_counter = FakeCounter(
+            [(1000, 5000), (1003, 5200), (1007, 5400), (1012, 5600)]
+        )
+        manager._retransmit_task = asyncio.create_task(manager._retransmit_loop())
+        await asyncio.sleep(0.2)
+
+        assert manager.retransmit_reconnects == 0, (
+            "12 retransmissions against 600 segments is 2% of the traffic, "
+            "which is a healthy link on a fast stream"
+        )
+        assert manager.retransmit_peak_window_fraction < 0.05
+    finally:
+        await manager.aclose()
+
+
+async def test_too_little_traffic_to_judge_never_fires():
+    """One lost segment on a quiet link is not 100 % packet loss.
+
+    Without a floor the fraction would fire on a station that had simply not sent
+    much - an idle service, a radio between segments - and close a connection
+    that was working perfectly.
+    """
+    settings = _settings()
+    settings.retransmit_poll_seconds = 0.01
+    settings.retransmit_window_seconds = 0.05
+    settings.retransmit_reconnect_segments = 10
+    settings.retransmit_window_segments = 14
+    settings.retransmit_window_ratio = 0.05
+    settings.retransmit_window_min_segments = 50
+    manager, _session, _ = await _manager_with_a_listener(settings)
+    try:
+        # 100 % of three segments. A fraction, and no evidence at all.
+        manager.retransmit_counter = FakeCounter([(1000, 5000), (1003, 5003)])
+        manager._retransmit_task = asyncio.create_task(manager._retransmit_loop())
+        await asyncio.sleep(0.2)
+
+        assert manager.retransmit_reconnects == 0, (
+            "a fraction was acted on before enough traffic had been sent to make one meaningful"
+        )
+        # And the reading itself must not be published either. A peak of 1.0
+        # (100 % loss) on a link that had sent three segments is not a large
+        # measurement, it is arithmetic on nothing - and this figure exists to be
+        # comparable, so it must not be nonsense exactly when little is flowing.
+        # First deploy of this metric reported peak 3.0 on a healthy Pi with no
+        # radios attached.
+        assert manager.retransmit_peak_window_fraction == 0.0, (
+            f"an undersampled window published a peak fraction of "
+            f"{manager.retransmit_peak_window_fraction}; on a quiet service that "
+            "is one retransmission over almost no traffic, which reads as "
+            "hundreds of percent of loss"
         )
     finally:
         await manager.aclose()

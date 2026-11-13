@@ -55,13 +55,23 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Callable, Optional, Protocol
+from typing import Callable, Dict, Optional, Protocol, Tuple
 
 #: Where Linux exposes its TCP counters.
 PROC_NET_SNMP = "/proc/net/snmp"
 
 #: The field of the `Tcp:` line that counts retransmitted segments.
 LINUX_FIELD = "RetransSegs"
+
+#: The field of the same line that counts segments *sent*, retransmissions
+#: included. It is the denominator of the fraction the watchdog acts on - see
+#: :func:`parse_proc_net_snmp_counts`.
+LINUX_OUT_FIELD = "OutSegs"
+
+#: What a counter reports: ``(retransmitted, sent)``. ``None`` means "no
+#: measurement now", which switches the watchdog off for that tick rather than
+#: pretending the link is perfect.
+Counts = Tuple[int, int]
 
 #: The fields of Windows' ``MIB_TCPSTATS``, in declaration order.
 #:
@@ -108,14 +118,26 @@ _MACOS_RETRANSMITTED = re.compile(
     re.MULTILINE,
 )
 
+#: The same output's "data packets sent" line, which sits indented under
+#: "N packet sent": ``1234 data packets (56789 bytes)``. It is the denominator
+#: of the fraction the watchdog acts on.
+#:
+#: The trailing ``$`` is what keeps this apart from the retransmitted line two
+#: lines below it - they differ only by the word at the end, and a looser
+#: pattern would count retransmissions as traffic and halve the measured loss.
+_MACOS_SENT = re.compile(
+    r"^\s*(\d+)\s+data\s+packets?\s+\(\s*\d+\s+bytes?\s*\)\s*$",
+    re.MULTILINE,
+)
 
-def parse_proc_net_snmp(text: str) -> Optional[int]:
-    """The ``RetransSegs`` total from the contents of ``/proc/net/snmp``.
+
+def _linux_tcp_fields(text: str) -> Optional[Dict[str, int]]:
+    """Every numeric field of the first ``Tcp:`` data line, by header name.
 
     The file is a sequence of header/data pairs, both prefixed with the same
-    protocol name, so the field is located by name in the header rather than by
-    a fixed column - a kernel that adds a counter would otherwise silently shift
-    every number after it. ``None`` if the pair is absent or ragged.
+    protocol name, so fields are located **by name** rather than by a fixed
+    column - a kernel that adds a counter would otherwise silently shift every
+    number after it.
     """
     header: Optional[list] = None
     for line in text.splitlines():
@@ -127,21 +149,49 @@ def parse_proc_net_snmp(text: str) -> Optional[int]:
             header = fields
             continue
         # The second `Tcp:` line is the data, in the header's order.
-        if LINUX_FIELD not in header:
-            return None
-        index = header.index(LINUX_FIELD)
-        if index >= len(fields):
-            return None
-        try:
-            return int(fields[index])
-        except ValueError:
-            return None
+        values: Dict[str, int] = {}
+        for field, raw in zip(header, fields):
+            try:
+                values[field] = int(raw)
+            except ValueError:
+                return None
+        return values
     return None
 
 
-def parse_netstat_tcp(text: str) -> Optional[int]:
-    """The retransmitted-packet total from ``netstat -s -p tcp`` on macOS."""
-    match = _MACOS_RETRANSMITTED.search(text)
+def parse_proc_net_snmp_counts(text: str) -> Optional[Counts]:
+    """``(RetransSegs, OutSegs)`` from the contents of ``/proc/net/snmp``.
+
+    Both numbers come from the *same* reading, which is what makes their ratio
+    meaningful: two reads a second apart would describe two different moments of
+    a link that is changing, and the denominator could belong to traffic the
+    numerator never saw.
+    """
+    values = _linux_tcp_fields(text)
+    if values is None:
+        return None
+    retransmitted = values.get(LINUX_FIELD)
+    sent = values.get(LINUX_OUT_FIELD)
+    if retransmitted is None or sent is None:
+        return None
+    return retransmitted, sent
+
+
+def parse_proc_net_snmp(text: str) -> Optional[int]:
+    """The ``RetransSegs`` total from the contents of ``/proc/net/snmp``.
+
+    ``None`` if the field is absent, the pair is ragged, or a figure is not a
+    number. Deliberately does not require ``OutSegs``: the absolute trigger must
+    keep working on a kernel that stops reporting it.
+    """
+    values = _linux_tcp_fields(text)
+    if values is None:
+        return None
+    return values.get(LINUX_FIELD)
+
+
+def _macos_count(pattern: re.Pattern[str], text: str) -> Optional[int]:
+    match = pattern.search(text)
     if match is None:
         return None
     try:
@@ -150,14 +200,45 @@ def parse_netstat_tcp(text: str) -> Optional[int]:
         return None
 
 
+def parse_netstat_tcp(text: str) -> Optional[int]:
+    """The retransmitted-packet total from ``netstat -s -p tcp`` on macOS."""
+    return _macos_count(_MACOS_RETRANSMITTED, text)
+
+
+def parse_netstat_tcp_counts(text: str) -> Optional[Counts]:
+    """``(retransmitted, sent)`` from ``netstat -s -p tcp`` on macOS.
+
+    ``None`` when either line is missing. macOS has been seen printing this whole
+    block as zeros while the machine was demonstrably busy (Apple silicon, macOS
+    14), so a zero is never read as "no traffic": a denominator of zero simply
+    leaves the ratio trigger off for that poll, and the absolute thresholds keep
+    working exactly as they did.
+    """
+    retransmitted = _macos_count(_MACOS_RETRANSMITTED, text)
+    sent = _macos_count(_MACOS_SENT, text)
+    if retransmitted is None or sent is None:
+        return None
+    return retransmitted, sent
+
+
 class RetransmitCounter(Protocol):
     """What the watchdog needs from a counter, and all it is allowed to assume.
 
-    The manager accepts *any* object with these two attributes and a ``read``,
-    which is how a test drives the watchdog with a scripted series of readings
-    instead of the machine's real traffic. Declaring the attribute as this
-    protocol rather than as `TcpRetransmitCounter` says so in the type system
-    instead of only in the docstrings.
+    The manager accepts *any* object with these two attributes and a
+    ``read_counts``, which is how a test drives the watchdog with a scripted
+    series of readings instead of the machine's real traffic. Declaring the
+    attribute as this protocol rather than as `TcpRetransmitCounter` says so in
+    the type system instead of only in the docstrings.
+
+    ``read`` is part of the protocol because it predates the denominator and is
+    still the simplest way to ask "how bad is the link". ``read_counts`` is what
+    the watchdog uses, because a count of retransmissions means nothing without
+    the number of segments it happened out of: 21 retransmissions in 10 s is
+    ordinary on a 320 kbit/s stream and catastrophic on an 8 kbit/s one.
+
+    Deliberately not a single method returning a tuple: a counter that cannot
+    report traffic at all must still be able to report damage, so the absolute
+    trigger keeps working on a platform whose denominator is unreadable.
     """
 
     #: Short name for logs and metrics: ``linux``, ``darwin``, ``windows`` or
@@ -167,16 +248,20 @@ class RetransmitCounter(Protocol):
     available: bool
 
     def read(self) -> Optional[int]:
-        """The cumulative count, or ``None`` when it cannot be read now."""
+        """The cumulative retransmission count, or ``None`` when unreadable."""
+        ...
+
+    def read_counts(self) -> Optional[Counts]:
+        """``(retransmitted, sent)``, or ``None`` when unreadable."""
         ...
 
 
 class TcpRetransmitCounter:
     """A cumulative retransmission count, or a stand-in that cannot read one.
 
-    ``read`` never raises: a counter that disappears (a kernel module unloaded,
-    a platform that cannot be read) must switch the watchdog off, not take the
-    stream down with it.
+    Neither reader ever raises: a counter that disappears (a kernel module
+    unloaded, a platform that cannot be read) must switch the watchdog off, not
+    take the stream down with it.
     """
 
     #: Short name for logs and metrics: ``linux``, ``darwin`` or ``unavailable``.
@@ -187,17 +272,21 @@ class TcpRetransmitCounter:
     def __init__(
         self,
         name: str,
-        reader: Optional[Callable[[], Optional[int]]] = None,
+        reader: Optional[Callable[[], int | Counts | None]] = None,
     ) -> None:
         self.name = name
         self.available = reader is not None
         self._reader = reader
 
     def read(self) -> Optional[int]:
+        counts = self.read_counts()
+        return None if counts is None else counts[0]
+
+    def read_counts(self) -> Optional[Counts]:
         if self._reader is None:
             return None
         try:
-            return self._reader()
+            value = self._reader()
         except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
             # A vanished /proc entry, a netstat that would not run, or a
             # ctypes call that could not resolve its symbol all mean "no
@@ -206,14 +295,22 @@ class TcpRetransmitCounter:
             # it, and the correct response is to switch the watchdog off rather
             # than take the stream down.
             return None
+        if value is None:
+            return None
+        if isinstance(value, tuple):
+            return int(value[0]), max(0, int(value[1]))
+        # A reader that only knows about retransmissions leaves the denominator
+        # unknown, which is reported as zero traffic: the ratio trigger stays
+        # off rather than being computed from a number nobody measured.
+        return int(value), 0
 
 
-def _read_proc_net_snmp() -> Optional[int]:
+def _read_proc_net_snmp() -> Optional[Counts]:
     with open(PROC_NET_SNMP, encoding="ascii", errors="replace") as handle:
-        return parse_proc_net_snmp(handle.read())
+        return parse_proc_net_snmp_counts(handle.read())
 
 
-def _read_netstat_tcp() -> Optional[int]:
+def _read_netstat_tcp() -> Optional[Counts]:
     # Resolved rather than run by bare name: a system without netstat must
     # report "no measurement", not raise a FileNotFoundError into the watchdog.
     executable = shutil.which("netstat")
@@ -227,7 +324,7 @@ def _read_netstat_tcp() -> Optional[int]:
     )
     if result.returncode != 0:
         return None
-    return parse_netstat_tcp(result.stdout.decode("utf-8", "replace"))
+    return parse_netstat_tcp_counts(result.stdout.decode("utf-8", "replace"))
 
 
 def parse_mib_tcpstats(raw: bytes) -> Optional[int]:
@@ -240,20 +337,38 @@ def parse_mib_tcpstats(raw: bytes) -> Optional[int]:
     number while looking perfectly healthy - so that decision is isolated here
     where it can be tested on a machine that is not Windows.
     """
-    if len(raw) < WINDOWS_RETRANSMIT_OFFSET + 4:
+    counts = parse_mib_tcpstats_counts(raw)
+    return None if counts is None else counts[0]
+
+
+def parse_mib_tcpstats_counts(raw: bytes) -> Optional[Counts]:
+    """``(dwRetransSegs, dwOutSegs)`` of a raw ``MIB_TCPSTATS`` struct.
+
+    ``dwOutSegs`` is the denominator of the fraction the watchdog acts on. It
+    lives in the same struct and the same call, so no extra syscall, no extra
+    privilege, and the two figures cannot describe different moments.
+    """
+    if len(raw) < WINDOWS_TCPSTATS_SIZE:
         return None
-    end = WINDOWS_RETRANSMIT_OFFSET + 4
-    # MIB_TCPSTATS is a C struct of DWORDs: unsigned, native (little-endian on
-    # every Windows architecture this project can run on).
-    return int.from_bytes(raw[WINDOWS_RETRANSMIT_OFFSET:end], "little")
+
+    def field(name: str) -> int:
+        offset = 4 * WINDOWS_TCPSTATS_FIELDS.index(name)
+        # MIB_TCPSTATS is a C struct of DWORDs: unsigned, native (little-endian
+        # on every Windows architecture this project can run on).
+        return int.from_bytes(raw[offset : offset + 4], "little")
+
+    return field("dwRetransSegs"), field("dwOutSegs")
 
 
-def _read_windows_tcp_stats() -> Optional[int]:
-    """Retransmitted segments, from ``GetTcpStatisticsEx``.
+def _read_windows_tcp_stats() -> Optional[Counts]:
+    """Retransmitted and sent segments, from ``GetTcpStatisticsEx``.
 
     The IP Helper API rather than ``netstat``: netstat's output is localised, so
     the label a parser would search for is different in every language. A struct
     field is not.
+
+    Both figures come from the *same* struct, so the numerator and the
+    denominator describe the same traffic, and reading the second costs nothing.
 
     Both address families are summed, because a stream can be carried over
     either and the two counters are kept separately. A failure on one family is
@@ -272,19 +387,21 @@ def _read_windows_tcp_stats() -> Optional[int]:
     function.restype = wintypes.ULONG
     no_error = 0
 
-    total = 0
+    total_retransmitted = 0
+    total_sent = 0
     seen = False
     for family in (_AF_INET, _AF_INET6):
         stats = MIB_TCPSTATS()
         if function(ctypes.byref(stats), family) != no_error:
             continue
         raw = ctypes.string_at(ctypes.byref(stats), ctypes.sizeof(stats))
-        value = parse_mib_tcpstats(raw)
-        if value is None:  # pragma: no cover - only if the struct shrank
+        counts = parse_mib_tcpstats_counts(raw)
+        if counts is None:  # pragma: no cover - only if the struct shrank
             continue
-        total += value
+        total_retransmitted += counts[0]
+        total_sent += counts[1]
         seen = True
-    return total if seen else None
+    return (total_retransmitted, total_sent) if seen else None
 
 
 def tcp_retransmit_counter(platform: Optional[str] = None) -> TcpRetransmitCounter:

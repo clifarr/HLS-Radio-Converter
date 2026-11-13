@@ -3,6 +3,41 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.4.4] - 2026-11-13
+
+The self-repair could not fire on an installation that forwards the station's
+own audio. Its retransmission thresholds were absolute segment counts, measured
+through a 192 kbit/s MP3 transcode; a forwarded 128 kbit/s stream puts about
+two-thirds as many segments on the wire, so the same interference stayed under
+both thresholds and a wedged radio was never re-anchored.
+
+### Fixed
+
+- **Wi-Fi interference went unrepaired in pass-through mode.** The watchdog that
+  closes a listener's connection so a radio re-anchors its decoder compares the
+  OS retransmission count with two thresholds, both measured on a 192 kbit/s MP3
+  transcode. A count of retransmissions scales with the segments sent, so on the
+  Pi, forwarding the station's own 128 kbit/s AAC, the measured peaks were **11
+  over the ten-second window** (threshold 14) and **7 in one poll** (threshold
+  10): neither absolute trigger had ever fired in 30 days, and the one trigger
+  that can catch a radio wedged without a blocked write was effectively off.
+  The watchdog now also compares retransmissions with the segments the OS says
+  it **sent** over the same window - roughly 0.4 % healthy against roughly 12 %
+  during interference, measured on one connection - which is the same judgement
+  expressed as a fraction and therefore independent of the bitrate. The counter
+  readers gained the denominator on all three platforms (`OutSegs` on Linux,
+  `dwOutSegs` on Windows - same struct, same call - and the "data packets sent"
+  line on macOS); the two absolute thresholds are unchanged and still work as
+  before. `retransmit_window_ratio` (0.05) and `retransmit_window_min_segments`
+  (50, because a fraction needs a denominator) are the new settings, and
+  `/metrics.json` reports `retransmit_window_fraction` and
+  `retransmit_sent_delta` so the trigger can be judged from a running machine.
+  The fraction is only reported once the window has carried enough traffic to
+  measure it: the first deploy of these gauges published a peak of **3.0** -
+  "300 % of the traffic was lost" - on a healthy Pi with no radio attached,
+  because a few retransmissions in the machine's own background traffic divide
+  by almost nothing.
+
 ## [2.4.3] - 2026-10-29
 
 Saving the settings page on the systemd install reported "read-only file
@@ -1670,6 +1705,8 @@ for the FFmpeg-free pass-through path, per-listener pacing with drop
 isolation, a dashboard with health metrics, and a systemd installer for the
 Raspberry Pi.
 
+[2.4.4]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.4.4
+[2.4.3]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.4.3
 [2.4.2]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.4.2
 [2.4.1]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.4.1
 [2.4.0]: https://github.com/clifarr/HLS-Radio-Converter/releases/tag/v2.4.0

@@ -69,6 +69,19 @@ GAUGES: Dict[str, str] = {
         "watchdog compares against its threshold."
     ),
     "retransmit_peak_window": "The largest windowed retransmission total seen.",
+    # The count above is not comparable across bitrates; the fraction is. It is
+    # the reading to set a threshold from, and the one that shows whether the
+    # watchdog is armed but never reaches its trigger.
+    "retransmit_sent_delta": "TCP segments sent over the trailing window.",
+    "retransmit_window_fraction": (
+        "Fraction of the segments sent over the window that had to be retransmitted. "
+        "Unlike the raw count this means the same thing at every bitrate, and it is "
+        "what the ratio trigger compares against its threshold."
+    ),
+    "retransmit_peak_window_fraction": "The largest windowed retransmission fraction seen.",
+    "retransmit_window_ratio": (
+        "The fraction of a window's traffic that counts as damage, as configured."
+    ),
 }
 
 #: Counter name -> HELP text. Counters only ever increase (until restart).
@@ -149,6 +162,15 @@ def snapshot(manager: SessionManager, monitor: ResourceMonitor) -> Dict[str, Any
             "retransmit_peak_delta": streams["retransmit_peak_delta"],
             "retransmit_window_delta": streams["retransmit_window_delta"],
             "retransmit_peak_window": streams["retransmit_peak_window"],
+            # The fraction form, and the denominator it was taken over. A count
+            # of retransmissions means nothing without the traffic it happened
+            # out of, and these are the readings that survive a change of
+            # bitrate - the counts above were measured through a 192 kbit/s
+            # transcode and never reach their threshold on a forwarded stream.
+            "retransmit_sent_delta": streams["retransmit_sent_delta"],
+            "retransmit_window_fraction": streams["retransmit_window_fraction"],
+            "retransmit_peak_window_fraction": streams["retransmit_peak_window_fraction"],
+            "retransmit_window_ratio": streams["retransmit_window_ratio"],
         },
         "counters": {
             # From the service-wide counters, not from a sum over the live
